@@ -1,0 +1,101 @@
+{
+    "test-plain": {
+        "mode": "plain",
+        "interceptor": "hexdump",
+        "server": {
+            "listen": "127.0.0.1:8000"
+        },
+        "client": {
+            "connect": "127.0.0.1:8100"
+        }
+    },
+    "test-tls": {
+        "mode": "tls",
+        "interceptor": "hexdump",
+        "server": {
+            "listen": "127.0.0.1:8001",
+            "cert-pem": "cert.pem",
+            "cert-key": "cert.key",
+            "key-logfile": "key.log"
+        },
+        "client": {
+            "connect": "127.0.0.1:8101",
+            "server-name": "tlstap-test-server-name",
+            "alpn": [
+                "myprotoA", 
+                "myprotoB"
+            ],
+            "key-logfile": "key.log"
+        }
+    },
+    "test-detecttls": {
+        "mode": "detecttls",
+        "interceptor": "hexdump",
+        "loglevel": "debug",
+        "server": {
+            "listen": "127.0.0.1:8002",
+            "cert-pem": "cert.pem",
+            "cert-key": "cert.key",
+            "key-logfile": "key.log"
+
+        },
+        "client": {
+            "connect": "127.0.0.1:8102",
+            "server-name": "detecttls-server",
+            "tls-max": "1.1",
+            "key-logfile": "key.log"
+        }
+    },
+    "rot-interceptor": {
+        "mode": "detecttls",
+        "interceptor": "rot",
+        "interceptor-args": {
+            "rot": 1,
+            "min-len": 2
+        },
+        "server": {
+            "listen": "127.0.0.1:8002",
+            "cert-pem": "cert.pem",
+            "cert-key": "cert.key"
+
+        },
+        "client": {
+            "connect": "127.0.0.1:8102"
+        }
+    },
+    "string-replacer": {
+        "mode": "detecttls",
+        "interceptor": "replacer",
+        "interceptor-args": {
+            "replacements":{
+                "ping": "pong",
+                "hello": "byeee"
+            }
+        },
+        "server": {
+            "listen": "127.0.0.1:8002",
+            "cert-pem": "cert.pem",
+            "cert-key": "cert.key"
+
+        },
+        "client": {
+            "connect": "127.0.0.1:8102"
+        }
+    },
+    "string-replacer-py": {
+        "mode": "detecttls",
+        "interceptor": "bridge",
+        "interceptor-args": {
+            "connect": "127.0.0.1:5555"
+        },
+        "server": {
+            "listen": "127.0.0.1:8002",
+            "cert-pem": "cert.pem",
+            "cert-key": "cert.key"
+
+        },
+        "client": {
+            "connect": "127.0.0.1:8102"
+        }
+    }
+}
