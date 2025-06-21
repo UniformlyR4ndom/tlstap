@@ -8,6 +8,7 @@ import (
 	tlstap "tlstap/proxy"
 )
 
+// HexDumpInterceptor writes all data passing through it to the logger in hexdump format
 type HexDumpInterceptor struct {
 	Logger *logging.Logger
 }
