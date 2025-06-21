@@ -28,19 +28,21 @@ func FormatHexDump2(data []byte) string {
 			if i+j < len(data) {
 				buffer.WriteString(fmt.Sprintf("%02x ", data[i+j]))
 			} else {
-				buffer.WriteString(fmt.Sprint("   "))
+				buffer.WriteString("   ")
 			}
 		}
 
 		// ASCII representation
-		buffer.WriteString(fmt.Sprint(" "))
+		buffer.WriteString(" ")
 		for j := 0; j < 16; j++ {
 			if i+j < len(data) {
 				b := data[i+j]
-				if b >= 32 && b <= 126 { // printable characters
+				if b >= 32 && b <= 126 {
+					// printable characters
 					buffer.WriteString(fmt.Sprintf("%c", b))
 				} else {
-					buffer.WriteString(fmt.Sprintf(".")) // non-printable characters
+					// non-printable characters
+					buffer.WriteString(".")
 				}
 			}
 		}

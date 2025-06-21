@@ -16,21 +16,21 @@ type Proxy struct {
 
 	Mode Mode
 
-	InterceptorUp   Interceptor
-	InterceptorDown Interceptor
+	InterceptorsUp   []Interceptor
+	InterceptorsDown []Interceptor
 
 	logger logging.Logger
 
 	nextConnId uint32
 }
 
-func NewProxy(config ProxyConfig, mode Mode, iUp, iDown Interceptor, logger logging.Logger) Proxy {
+func NewProxy(config ProxyConfig, mode Mode, iUp, iDown []Interceptor, logger logging.Logger) Proxy {
 	return Proxy{
-		Config:          config,
-		Mode:            mode,
-		InterceptorUp:   iUp,
-		InterceptorDown: iDown,
-		logger:          logger,
+		Config:           config,
+		Mode:             mode,
+		InterceptorsUp:   iUp,
+		InterceptorsDown: iDown,
+		logger:           logger,
 	}
 }
 
@@ -191,7 +191,6 @@ func (p *Proxy) loadCert(certPath, keyPath string) (tls.Certificate, error) {
 }
 
 func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) error {
-
 	listener, err := tls.Listen("tcp", p.Config.Server.ListenEndpoint, tlsServerConfig)
 	if err != nil {
 		return err
@@ -239,10 +238,10 @@ func (p *Proxy) newHandler(mode Mode) *ConnHandler {
 			ConnectEndpoint: p.Config.Client.ConnectEndpoint,
 			Mode:            mode,
 		},
-		InterceptorUp:   p.InterceptorUp,
-		InterceptorDown: p.InterceptorDown,
-		logger:          &p.logger,
-		ConnId:          p.nextConnId,
+		InterceptorsUp:   p.InterceptorsUp,
+		InterceptorsDown: p.InterceptorsDown,
+		logger:           &p.logger,
+		ConnId:           p.nextConnId,
 	}
 
 	p.nextConnId++

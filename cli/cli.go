@@ -15,7 +15,7 @@ import (
 	tlsbend "tlstap/proxy"
 )
 
-type InterceptorCallback func(config proxy.ProxyConfig, logger *logging.Logger) (proxy.Interceptor, error)
+type InterceptorCallback func(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
 
 func main() {
 	StartWithCli(nil)
@@ -57,8 +57,10 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			mainLogger.Fatal("Unknown config: %s", configName)
 		}
 
-		if iArgsJson, err := json.Marshal(config.InterceptorArgs); err == nil {
-			config.InterceptorArgsJson = iArgsJson
+		for i, iConfig := range config.Interceptors {
+			iArgsJson, err := json.Marshal(iConfig.Args)
+			checkFatal(&mainLogger, err)
+			config.Interceptors[i].ArgsJson = iArgsJson
 		}
 
 		proxy, err := proxyFromConfig(&config, &mainLogger, interceptorCallback)
@@ -107,41 +109,60 @@ func proxyFromConfig(config *proxy.ProxyConfig, logger *logging.Logger, cb Inter
 	}
 
 	proxyLogger := logging.NewLogger(logWriter, &slog.HandlerOptions{Level: logLevel})
-	var interceptor tlsbend.Interceptor
-	switch config.Interceptor {
-	case "hexdump":
-		interceptor = &tlsbend.HexDumpInterceptor{Logger: &proxyLogger}
-	case "bridge":
-		var bridgeConf proxy.BridgeConfig
-		if err := json.Unmarshal(config.InterceptorArgsJson, &bridgeConf); err != nil {
-			return nil, err
+	var interceptorsUp []tlsbend.Interceptor
+	var interceptorsDown []tlsbend.Interceptor
+	for _, iConfig := range config.Interceptors {
+		if iConfig.Disable {
+			logger.Warn("interceptor %s disabled", iConfig.Name)
+			continue
 		}
 
-		i := proxy.NewBridgeInterceptor(bridgeConf.Connect, logger)
-		interceptor = &i
-	case "none":
-		fallthrough
-	case "null":
-		fallthrough
-	case "nil":
-		fallthrough
-	case "":
-		interceptor = nil
-	default:
-		var err error
-		if cb != nil {
-			interceptor, err = cb(*config, logger)
+		var interceptor proxy.Interceptor
+		switch iConfig.Name {
+		case "hexdump":
+			interceptor = &tlsbend.HexDumpInterceptor{Logger: &proxyLogger}
+		case "bridge":
+			var bridgeConf proxy.BridgeConfig
+			if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
+				return nil, err
+			}
+
+			i := proxy.NewBridgeInterceptor(bridgeConf.Connect, logger)
+			interceptor = &i
+		case "none":
+		case "null":
+		case "nil":
+		case "":
+		default:
+			var err error
+			if cb != nil {
+				interceptor, err = cb(*config, iConfig, logger)
+			}
+
+			switch {
+			case err != nil:
+				return nil, err
+			case interceptor == nil:
+				return nil, fmt.Errorf("unknown (custom) interceptor: %s", iConfig.Name)
+			}
 		}
 
-		switch {
-		case err != nil:
-			return nil, err
-		case interceptor == nil:
-			return nil, fmt.Errorf("unknown (custom) interceptor: %s", config.Interceptor)
+		switch dir := strings.ToLower(iConfig.Direction); dir {
+		case "up":
+			interceptorsUp = append(interceptorsUp, interceptor)
+		case "down":
+			interceptorsDown = append(interceptorsDown, interceptor)
+		case "both":
+			fallthrough
+		case "":
+			interceptorsUp = append(interceptorsUp, interceptor)
+			interceptorsDown = append(interceptorsDown, interceptor)
+		default:
+			return nil, fmt.Errorf("invalid direction: %s", dir)
 		}
 	}
 
-	p := proxy.NewProxy(*config, mode, interceptor, interceptor, proxyLogger)
+	p := proxy.NewProxy(*config, mode, interceptorsUp, interceptorsDown, proxyLogger)
 	return &p, nil
 }
 

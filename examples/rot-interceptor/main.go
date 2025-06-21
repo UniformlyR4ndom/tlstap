@@ -79,13 +79,13 @@ func rotLetter(r rune, rot int) rune {
 	}
 }
 
-func configCallback(config tlstap.ProxyConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
-	if config.Interceptor != "rot" {
-		return nil, fmt.Errorf("unexpected interceptor name: %s", config.Interceptor)
+func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
+	if iConfig.Name != "rot" {
+		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}
 
 	var rConf RotConfig
-	checkFatal(json.Unmarshal(config.InterceptorArgsJson, &rConf))
+	checkFatal(json.Unmarshal(iConfig.ArgsJson, &rConf))
 
 	i := RotInterceptor{
 		rot:          rConf.Rot,

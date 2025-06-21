@@ -30,15 +30,16 @@ func (i *StringReplacer) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, 
 	return []byte(str), nil
 }
 
-func configCallback(config tlstap.ProxyConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
-	if config.Interceptor != "replacer" {
-		return nil, fmt.Errorf("unexpected interceptor name: %s", config.Interceptor)
+func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
+	if iConfig.Name != "replacer" {
+		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}
 
 	var rConf ReplacerConfig
-	checkFatal(json.Unmarshal(config.InterceptorArgsJson, &rConf))
+	err := json.Unmarshal(iConfig.ArgsJson, &rConf)
+	checkFatal(err)
 
-	logger.Info("Replacer config: %v", rConf)
+	logger.Info("Replacer config: %v", iConfig)
 	i := StringReplacer{
 		replacements: rConf.Replacements,
 	}

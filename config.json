@@ -1,7 +1,11 @@
 {
     "test-plain": {
         "mode": "plain",
-        "interceptor": "hexdump",
+        "interceptors": [
+            {
+                "name": "hexdump"
+            }
+        ],
         "server": {
             "listen": "127.0.0.1:8000"
         },
@@ -11,7 +15,11 @@
     },
     "test-tls": {
         "mode": "tls",
-        "interceptor": "hexdump",
+        "interceptors": [
+            {
+                "name": "hexdump"
+            }
+        ],
         "server": {
             "listen": "127.0.0.1:8001",
             "cert-pem": "cert.pem",
@@ -30,7 +38,11 @@
     },
     "test-detecttls": {
         "mode": "detecttls",
-        "interceptor": "hexdump",
+        "interceptors": [
+            {
+                "name": "hexdump"
+            }
+        ],
         "loglevel": "debug",
         "server": {
             "listen": "127.0.0.1:8002",
@@ -46,13 +58,18 @@
             "key-logfile": "key.log"
         }
     },
-    "rot-interceptor": {
+    "rot": {
         "mode": "detecttls",
-        "interceptor": "rot",
-        "interceptor-args": {
-            "rot": 1,
-            "min-len": 2
-        },
+        "interceptors": [
+            {
+                "name": "rot",
+                "direction": "up",
+                "args": {
+                    "rot": 1,
+                    "min-len": 2
+                }
+            }
+        ],
         "server": {
             "listen": "127.0.0.1:8002",
             "cert-pem": "cert.pem",
@@ -65,13 +82,17 @@
     },
     "string-replacer": {
         "mode": "detecttls",
-        "interceptor": "replacer",
-        "interceptor-args": {
-            "replacements":{
-                "ping": "pong",
-                "hello": "byeee"
+        "interceptors": [
+            {
+                "name": "replacer",
+                "args": {
+                    "replacements": {
+                        "ping": "pong",
+                        "hello": "byeee"
+                    }
+                }
             }
-        },
+        ],
         "server": {
             "listen": "127.0.0.1:8002",
             "cert-pem": "cert.pem",
@@ -84,10 +105,14 @@
     },
     "string-replacer-py": {
         "mode": "detecttls",
-        "interceptor": "bridge",
-        "interceptor-args": {
-            "connect": "127.0.0.1:5555"
-        },
+        "interceptors": [
+            {
+                "name": "bridge",
+                "args": {
+                    "connect": "127.0.0.1:5555"
+                }
+            }
+        ],
         "server": {
             "listen": "127.0.0.1:8002",
             "cert-pem": "cert.pem",

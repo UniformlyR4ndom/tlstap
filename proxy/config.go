@@ -4,24 +4,39 @@ type ProxyConfig struct {
 	// mode of the proxy; acceptable values: plain, tls, detecttls (default)
 	Mode string `json:"mode"`
 
+	// log level; possible values: debug, info (default), warn, error
 	LogLevel string `json:"loglevel"`
-	LogFile  string `json:"logfile"`
 
-	// name of the interceptor to use
-	Interceptor string `json:"interceptor"`
+	// path to log file; if none given, log is written to stdout
+	LogFile string `json:"logfile"`
 
-	// aruments to pass to custom interceptors
-	InterceptorArgs map[string]any `json:"interceptor-args"`
-
-	// same as InterceptorArgs but the bytes representing the JSON string
-	// useful to pass to json.Unmarshal directly to recover custom structs
-	InterceptorArgsJson []byte `json:"interceptor-args-json"`
+	// intercpetors
+	Interceptors []InterceptorConfig `json:"interceptors"`
 
 	// configuration for the server part of the proxy
 	Server ServerConfig `json:"server"`
 
 	// configuration for the client part of the proxy
 	Client ClientConfig `json:"client"`
+}
+
+type InterceptorConfig struct {
+	// name of the interceptor
+	Name string `json:"name"`
+
+	// disable the interceptor
+	Disable bool `json:"disable"`
+
+	// direction in whicht the interceptor is active
+	// possible values: up, down, both (default)
+	Direction string `json:"direction"`
+
+	// aruments to pass to custom interceptors
+	Args map[string]any `json:"args"`
+
+	// same as InterceptorArgs but the bytes representing the JSON string
+	// useful to pass to json.Unmarshal directly to recover custom structs
+	ArgsJson []byte `json:"args-json"`
 }
 
 type ServerConfig struct {
