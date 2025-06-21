@@ -7,6 +7,7 @@ import (
 	"unicode"
 
 	"tlstap/cli"
+	interceptors "tlstap/interceptors"
 	"tlstap/logging"
 	tlstap "tlstap/proxy"
 )
@@ -18,7 +19,7 @@ type RotConfig struct {
 
 type RotInterceptor struct {
 	// implements unused boilerplate (Init, Finalize, ConnectionEstablished, ConnectionTerminated)
-	tlstap.NullInterceptor
+	interceptors.NullInterceptor
 
 	rot          int
 	minSeqLength int

@@ -10,12 +10,12 @@ import (
 	"strings"
 	"sync"
 
+	"tlstap/interceptors"
 	logging "tlstap/logging"
-	proxy "tlstap/proxy"
-	tlsbend "tlstap/proxy"
+	tlstap "tlstap/proxy"
 )
 
-type InterceptorCallback func(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
+type InterceptorCallback func(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
 
 func main() {
 	StartWithCli(nil)
@@ -35,7 +35,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	configData, err := os.ReadFile(configPath)
 	checkFatal(&mainLogger, err)
 
-	var configs map[string]proxy.ProxyConfig
+	var configs map[string]tlstap.ProxyConfig
 	checkFatal(&mainLogger, json.Unmarshal(configData, &configs))
 
 	var enabledConfigs []string
@@ -74,15 +74,15 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	wg.Wait()
 }
 
-func proxyFromConfig(config *proxy.ProxyConfig, logger *logging.Logger, cb InterceptorCallback) (*proxy.Proxy, error) {
-	var mode proxy.Mode
+func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb InterceptorCallback) (*tlstap.Proxy, error) {
+	var mode tlstap.Mode
 	switch m := strings.ToLower(strings.TrimSpace(config.Mode)); m {
 	case "plain":
-		mode = proxy.ModePlain
+		mode = tlstap.ModePlain
 	case "tls":
-		mode = proxy.ModeTls
+		mode = tlstap.ModeTls
 	case "detecttls":
-		mode = proxy.ModeDetectTls
+		mode = tlstap.ModeDetectTls
 	default:
 		return nil, fmt.Errorf("invalid proxy mode: %s", config.Mode)
 	}
@@ -109,25 +109,25 @@ func proxyFromConfig(config *proxy.ProxyConfig, logger *logging.Logger, cb Inter
 	}
 
 	proxyLogger := logging.NewLogger(logWriter, &slog.HandlerOptions{Level: logLevel})
-	var interceptorsUp []tlsbend.Interceptor
-	var interceptorsDown []tlsbend.Interceptor
+	var interceptorsUp []tlstap.Interceptor
+	var interceptorsDown []tlstap.Interceptor
 	for _, iConfig := range config.Interceptors {
 		if iConfig.Disable {
 			logger.Warn("interceptor %s disabled", iConfig.Name)
 			continue
 		}
 
-		var interceptor proxy.Interceptor
+		var interceptor tlstap.Interceptor
 		switch iConfig.Name {
 		case "hexdump":
-			interceptor = &tlsbend.HexDumpInterceptor{Logger: &proxyLogger}
+			interceptor = &interceptors.HexDumpInterceptor{Logger: &proxyLogger}
 		case "bridge":
-			var bridgeConf proxy.BridgeConfig
+			var bridgeConf interceptors.BridgeConfig
 			if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
 				return nil, err
 			}
 
-			i := proxy.NewBridgeInterceptor(bridgeConf.Connect, logger)
+			i := interceptors.NewBridgeInterceptor(bridgeConf.Connect, logger)
 			interceptor = &i
 		case "none":
 		case "null":
@@ -162,11 +162,11 @@ func proxyFromConfig(config *proxy.ProxyConfig, logger *logging.Logger, cb Inter
 		}
 	}
 
-	p := proxy.NewProxy(*config, mode, interceptorsUp, interceptorsDown, proxyLogger)
+	p := tlstap.NewProxy(*config, mode, interceptorsUp, interceptorsDown, proxyLogger)
 	return &p, nil
 }
 
-func startProxy(p *proxy.Proxy, logger *logging.Logger) {
+func startProxy(p *tlstap.Proxy, logger *logging.Logger) {
 	err := p.Start()
 	checkFatal(logger, err)
 }

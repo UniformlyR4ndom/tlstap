@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"log"
 	"strings"
+
 	"tlstap/cli"
+	"tlstap/interceptors"
 	"tlstap/logging"
 	tlstap "tlstap/proxy"
 )
 
 type StringReplacer struct {
 	// implements unused boilerplate (Init, Finalize, ConnectionEstablished, ConnectionTerminated)
-	tlstap.NullInterceptor
+	interceptors.NullInterceptor
 
 	replacements map[string]string
 }

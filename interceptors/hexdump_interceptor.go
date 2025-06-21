@@ -1,9 +1,11 @@
-package tlstap
+package interceptors
 
 import (
+	"encoding/hex"
 	"net"
 
 	"tlstap/logging"
+	tlstap "tlstap/proxy"
 )
 
 type HexDumpInterceptor struct {
@@ -16,7 +18,7 @@ func (i *HexDumpInterceptor) Init(addr net.TCPAddr) error {
 
 func (i *HexDumpInterceptor) Finalize(addr net.TCPAddr) {}
 
-func (i *HexDumpInterceptor) ConnectionEstablished(info *ConnInfo) error {
+func (i *HexDumpInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	if i.Logger != nil {
 		i.Logger.Info("Connection established: %v (%v->%v)", info.ConnID, info.SrcEndpoint, info.DstEndpoint)
 	}
@@ -24,7 +26,7 @@ func (i *HexDumpInterceptor) ConnectionEstablished(info *ConnInfo) error {
 	return nil
 }
 
-func (i *HexDumpInterceptor) ConnectionTerminated(info *ConnInfo) error {
+func (i *HexDumpInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	if i.Logger != nil {
 		i.Logger.Info("Connection terminated: %v (%v->%v)", info.ConnID, info.SrcEndpoint, info.DstEndpoint)
 	}
@@ -34,9 +36,9 @@ func (i *HexDumpInterceptor) ConnectionTerminated(info *ConnInfo) error {
 
 // Write data in hexdump format to logger.
 // If the Logger is nil, skip logging entirely.
-func (i *HexDumpInterceptor) Intercept(info *ConnInfo, data []byte) ([]byte, error) {
+func (i *HexDumpInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
 	if i.Logger != nil {
-		i.Logger.Info("%v -> %v (%v):\n%v\n", info.SrcEndpoint, info.DstEndpoint, info.ConnID, FormatHexDump2(data))
+		i.Logger.Info("%v -> %v (%v):\n%v\n", info.SrcEndpoint, info.DstEndpoint, info.ConnID, hex.Dump(data))
 	}
 
 	return data, nil
