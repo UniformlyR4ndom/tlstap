@@ -10,7 +10,7 @@ import (
 
 	"tlstap/assert"
 	"tlstap/logging"
-	proxy "tlstap/proxy"
+	tlstap "tlstap/proxy"
 )
 
 type FrameType byte
@@ -158,7 +158,7 @@ func NewBridgeInterceptor(connect string, logger *logging.Logger) BridgeIntercep
 	}
 }
 
-func (i *BridgeInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
+func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	conn, err := net.Dial("tcp", i.connectEndpoint)
 	if err != nil {
 		return err
@@ -176,7 +176,7 @@ func (i *BridgeInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	return err
 }
 
-func (i *BridgeInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
+func (i *BridgeInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	infoFrame := InfoFrame{
 		eventId:    BridgeEventConnTerminated,
 		connId:     uint32(info.ConnID),
@@ -197,7 +197,7 @@ func (i *BridgeInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	return nil
 }
 
-func (i *BridgeInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
+func (i *BridgeInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
 	n := uint32(len(data))
 	assert.Assertf(int(n) == len(data), "Length truncated")
 

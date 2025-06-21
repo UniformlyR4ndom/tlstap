@@ -3,7 +3,7 @@ package interceptors
 import (
 	"net"
 
-	proxy "tlstap/proxy"
+	tlstap "tlstap/proxy"
 )
 
 // The NullInterceptor does nothing.
@@ -17,14 +17,14 @@ func (i *NullInterceptor) Init(addr net.TCPAddr) error {
 
 func (i *NullInterceptor) Finalize(addr net.TCPAddr) {}
 
-func (i *NullInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
+func (i *NullInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	return nil
 }
 
-func (i *NullInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
+func (i *NullInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	return nil
 }
 
-func (i *NullInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
+func (i *NullInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
 	return data, nil
 }
