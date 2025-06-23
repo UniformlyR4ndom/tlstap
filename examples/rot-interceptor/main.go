@@ -6,8 +6,8 @@ import (
 	"log"
 	"unicode"
 
-	"tlstap/cli"
-	interceptors "tlstap/interceptors"
+	main1 "tlstap/cli"
+	"tlstap/intercept"
 	"tlstap/logging"
 	tlstap "tlstap/proxy"
 )
@@ -19,7 +19,7 @@ type RotConfig struct {
 
 type RotInterceptor struct {
 	// implements unused boilerplate (Init, Finalize, ConnectionEstablished, ConnectionTerminated)
-	interceptors.NullInterceptor
+	intercept.NullInterceptor
 
 	rot          int
 	minSeqLength int
@@ -98,7 +98,7 @@ func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig,
 }
 
 func main() {
-	cli.StartWithCli(configCallback)
+	main1.StartWithCli(configCallback)
 }
 
 func checkFatal(err error) {

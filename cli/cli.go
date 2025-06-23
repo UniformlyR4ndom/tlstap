@@ -10,16 +10,12 @@ import (
 	"strings"
 	"sync"
 
-	"tlstap/interceptors"
-	logging "tlstap/logging"
+	"tlstap/intercept"
+	"tlstap/logging"
 	tlstap "tlstap/proxy"
 )
 
 type InterceptorCallback func(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
-
-func main() {
-	StartWithCli(nil)
-}
 
 func StartWithCli(interceptorCallback InterceptorCallback) {
 	optEnable := flag.String("enable", "", `Comma-separated list of proxy configurations to enable (e.g. "myconfig-a,myconfig-b")`)
@@ -120,14 +116,14 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 		var interceptor tlstap.Interceptor
 		switch iConfig.Name {
 		case "hexdump":
-			interceptor = &interceptors.HexDumpInterceptor{Logger: &proxyLogger}
+			interceptor = &intercept.HexDumpInterceptor{Logger: &proxyLogger}
 		case "bridge":
-			var bridgeConf interceptors.BridgeConfig
+			var bridgeConf intercept.BridgeConfig
 			if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
 				return nil, err
 			}
 
-			i := interceptors.NewBridgeInterceptor(bridgeConf.Connect, logger)
+			i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
 			interceptor = &i
 		case "none":
 		case "null":

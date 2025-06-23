@@ -142,8 +142,7 @@ func (h *ConnHandler) forwardDetectTls(conn net.Conn) error {
 
 func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) error {
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(connDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String(), h.ConnId)
-
+	connInfo := NewConnInfo(connDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
 	for {
 		peeked, err := connDown.Peek(buf)
 		if err != nil {
@@ -189,7 +188,7 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 		<-h.upgradeAckChan
 
 		// drain upstream connection in case there is outstanding data sent from the sever to the client
-		info := NewConnInfo(h.ConnUp.RemoteAddr().String(), connDown.RemoteAddr().String(), h.ConnId)
+		info := NewConnInfo(h.ConnUp.RemoteAddr(), connDown.RemoteAddr(), h.ConnId)
 		if err = h.drainConn(buf, h.ConnUp, h.ConnDown, h.InterceptorsDown, &info, drainTimeoutMs); err != nil {
 			h.logger.Error("Error while draining upstream connection: %v", err)
 			h.upgradeChan <- false
@@ -235,7 +234,7 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 
 func (h *ConnHandler) forwardDetectTlsDown() error {
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(h.ConnUp.RemoteAddr().String(), h.ConnDown.RemoteAddr().String(), h.ConnId)
+	connInfo := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
 
 	for {
 		read, err := h.ConnUp.Read(buf)
@@ -285,8 +284,8 @@ func (h *ConnHandler) drainConn(b []byte, connIn, connOut net.Conn, interceptors
 func (h *ConnHandler) forwardGeneric() error {
 	bufDown := make([]byte, bufSize)
 	bufUp := make([]byte, bufSize)
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr().String(), h.ConnDown.RemoteAddr().String(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
 
 	h.logger.Info("Forwarding %s <-> %s", h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String())
 	if err := h.notifyConnEstablished(); err != nil {
@@ -304,16 +303,16 @@ func (h *ConnHandler) forwardGeneric() error {
 
 // TODO: what to do on errors in ConnectionEstablished for any interceptor?
 func (h *ConnHandler) notifyConnEstablished() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr().String(), h.ConnDown.RemoteAddr().String(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
 	h.notifyEstablished(h.InterceptorsUp, &connInfoUp)
 	h.notifyEstablished(h.InterceptorsDown, &connInfoDown)
 	return nil
 }
 
 func (h *ConnHandler) notifyConnTerminated() {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr().String(), h.ConnDown.RemoteAddr().String(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
 	h.notifyTerminated(h.InterceptorsUp, &connInfoUp)
 	h.notifyTerminated(h.InterceptorsDown, &connInfoDown)
 }

@@ -2,6 +2,7 @@ package tlstap
 
 import (
 	"net"
+	"tlstap/assert"
 )
 
 type Interceptor interface {
@@ -27,15 +28,31 @@ type Interceptor interface {
 }
 
 type ConnInfo struct {
+	SrcIp   net.IP
+	SrcPort uint16
+
+	DstIp   net.IP
+	DstPort uint16
+
 	SrcEndpoint string
 	DstEndpoint string
 	ConnID      uint32
 }
 
-func NewConnInfo(srcEndpoint, dstEndpoing string, id uint32) ConnInfo {
+func NewConnInfo(lAddr, rAddr net.Addr, id uint32) ConnInfo {
+	lTcpAddr, ok := lAddr.(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected type: %T. This is a bug.", lAddr)
+
+	rTcpAddr, ok := rAddr.(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected type: %T. This is a bug.", rAddr)
+
 	return ConnInfo{
-		SrcEndpoint: srcEndpoint,
-		DstEndpoint: dstEndpoing,
+		SrcIp:       lTcpAddr.IP,
+		SrcPort:     uint16(lTcpAddr.Port),
+		SrcEndpoint: lTcpAddr.String(),
+		DstIp:       rTcpAddr.IP,
+		DstPort:     uint16(rTcpAddr.Port),
+		DstEndpoint: rTcpAddr.String(),
 		ConnID:      id,
 	}
 }

@@ -6,15 +6,15 @@ import (
 	"log"
 	"strings"
 
-	"tlstap/cli"
-	"tlstap/interceptors"
+	main1 "tlstap/cli"
+	"tlstap/intercept"
 	"tlstap/logging"
 	tlstap "tlstap/proxy"
 )
 
 type StringReplacer struct {
 	// implements unused boilerplate (Init, Finalize, ConnectionEstablished, ConnectionTerminated)
-	interceptors.NullInterceptor
+	intercept.NullInterceptor
 
 	replacements map[string]string
 }
@@ -50,7 +50,7 @@ func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig,
 }
 
 func main() {
-	cli.StartWithCli(configCallback)
+	main1.StartWithCli(configCallback)
 }
 
 func checkFatal(err error) {
