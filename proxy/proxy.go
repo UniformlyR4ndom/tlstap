@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"tlstap/assert"
 	"tlstap/logging"
 )
 
@@ -18,18 +19,20 @@ type Proxy struct {
 
 	InterceptorsUp   []Interceptor
 	InterceptorsDown []Interceptor
+	InterceptorsAll  []Interceptor
 
 	logger logging.Logger
 
 	nextConnId uint32
 }
 
-func NewProxy(config ProxyConfig, mode Mode, iUp, iDown []Interceptor, logger logging.Logger) Proxy {
+func NewProxy(config ProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
 	return Proxy{
 		Config:           config,
 		Mode:             mode,
 		InterceptorsUp:   iUp,
 		InterceptorsDown: iDown,
+		InterceptorsAll:  iAll,
 		logger:           logger,
 	}
 }
@@ -170,6 +173,10 @@ func (p *Proxy) startPlainProxy() error {
 	}
 
 	p.logger.Info("proxy (mode plain) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	notifyInit(p.InterceptorsAll, *tcpAddr)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -197,6 +204,10 @@ func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) erro
 	}
 
 	p.logger.Info("proxy (mode TLS) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	notifyInit(p.InterceptorsAll, *tcpAddr)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -218,6 +229,10 @@ func (p *Proxy) startDetectTlsProxy(tlsServerConfig, tlsClientconfig *tls.Config
 	}
 
 	p.logger.Info("proxy (mode detecttls) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	notifyInit(p.InterceptorsAll, *tcpAddr)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -246,4 +261,14 @@ func (p *Proxy) newHandler(mode Mode) *ConnHandler {
 
 	p.nextConnId++
 	return &handler
+}
+
+func notifyInit(interceptors []Interceptor, listenAddress net.TCPAddr) error {
+	for _, i := range interceptors {
+		if err := i.Init(listenAddress); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

@@ -107,6 +107,7 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 	proxyLogger := logging.NewLogger(logWriter, &slog.HandlerOptions{Level: logLevel})
 	var interceptorsUp []tlstap.Interceptor
 	var interceptorsDown []tlstap.Interceptor
+	var interceptorsAll []tlstap.Interceptor
 	for _, iConfig := range config.Interceptors {
 		if iConfig.Disable {
 			logger.Warn("interceptor %s disabled", iConfig.Name)
@@ -124,6 +125,14 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 			}
 
 			i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
+			interceptor = &i
+		case "pcapdump":
+			var pcapConfig intercept.PcapConfig
+			if err := json.Unmarshal(iConfig.ArgsJson, &pcapConfig); err != nil {
+				return nil, err
+			}
+
+			i := intercept.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
 			interceptor = &i
 		case "none":
 		case "null":
@@ -156,9 +165,11 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 		default:
 			return nil, fmt.Errorf("invalid direction: %s", dir)
 		}
+
+		interceptorsAll = append(interceptorsAll, interceptor)
 	}
 
-	p := tlstap.NewProxy(*config, mode, interceptorsUp, interceptorsDown, proxyLogger)
+	p := tlstap.NewProxy(*config, mode, interceptorsUp, interceptorsDown, interceptorsAll, proxyLogger)
 	return &p, nil
 }
 

@@ -28,10 +28,10 @@ type Interceptor interface {
 }
 
 type ConnInfo struct {
-	SrcIp   net.IP
+	SrcIP   net.IP
 	SrcPort uint16
 
-	DstIp   net.IP
+	DstIP   net.IP
 	DstPort uint16
 
 	SrcEndpoint string
@@ -47,10 +47,10 @@ func NewConnInfo(lAddr, rAddr net.Addr, id uint32) ConnInfo {
 	assert.Assertf(ok, "Unexpected type: %T. This is a bug.", rAddr)
 
 	return ConnInfo{
-		SrcIp:       lTcpAddr.IP,
+		SrcIP:       lTcpAddr.IP,
 		SrcPort:     uint16(lTcpAddr.Port),
 		SrcEndpoint: lTcpAddr.String(),
-		DstIp:       rTcpAddr.IP,
+		DstIP:       rTcpAddr.IP,
 		DstPort:     uint16(rTcpAddr.Port),
 		DstEndpoint: rTcpAddr.String(),
 		ConnID:      id,

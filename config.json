@@ -41,6 +41,13 @@
         "interceptors": [
             {
                 "name": "hexdump"
+            },
+            {
+                "name": "pcapdump",
+                "args": {
+                    "file": "dump.pcap",
+                    "truncate": true
+                }
             }
         ],
         "loglevel": "debug",
