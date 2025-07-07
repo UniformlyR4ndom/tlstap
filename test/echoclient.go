@@ -43,7 +43,7 @@ func NewEchoClient(connect string, bufSize int, trigger []byte, config *tls.Conf
 
 func (c *EchoClient) Start() error {
 	conn, err := net.Dial("tcp", c.connect)
-	checkFatal(err)
+	CheckFatal(err)
 
 	go c.forwardText(conn)
 	c.readReplies(conn)
@@ -89,14 +89,14 @@ func (c *EchoClient) readReplies(conn net.Conn) {
 		}
 
 		_, err := io.ReadFull(conn, buf[:frameSize])
-		checkFatal(err)
+		CheckFatal(err)
 		c.msgReceived()
 
 		fmt.Print(string(buf[:frameSize]))
 
 		if c.shouldUpgrade() {
 			tlsConn := tls.Client(conn, c.tlsConfig)
-			checkFatal(tlsConn.Handshake())
+			CheckFatal(tlsConn.Handshake())
 
 			conn = tlsConn
 			c.upgradeChan <- tlsConn
@@ -110,7 +110,7 @@ func (c *EchoClient) forwardText(conn net.Conn) {
 	for {
 		text, err := reader.ReadString(byte('\n'))
 		data := []byte(text)
-		checkFatal(err)
+		CheckFatal(err)
 
 		frameSize := uint32(len(data))
 		binary.Write(conn, binary.LittleEndian, frameSize)
@@ -121,11 +121,5 @@ func (c *EchoClient) forwardText(conn net.Conn) {
 			c.markForUpgrade()
 			conn = <-c.upgradeChan
 		}
-	}
-}
-
-func checkFatal(err error) {
-	if err != nil {
-		log.Fatalf("Fatal error: %v", err)
 	}
 }

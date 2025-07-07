@@ -1,44 +1,52 @@
 package main
 
 import (
-	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"log"
+	"os"
 
 	"tlstap/test"
 )
 
-func main() {
-	optListen := flag.String("l", "", "listen endpoint (e.g. 127.0.0.1:8000)")
-	optTrigger := flag.String("trigger", "starttls", "trigger to start TLS upgrade")
-	optBufSize := flag.Int("bs", 8192, "buffer size")
-	optCertPem := flag.String("cert-pem", "", "path to certificate (in PEM format)")
-	optCertKey := flag.String("cert-key", "", "path to certificate key")
-	flag.Parse()
+type EchoServerConfig struct {
+	Listen     string `json:"listen"`
+	Trigger    string `json:"trigger"`
+	BufferSize int    `json:"buffer-size"`
 
-	if *optListen == "" {
-		log.Fatal("Listen endpoint must be provided")
-	}
-
-	if *optCertPem == "" || *optCertKey == "" {
-		log.Fatal("Certificate and corresponding key must be provided")
-	}
-
-	cert, err := tls.LoadX509KeyPair(*optCertPem, *optCertKey)
-	checkFatal(err)
-
-	tlsConfig := tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10,
-		MaxVersion:   tls.VersionTLS13,
-	}
-
-	server := test.NewEchoServer(*optListen, *optBufSize, &tlsConfig, []byte(*optTrigger))
-	checkFatal(server.Start())
+	TlsServerConfig test.TlsServerConfig `json:"tls-config"`
 }
 
-func checkFatal(err error) {
-	if err != nil {
-		log.Fatalf("Fatal error: %v", err)
+func main() {
+	optConfig := flag.String("config", "server-config.json", "Path to server config")
+	optEnable := flag.String("enable", "", "Name of enabled config")
+	flag.Parse()
+
+	data, err := os.ReadFile(*optConfig)
+	test.CheckFatal(err)
+
+	var configs map[string]EchoServerConfig
+	err = json.Unmarshal(data, &configs)
+	test.CheckFatal(err)
+
+	config, ok := configs[*optEnable]
+	if !ok {
+		log.Fatalf("config %s not found", *optEnable)
 	}
+
+	bufSize := 8192
+	if config.BufferSize > 0 {
+		bufSize = config.BufferSize
+	}
+
+	trigger := "starttls"
+	if config.Trigger != "" {
+		trigger = config.Trigger
+	}
+
+	tlsConfig, err := test.ParseServerConfig(&config.TlsServerConfig)
+	test.CheckFatal(err)
+
+	server := test.NewEchoServer(config.Listen, bufSize, tlsConfig, []byte(trigger))
+	test.CheckFatal(server.Start())
 }

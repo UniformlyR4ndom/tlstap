@@ -1,0 +1,41 @@
+{
+    "mtls-default": {
+        "connect": "127.0.0.1:8000",
+        "trigger": "tls",
+        "tls-config": {
+            "cert-pem": "../certs/client.pem",
+            "cert-key": "../certs/client.key",
+            "roots": "../certs/ca.pem", 
+            "server-name": "echoserver.local",
+            "skip-verify": false,
+            "min-version": "",
+            "max-version": "1.2"
+        }
+    },
+    "mtls-system-roots": {
+        "connect": "127.0.0.1:8000",
+        "trigger": "tls",
+        "tls-config": {
+            "cert-pem": "../certs/client.pem",
+            "cert-key": "../certs/client.key",
+            "roots": "", 
+            "server-name": "echoserver.local",
+            "skip-verify": false,
+            "min-version": "",
+            "max-version": "1.2"
+        }
+    },
+    "mtls-int-1": {
+        "connect": "127.0.0.1:8000",
+        "trigger": "tls",
+        "tls-config": {
+            "cert-pem": "../certs/client-int-1-chain.pem",
+            "cert-key": "../certs/client-int-1.key",
+            "roots": "../certs/ca.pem", 
+            "server-name": "echoserver.local",
+            "skip-verify": false,
+            "min-version": "",
+            "max-version": "1.2"
+        }
+    }
+}
