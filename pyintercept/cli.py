@@ -7,8 +7,8 @@ from .server import Server
 
 def start_with_cli(interceptor : Interceptor):
     parser = argparse.ArgumentParser(
-    prog="string-repacer", 
-    description="String replacer interceptor. Example for a custom interceptor for tlstap in python (via the BridgeInterceptor).")
+    prog="bridge-interceptor-py",
+    description="Bridge-interceptor implementation in python. Useful to write custom interceptors for tlstap in python.")
     parser.add_argument("-p", "--listen-port")
     parser.add_argument("-ip", "--listen-ip")
     args = parser.parse_args()

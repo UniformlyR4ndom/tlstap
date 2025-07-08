@@ -17,6 +17,7 @@ class StringReplacer(Interceptor):
     def intercept(self, connId : int, data : bytearray) -> bytearray:
         data = data.replace(b'ping', b'pong')
         data = data.replace(b'hello', b'byeee')
+        data = data.replace(b'go', b'py')
         return data
     
 

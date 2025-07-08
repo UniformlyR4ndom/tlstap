@@ -41,7 +41,6 @@ func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig,
 	err := json.Unmarshal(iConfig.ArgsJson, &rConf)
 	checkFatal(err)
 
-	logger.Info("Replacer config: %v", iConfig)
 	i := StringReplacer{
 		replacements: rConf.Replacements,
 	}
