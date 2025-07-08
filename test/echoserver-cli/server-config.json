@@ -1,6 +1,6 @@
 {
     "mtls-forced": {
-        "listen": "127.0.0.1:8000",
+        "listen": "127.0.0.1:8100",
         "trigger": "tls",
         "tls-config": {
             "cert-pem": "../certs/server.pem",

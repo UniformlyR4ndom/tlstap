@@ -12,6 +12,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	tlstap "tlstap/proxy"
 )
 
 type EchoClient struct {
@@ -43,7 +44,7 @@ func NewEchoClient(connect string, bufSize int, trigger []byte, config *tls.Conf
 
 func (c *EchoClient) Start() error {
 	conn, err := net.Dial("tcp", c.connect)
-	CheckFatal(err)
+	tlstap.CheckFatal(err)
 
 	go c.forwardText(conn)
 	c.readReplies(conn)
@@ -89,14 +90,14 @@ func (c *EchoClient) readReplies(conn net.Conn) {
 		}
 
 		_, err := io.ReadFull(conn, buf[:frameSize])
-		CheckFatal(err)
+		tlstap.CheckFatal(err)
 		c.msgReceived()
 
 		fmt.Print(string(buf[:frameSize]))
 
 		if c.shouldUpgrade() {
 			tlsConn := tls.Client(conn, c.tlsConfig)
-			CheckFatal(tlsConn.Handshake())
+			tlstap.CheckFatal(tlsConn.Handshake())
 
 			conn = tlsConn
 			c.upgradeChan <- tlsConn
@@ -110,7 +111,7 @@ func (c *EchoClient) forwardText(conn net.Conn) {
 	for {
 		text, err := reader.ReadString(byte('\n'))
 		data := []byte(text)
-		CheckFatal(err)
+		tlstap.CheckFatal(err)
 
 		frameSize := uint32(len(data))
 		binary.Write(conn, binary.LittleEndian, frameSize)

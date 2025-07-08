@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 
+	tlstap "tlstap/proxy"
 	"tlstap/test"
 )
 
@@ -14,7 +15,7 @@ type EchoServerConfig struct {
 	Trigger    string `json:"trigger"`
 	BufferSize int    `json:"buffer-size"`
 
-	TlsServerConfig test.TlsServerConfig `json:"tls-config"`
+	TlsServerConfig tlstap.TlsServerConfig `json:"tls-config"`
 }
 
 func main() {
@@ -23,11 +24,11 @@ func main() {
 	flag.Parse()
 
 	data, err := os.ReadFile(*optConfig)
-	test.CheckFatal(err)
+	tlstap.CheckFatal(err)
 
 	var configs map[string]EchoServerConfig
 	err = json.Unmarshal(data, &configs)
-	test.CheckFatal(err)
+	tlstap.CheckFatal(err)
 
 	config, ok := configs[*optEnable]
 	if !ok {
@@ -44,9 +45,9 @@ func main() {
 		trigger = config.Trigger
 	}
 
-	tlsConfig, err := test.ParseServerConfig(&config.TlsServerConfig)
-	test.CheckFatal(err)
+	tlsConfig, err := tlstap.ParseServerConfig(&config.TlsServerConfig)
+	tlstap.CheckFatal(err)
 
 	server := test.NewEchoServer(config.Listen, bufSize, tlsConfig, []byte(trigger))
-	test.CheckFatal(server.Start())
+	tlstap.CheckFatal(server.Start())
 }

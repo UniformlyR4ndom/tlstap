@@ -3,10 +3,7 @@ package tlstap
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
-	"os"
-	"strings"
 
 	"tlstap/assert"
 	"tlstap/logging"
@@ -38,17 +35,25 @@ func NewProxy(config ProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, log
 }
 
 func (p *Proxy) Start() error {
+	if p.Config.ListenEndpoint == "" {
+		return fmt.Errorf("listen endpoint must be specified")
+	}
+
+	if p.Config.ConnectEndpoint == "" {
+		return fmt.Errorf("connect endpoint must be specified")
+	}
+
 	var tlsServerConfig, tlsClientconfig *tls.Config
 	var err error
 	switch p.Mode {
 	case ModeTls:
 		fallthrough
 	case ModeDetectTls:
-		if tlsServerConfig, err = p.getTlsServerConfig(); err != nil {
+		if tlsServerConfig, err = ParseServerConfig(&p.Config.Server); err != nil {
 			return err
 		}
 
-		if tlsClientconfig, err = p.getTlsClientConfig(); err != nil {
+		if tlsClientconfig, err = ParseClientConfig(&p.Config.Client); err != nil {
 			return err
 		}
 	}
@@ -65,20 +70,21 @@ func (p *Proxy) Start() error {
 	}
 }
 
+/*
 func (p *Proxy) getTlsServerConfig() (*tls.Config, error) {
 	serverConfig := p.Config.Server
 
 	var err error
 	serverTlsMin := uint16(tls.VersionTLS10)
-	serverTlsMax := uint16(tls.VersionTLS13)
-	if serverConfig.TlsMin != "" {
-		if serverTlsMin, err = TlsVersionFromString(serverConfig.TlsMin); err != nil {
+	if serverConfig.MinVersion != "" {
+		if serverTlsMin, err = TlsVersionFromString(serverConfig.MinVersion); err != nil {
 			return nil, err
 		}
 	}
 
-	if serverConfig.TlsMax != "" {
-		if serverTlsMax, err = TlsVersionFromString(serverConfig.TlsMax); err != nil {
+	serverTlsMax := uint16(tls.VersionTLS13)
+	if serverConfig.MaxVersion != "" {
+		if serverTlsMax, err = TlsVersionFromString(serverConfig.MaxVersion); err != nil {
 			return nil, err
 		}
 	}
@@ -89,7 +95,7 @@ func (p *Proxy) getTlsServerConfig() (*tls.Config, error) {
 	}
 
 	var clientAuth tls.ClientAuthType
-	switch clientAuthStr := strings.ToLower(strings.TrimSpace(serverConfig.ClientAuth)); clientAuthStr {
+	switch clientAuthStr := strings.ToLower(strings.TrimSpace(serverConfig.ClientAuthPolicy)); clientAuthStr {
 	case "":
 		fallthrough
 	case "none":
@@ -103,7 +109,7 @@ func (p *Proxy) getTlsServerConfig() (*tls.Config, error) {
 	case "require-and-verify":
 		clientAuth = tls.RequireAndVerifyClientCert
 	default:
-		return nil, fmt.Errorf("invalid client auth type: %s", serverConfig.ClientAuth)
+		return nil, fmt.Errorf("invalid client auth type: %s", serverConfig.ClientAuthPolicy)
 	}
 
 	var keyLogWriter io.Writer = nil
@@ -123,21 +129,23 @@ func (p *Proxy) getTlsServerConfig() (*tls.Config, error) {
 
 	return &tlsConfig, nil
 }
+*/
 
+/*
 func (p *Proxy) getTlsClientConfig() (*tls.Config, error) {
 	clientConfig := p.Config.Client
 
 	var err error
 	clientTlsMin := uint16(tls.VersionTLS10)
 	clientTlsMax := uint16(tls.VersionTLS13)
-	if clientConfig.TlsMin != "" {
-		if clientTlsMin, err = TlsVersionFromString(clientConfig.TlsMin); err != nil {
+	if clientConfig.MinVersion != "" {
+		if clientTlsMin, err = TlsVersionFromString(clientConfig.MinVersion); err != nil {
 			return nil, err
 		}
 	}
 
-	if clientConfig.TlsMax != "" {
-		if clientTlsMax, err = TlsVersionFromString(clientConfig.TlsMax); err != nil {
+	if clientConfig.MaxVersion != "" {
+		if clientTlsMax, err = TlsVersionFromString(clientConfig.MaxVersion); err != nil {
 			return nil, err
 		}
 	}
@@ -155,7 +163,7 @@ func (p *Proxy) getTlsClientConfig() (*tls.Config, error) {
 	}
 
 	tlsConfig := tls.Config{
-		InsecureSkipVerify: !clientConfig.VerifyCert,
+		InsecureSkipVerify: clientConfig.SkipVerify,
 		MinVersion:         clientTlsMin,
 		MaxVersion:         clientTlsMax,
 		ServerName:         p.Config.Client.ServerName,
@@ -165,14 +173,15 @@ func (p *Proxy) getTlsClientConfig() (*tls.Config, error) {
 
 	return &tlsConfig, nil
 }
+*/
 
 func (p *Proxy) startPlainProxy() error {
-	listener, err := net.Listen("tcp", p.Config.Server.ListenEndpoint)
+	listener, err := net.Listen("tcp", p.Config.ListenEndpoint)
 	if err != nil {
 		return err
 	}
 
-	p.logger.Info("proxy (mode plain) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	p.logger.Info("proxy (mode plain) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -189,6 +198,7 @@ func (p *Proxy) startPlainProxy() error {
 	}
 }
 
+/*
 func (p *Proxy) loadCert(certPath, keyPath string) (tls.Certificate, error) {
 	if certPath == "" || keyPath == "" {
 		return tls.Certificate{}, fmt.Errorf("server certificate pem and key path must be provided")
@@ -196,14 +206,15 @@ func (p *Proxy) loadCert(certPath, keyPath string) (tls.Certificate, error) {
 
 	return tls.LoadX509KeyPair(certPath, keyPath)
 }
+*/
 
 func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) error {
-	listener, err := tls.Listen("tcp", p.Config.Server.ListenEndpoint, tlsServerConfig)
+	listener, err := tls.Listen("tcp", p.Config.ListenEndpoint, tlsServerConfig)
 	if err != nil {
 		return err
 	}
 
-	p.logger.Info("proxy (mode TLS) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	p.logger.Info("proxy (mode TLS) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -223,12 +234,12 @@ func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) erro
 }
 
 func (p *Proxy) startDetectTlsProxy(tlsServerConfig, tlsClientconfig *tls.Config) error {
-	listener, err := net.Listen("tcp", p.Config.Server.ListenEndpoint)
+	listener, err := net.Listen("tcp", p.Config.ListenEndpoint)
 	if err != nil {
 		return err
 	}
 
-	p.logger.Info("proxy (mode detecttls) listening at %s and forwarding to %s", p.Config.Server.ListenEndpoint, p.Config.Client.ConnectEndpoint)
+	p.logger.Info("proxy (mode detecttls) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -250,7 +261,7 @@ func (p *Proxy) startDetectTlsProxy(tlsServerConfig, tlsClientconfig *tls.Config
 func (p *Proxy) newHandler(mode Mode) *ConnHandler {
 	handler := ConnHandler{
 		Setting: ConnSettings{
-			ConnectEndpoint: p.Config.Client.ConnectEndpoint,
+			ConnectEndpoint: p.Config.ConnectEndpoint,
 			Mode:            mode,
 		},
 		InterceptorsUp:   p.InterceptorsUp,

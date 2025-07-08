@@ -1,19 +1,24 @@
 {
     "test-plain": {
+        "listen": "127.0.0.1:8000",
+        "connect": "127.0.0.1:8100",
         "mode": "plain",
         "interceptors": [
             {
                 "name": "hexdump"
+            },
+            {
+                "name": "pcapdump",
+                "args": {
+                    "file": "dump.pcap",
+                    "truncate": true
+                }
             }
-        ],
-        "server": {
-            "listen": "127.0.0.1:8000"
-        },
-        "client": {
-            "connect": "127.0.0.1:8100"
-        }
+        ]
     },
     "test-tls": {
+        "listen": "127.0.0.1:8001",
+        "connect": "127.0.0.1:8101",
         "mode": "tls",
         "interceptors": [
             {
@@ -21,22 +26,22 @@
             }
         ],
         "server": {
-            "listen": "127.0.0.1:8001",
             "cert-pem": "cert.pem",
             "cert-key": "cert.key",
-            "key-logfile": "key.log"
+            "keylog": "key.log"
         },
         "client": {
-            "connect": "127.0.0.1:8101",
             "server-name": "tlstap-test-server-name",
             "alpn": [
                 "myprotoA", 
                 "myprotoB"
             ],
-            "key-logfile": "key.log"
+            "keylog": "key.log"
         }
     },
     "test-detecttls": {
+        "listen": "127.0.0.1:8000",
+        "connect": "127.0.0.1:8100",
         "mode": "detecttls",
         "interceptors": [
             {
@@ -52,20 +57,22 @@
         ],
         "loglevel": "debug",
         "server": {
-            "listen": "127.0.0.1:8002",
-            "cert-pem": "cert.pem",
-            "cert-key": "cert.key",
-            "key-logfile": "key.log"
-
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key",
+            "client-auth": "none"
         },
         "client": {
-            "connect": "127.0.0.1:8102",
-            "server-name": "detecttls-server",
+            "server-name": "server.local",
+            "cert-pem": "test/certs/client-int-1-chain.pem",
+            "cert-key": "test/certs/client-int-1.key",
             "tls-max": "1.1",
-            "key-logfile": "key.log"
+            "skip-verify": true,
+            "ALPN": ["not h2"]
         }
     },
     "rot": {
+        "listen": "127.0.0.1:8000",
+        "connect": "127.0.0.1:8100",
         "mode": "detecttls",
         "interceptors": [
             {
@@ -78,16 +85,20 @@
             }
         ],
         "server": {
-            "listen": "127.0.0.1:8002",
-            "cert-pem": "cert.pem",
-            "cert-key": "cert.key"
-
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key"
         },
         "client": {
-            "connect": "127.0.0.1:8102"
+            "server-name": "server.local",
+            "cert-pem": "test/certs/client-int-1-chain.pem",
+            "cert-key": "test/certs/client-int-1.key",
+            "tls-max": "1.1",
+            "skip-verify": true
         }
     },
     "string-replacer": {
+        "listen": "127.0.0.1:8000",
+        "connect": "127.0.0.1:8100",
         "mode": "detecttls",
         "interceptors": [
             {
@@ -101,16 +112,20 @@
             }
         ],
         "server": {
-            "listen": "127.0.0.1:8002",
-            "cert-pem": "cert.pem",
-            "cert-key": "cert.key"
-
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key"
         },
         "client": {
-            "connect": "127.0.0.1:8102"
+            "server-name": "server.local",
+            "cert-pem": "test/certs/client-int-1-chain.pem",
+            "cert-key": "test/certs/client-int-1.key",
+            "tls-max": "1.1",
+            "skip-verify": true
         }
     },
     "string-replacer-py": {
+        "listen": "127.0.0.1:8000",
+        "connect": "127.0.0.1:8100",
         "mode": "detecttls",
         "interceptors": [
             {
@@ -121,13 +136,15 @@
             }
         ],
         "server": {
-            "listen": "127.0.0.1:8002",
-            "cert-pem": "cert.pem",
-            "cert-key": "cert.key"
-
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key"
         },
         "client": {
-            "connect": "127.0.0.1:8102"
+            "server-name": "server.local",
+            "cert-pem": "test/certs/client-int-1-chain.pem",
+            "cert-key": "test/certs/client-int-1.key",
+            "tls-max": "1.1",
+            "skip-verify": true
         }
     }
 }

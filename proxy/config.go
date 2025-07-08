@@ -1,6 +1,12 @@
 package tlstap
 
 type ProxyConfig struct {
+	// where the server should listen for incoming connections (e.g. 127.0.0.1:1234 or [::1]:1234)
+	ListenEndpoint string `json:"listen"`
+
+	// where clients should connect to (e.g. 127.0.0.1:1234 or [::1]:1234)
+	ConnectEndpoint string `json:"connect"`
+
 	// mode of the proxy; acceptable values: plain, tls, detecttls (default)
 	Mode string `json:"mode"`
 
@@ -14,10 +20,10 @@ type ProxyConfig struct {
 	Interceptors []InterceptorConfig `json:"interceptors"`
 
 	// configuration for the server part of the proxy
-	Server ServerConfig `json:"server"`
+	Server TlsServerConfig `json:"server"`
 
 	// configuration for the client part of the proxy
-	Client ClientConfig `json:"client"`
+	Client TlsClientConfig `json:"client"`
 }
 
 type InterceptorConfig struct {
@@ -39,57 +45,64 @@ type InterceptorConfig struct {
 	ArgsJson []byte `json:"args-json"`
 }
 
-type ServerConfig struct {
-	// where the server should listen for incoming connections (e.g. 127.0.0.1:1234 or [::1]:1234)
-	ListenEndpoint string `json:"listen"`
-
-	// server certificate in PEM format
-	// the PEM file can contain pa whole chain (leaf first, then intermediates up to and excluding the root)
+type TlsServerConfig struct {
+	// Path to server certificate (or chain) and key.
+	// Server certificate is required.
 	CertPem string `json:"cert-pem"`
-	// key corresponding to the server certificate (only the leaf if whole chain is provided)
 	CertKey string `json:"cert-key"`
 
-	// the minimum and maximum TLS version the server will accept for incoming connections
-	// see MinVersion/MaxVersion in https://pkg.go.dev/crypto/tls#Config
-	TlsMin string `json:"tls-min"`
-	TlsMax string `json:"tls-max"`
+	// Comma-serparated list of paths to PEM files that.
+	// constitute the pool of trust roots for verifying client certificates.
+	ClientRoots string `json:"client-roots"`
 
-	// client authentication policy
-	// possible values: none (or empty), request-cert, require-any, verify-if-given, require-and-verify
-	// corresponds to https://pkg.go.dev/crypto/tls#ClientAuthType
-	// if no value is provided, the default is NoClientCert
-	ClientAuth string `json:"client-auth"`
+	// The client authentication policy.
+	// Available values: none (default), request, require-any, verify-if-given, require-and-verify.
+	// Correspond to the appropriate values of https://pkg.go.dev/crypto/tls#ClientAuthType
+	ClientAuthPolicy string `json:"client-auth"`
 
-	// path to file to which TLS pre-master secrets should be written (for the client <-> proxy connection)
-	// see KeyLogWriter in https://pkg.go.dev/crypto/tls#Config
-	KeyLogFile string `json:"key-logfile"`
+	// Minimum and maximums TLS version that will be negotiated.
+	MinVersion string `json:"min-version"`
+	MaxVersion string `json:"max-version"`
+
+	// Path to file to which TLS pre-master secrets should be written (for the client <-> proxy connection).
+	// See KeyLogWriter in https://pkg.go.dev/crypto/tls#Config
+	KeyLogFile string `json:"keylog"`
+
+	// Whether the key log file should be truncated upon start.
+	KeyLogTruncate bool `json:"truncate-keylog"`
 }
 
-type ClientConfig struct {
-	// where clients should connect to (e.g. 127.0.0.1:1234 or [::1]:1234)
-	ConnectEndpoint string `json:"connect"`
+type TlsClientConfig struct {
+	// Path to client certificate (or chain) and key.
+	// If none is given, no client authentiation is available.
+	CertPem string `json:"cert-pem"`
+	CertKey string `json:"cert-key"`
 
-	// specifies whether clients should verify server certificates
-	// if no value is provided, the default is false
-	VerifyCert bool `json:"verify-cert"`
+	// Comma-serparated list of paths to PEM files that
+	// constitute the trust roots.
+	// If none are given, the system trust store is used.
+	// See RootCAs in https://pkg.go.dev/crypto/tls#Config
+	Roots string `json:"roots"`
 
-	// server name used for SNI and to verify the server name (if VerifyCert is true)
-	// see ServerName in https://pkg.go.dev/crypto/tls#Config
+	// Server name (SNI)
+	// See ServerName in https://pkg.go.dev/crypto/tls#Config
 	ServerName string `json:"server-name"`
 
 	// ALPN strings
-	// see NextProtos in https://pkg.go.dev/crypto/tls#Config
+	// See NextProtos in https://pkg.go.dev/crypto/tls#Config
 	ALPN []string `json:"alpn"`
 
-	// the minimum and maximum TLS version clients will attempt to negotiate for incoming connections
-	// see MinVersion/MaxVersion in https://pkg.go.dev/crypto/tls#Config
-	TlsMin string `json:"tls-min"`
-	TlsMax string `json:"tls-max"`
+	// Do not verify the server certificate
+	SkipVerify bool `json:"skip-verify"`
 
-	CertPem string `json:"cert-pem"`
-	CertKey string `json:"cert-key"`
+	// Minimum and maximums TLS version that will be negotiated.
+	MinVersion string `json:"min-version"`
+	MaxVersion string `json:"max-version"`
 
-	// path to file to which TLS pre-master secrets should be written (for the proxy <-> server connection)
-	// see KeyLogWriter in https://pkg.go.dev/crypto/tls#Config
-	KeyLogFile string `json:"key-logfile"`
+	// Path to file to which TLS pre-master secrets should be written (for the client <-> proxy connection).
+	// See KeyLogWriter in https://pkg.go.dev/crypto/tls#Config
+	KeyLogFile string `json:"keylog"`
+
+	// Whether the key log file should be truncated upon start
+	KeyLogTruncate bool `json:"truncate-keylog"`
 }
