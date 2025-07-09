@@ -6,10 +6,10 @@ import (
 	"log"
 	"strings"
 
-	main1 "tlstap/cli"
+	"tlstap/cli"
 	"tlstap/intercept"
 	"tlstap/logging"
-	tlstap "tlstap/proxy"
+	proxy "tlstap/proxy"
 )
 
 type StringReplacer struct {
@@ -23,7 +23,7 @@ type ReplacerConfig struct {
 	Replacements map[string]string `json:"replacements"`
 }
 
-func (i *StringReplacer) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
+func (i *StringReplacer) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	str := string(data)
 	for k, v := range i.replacements {
 		str = strings.ReplaceAll(str, k, v)
@@ -32,7 +32,7 @@ func (i *StringReplacer) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, 
 	return []byte(str), nil
 }
 
-func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
+func configCallback(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
 	if iConfig.Name != "replacer" {
 		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}
@@ -49,7 +49,7 @@ func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig,
 }
 
 func main() {
-	main1.StartWithCli(configCallback)
+	cli.StartWithCli(configCallback)
 }
 
 func checkFatal(err error) {

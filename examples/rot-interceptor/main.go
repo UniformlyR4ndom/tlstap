@@ -6,10 +6,10 @@ import (
 	"log"
 	"unicode"
 
-	main1 "tlstap/cli"
+	"tlstap/cli"
 	"tlstap/intercept"
 	"tlstap/logging"
-	tlstap "tlstap/proxy"
+	proxy "tlstap/proxy"
 )
 
 type RotConfig struct {
@@ -26,7 +26,7 @@ type RotInterceptor struct {
 	logger       *logging.Logger
 }
 
-func (i *RotInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
+func (i *RotInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	runes := []rune(string(data))
 	for {
 		s, e := nextPrintableSeq(runes, i.minSeqLength)
@@ -80,7 +80,7 @@ func rotLetter(r rune, rot int) rune {
 	}
 }
 
-func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error) {
+func configCallback(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
 	if iConfig.Name != "rot" {
 		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}
@@ -98,7 +98,7 @@ func configCallback(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig,
 }
 
 func main() {
-	main1.StartWithCli(configCallback)
+	cli.StartWithCli(configCallback)
 }
 
 func checkFatal(err error) {
