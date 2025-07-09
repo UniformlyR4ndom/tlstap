@@ -155,7 +155,7 @@ func OpenKelogWriter(path string, truncate bool) (io.WriteCloser, error) {
 		mode = os.O_TRUNC
 	}
 
-	return os.OpenFile(path, mode|os.O_CREATE, 0600)
+	return os.OpenFile(path, mode|os.O_CREATE|os.O_RDWR, 0600)
 }
 
 func LoadCertPool(pathList string) (*x509.CertPool, error) {
