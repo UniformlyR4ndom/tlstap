@@ -260,9 +260,10 @@ For example, an `InfoFrame` with event ID `0x20` (`BridgeEventInfo`), connection
 ### Data frames
 `DataFrame`s have the following layout:
 ```
-type 			- byte
-data size 		- uint32
-connection ID 	- uint32
+// DataFrame
+type            - byte
+data size       - uint32
+connection ID   - uint32
 data            - byte[size]
 ```
 
