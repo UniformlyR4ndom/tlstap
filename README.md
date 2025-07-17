@@ -239,11 +239,11 @@ Integer values are encoded in little endian.
 `InfoFrame`s have the following layout:
 ```
 // InfoFrame
-type 				- byte
-event ID			- byte
-connection ID		- uint32
-downstream remote 	- string
-upstream remote		- string
+type                - byte
+event ID            - byte
+connection ID       - uint32
+downstream remote   - string
+upstream remote	    - string
 ```
 For example, an `InfoFrame` with event ID `0x20` (`BridgeEventInfo`), connection ID `17`, downstream remote `127.0.0.1:5000` and upstream remote `127.0.0.1:6000` serializes to the following byte stream:
 ```
