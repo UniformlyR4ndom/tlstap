@@ -32,8 +32,8 @@ type Frame interface {
 // data size 		- uint32
 // connection ID 	- uint32
 type DataFrame struct {
-	size   uint32
-	connId uint32
+	Size   uint32
+	ConnId uint32
 }
 
 func (f *DataFrame) Type() FrameType {
@@ -41,26 +41,26 @@ func (f *DataFrame) Type() FrameType {
 }
 
 func (f *DataFrame) DataSize() int {
-	return int(f.size)
+	return int(f.Size)
 }
 
 func (f *DataFrame) ToBytes() []byte {
 	buf := [9]byte{}
 	buf[0] = byte(f.Type())
-	_, err := binary.Encode(buf[1:], binary.LittleEndian, f.size)
+	_, err := binary.Encode(buf[1:], binary.LittleEndian, f.Size)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
-	_, err = binary.Encode(buf[5:], binary.LittleEndian, f.connId)
+	_, err = binary.Encode(buf[5:], binary.LittleEndian, f.ConnId)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 	return buf[:]
 }
 
 func ReadDataFrame(r io.Reader) (DataFrame, error) {
 	f := DataFrame{}
-	if err := binary.Read(r, binary.LittleEndian, &f.size); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &f.Size); err != nil {
 		return DataFrame{}, err
 	}
 
-	if err := binary.Read(r, binary.LittleEndian, &f.connId); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &f.ConnId); err != nil {
 		return DataFrame{}, err
 	}
 
@@ -75,10 +75,10 @@ func ReadDataFrame(r io.Reader) (DataFrame, error) {
 // upstream remote		- string
 // strings are prefixed by length (uint32) and UTF8-encoded
 type InfoFrame struct {
-	eventId    byte
-	connId     uint32
-	remoteDown string
-	remoteUp   string
+	EventId    byte
+	ConnId     uint32
+	RemoteDown string
+	RemoteUp   string
 }
 
 const (
@@ -99,33 +99,33 @@ func (f *InfoFrame) DataSize() int {
 
 func (f *InfoFrame) ToBytes() []byte {
 	var buf bytes.Buffer
-	buf.Grow(2 + 3*4 + len(f.remoteDown) + len(f.remoteUp))
+	buf.Grow(2 + 3*4 + len(f.RemoteDown) + len(f.RemoteUp))
 
 	err := buf.WriteByte(byte(f.Type()))
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	err = buf.WriteByte(f.eventId)
+	err = buf.WriteByte(f.EventId)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	err = binary.Write(&buf, binary.LittleEndian, f.connId)
+	err = binary.Write(&buf, binary.LittleEndian, f.ConnId)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	n := uint32(len(f.remoteDown))
-	assert.Assertf(int(n) == len(f.remoteDown), "Length truncated. This is a bug.")
+	n := uint32(len(f.RemoteDown))
+	assert.Assertf(int(n) == len(f.RemoteDown), "Length truncated. This is a bug.")
 
 	err = binary.Write(&buf, binary.LittleEndian, n)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	_, err = buf.Write([]byte(f.remoteDown))
+	_, err = buf.Write([]byte(f.RemoteDown))
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	n = uint32(len(f.remoteUp))
-	assert.Assertf(int(n) == len(f.remoteUp), "Length truncated. This is a bug.")
+	n = uint32(len(f.RemoteUp))
+	assert.Assertf(int(n) == len(f.RemoteUp), "Length truncated. This is a bug.")
 
 	err = binary.Write(&buf, binary.LittleEndian, n)
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
-	_, err = buf.Write([]byte(f.remoteUp))
+	_, err = buf.Write([]byte(f.RemoteUp))
 	assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 
 	return buf.Bytes()
@@ -166,10 +166,10 @@ func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 
 	i.connMap.Store(int(info.ConnID), conn)
 	infoFrame := InfoFrame{
-		eventId:    BridgeEventConnEstablished,
-		connId:     uint32(info.ConnID),
-		remoteDown: info.SrcEndpoint,
-		remoteUp:   info.DstEndpoint,
+		EventId:    BridgeEventConnEstablished,
+		ConnId:     uint32(info.ConnID),
+		RemoteDown: info.SrcEndpoint,
+		RemoteUp:   info.DstEndpoint,
 	}
 
 	_, err = conn.Write(infoFrame.ToBytes())
@@ -178,10 +178,10 @@ func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 
 func (i *BridgeInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	infoFrame := InfoFrame{
-		eventId:    BridgeEventConnTerminated,
-		connId:     uint32(info.ConnID),
-		remoteDown: info.SrcEndpoint,
-		remoteUp:   info.DstEndpoint,
+		EventId:    BridgeEventConnTerminated,
+		ConnId:     uint32(info.ConnID),
+		RemoteDown: info.SrcEndpoint,
+		RemoteUp:   info.DstEndpoint,
 	}
 
 	c, ok := i.connMap.Load(int(info.ConnID))
@@ -210,8 +210,8 @@ func (i *BridgeInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byt
 	assert.Assertf(ok, "Unexpected type: %T", c)
 
 	outFrame := DataFrame{
-		size:   n,
-		connId: uint32(info.ConnID),
+		Size:   n,
+		ConnId: uint32(info.ConnID),
 	}
 
 	if _, err := conn.Write(outFrame.ToBytes()); err != nil {
@@ -227,17 +227,17 @@ func (i *BridgeInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byt
 		return data, err
 	}
 
-	if inFrame.size > maxFrameSize {
-		i.logger.Error("Recieved frame is too large (%d btyes). Maximum of %d bytes are acceptable.", inFrame.size, maxFrameSize)
+	if inFrame.Size > maxFrameSize {
+		i.logger.Error("Recieved frame is too large (%d btyes). Maximum of %d bytes are acceptable.", inFrame.Size, maxFrameSize)
 	}
 
-	if int(inFrame.size) > len(i.readBuf) {
-		i.readBuf = make([]byte, inFrame.size)
+	if int(inFrame.Size) > len(i.readBuf) {
+		i.readBuf = make([]byte, inFrame.Size)
 	}
 
-	if _, err = io.ReadFull(conn, i.readBuf[:inFrame.size]); err != nil {
+	if _, err = io.ReadFull(conn, i.readBuf[:inFrame.Size]); err != nil {
 		return data, err
 	}
 
-	return i.readBuf[:inFrame.size], nil
+	return i.readBuf[:inFrame.Size], nil
 }

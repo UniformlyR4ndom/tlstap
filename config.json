@@ -1,4 +1,28 @@
 {
+    "example-hexdump-plain": {
+        "listen": "127.0.0.1:5000",
+        "connect": "127.0.0.1:6000",
+        "mode": "plain",
+        "interceptors": [
+            {
+                "name": "hexdump"
+            }
+        ]
+    },
+    "example-pcapdump-plain": {
+        "listen": "127.0.0.1:5000",
+        "connect": "127.0.0.1:6000",
+        "mode": "plain",
+        "interceptors": [
+            {
+                "name": "pcapdump",
+                "args": {
+                    "file": "dump.pcap",
+                    "truncate": true
+                }
+            }
+        ]
+    },
     "test-plain": {
         "listen": "127.0.0.1:8000",
         "connect": "127.0.0.1:8100",
