@@ -16,11 +16,11 @@ Multiple interceptors can be active at the same time.
 You can build it for (and from) Linux or Windows like so (if you are building for the same platform you are currently running, you do not need to specify `GOOS`.):
 ```
 # for Windows
-GOOS=windows go build -o tlstapx.exe .
+GOOS=windows go build -o tlstap.exe .
 ```
 ```
 # for Linux
-GOOS=linux go build -o tlstapx.exe .
+GOOS=linux go build -o tlstap .
 ```
 
 # Usage
