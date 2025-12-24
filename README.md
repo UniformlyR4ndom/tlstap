@@ -33,13 +33,13 @@ The global JSON configuration file contains one or more named configurations and
 ```json
 {
     "config-a": { 
-        ...
+        "...": "..."
     },
     "config-b": { 
-        ...
+        "...": "..."
     },
     "config-c": { 
-        ...
+        "...": "..."
     }
 }
 ```
@@ -58,13 +58,13 @@ The top-level configuration is given by `ProxyConfig` (see [config.go](./proxy/c
     "loglevel": "debug|info|warn|error",
     "logfile": "path/to/log/file",
     "interceptors": { 
-        ...
+        "...": "..."
     },
     "server": {
-        ...
+        "...": "..."
     },
     "client": {
-        ...
+        "...": "..."
     }
 }
 ```
@@ -87,9 +87,9 @@ The interceptor configuration allows specifying the active interceptors and has 
 {
     "name": "my-interceptor",
     "disable": false,
-    "direction": "up|down|both",
+    "direction": "up|down|any",
     "args": {
-        ...
+        "...": "..."
     },
     "args-json": "{ ... }"
 }
@@ -99,7 +99,7 @@ The interceptor configuration allows specifying the active interceptors and has 
 - `direction` - direction in which the interceptor should be active; default `both`; available values:
     - `up` - only process traffic headed upstream (client -> server)
     - `down` - only process traffic headed downstream (server -> client)
-    - `both` - process traffic in both directions
+    - `any` - process traffic in any direction
 - `args` - interceptor arguments as `map[string]any` structure
 - `args-json` - `args` but serialized to a single JSON string; *should not be set directly*; useful in conjunction with  [json.Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal)
 

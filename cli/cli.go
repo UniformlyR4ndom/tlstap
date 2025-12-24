@@ -134,10 +134,8 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 
 			i := intercept.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
 			interceptor = &i
-		case "none":
-		case "null":
-		case "nil":
-		case "":
+		case "none", "null", "nil", "":
+			// ignore
 		default:
 			var err error
 			if cb != nil {
@@ -157,7 +155,7 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 			interceptorsUp = append(interceptorsUp, interceptor)
 		case "down":
 			interceptorsDown = append(interceptorsDown, interceptor)
-		case "both":
+		case "any":
 			fallthrough
 		case "":
 			interceptorsUp = append(interceptorsUp, interceptor)
