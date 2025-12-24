@@ -70,111 +70,6 @@ func (p *Proxy) Start() error {
 	}
 }
 
-/*
-func (p *Proxy) getTlsServerConfig() (*tls.Config, error) {
-	serverConfig := p.Config.Server
-
-	var err error
-	serverTlsMin := uint16(tls.VersionTLS10)
-	if serverConfig.MinVersion != "" {
-		if serverTlsMin, err = TlsVersionFromString(serverConfig.MinVersion); err != nil {
-			return nil, err
-		}
-	}
-
-	serverTlsMax := uint16(tls.VersionTLS13)
-	if serverConfig.MaxVersion != "" {
-		if serverTlsMax, err = TlsVersionFromString(serverConfig.MaxVersion); err != nil {
-			return nil, err
-		}
-	}
-
-	cert, err := p.loadCert(serverConfig.CertPem, serverConfig.CertKey)
-	if err != nil {
-		return nil, err
-	}
-
-	var clientAuth tls.ClientAuthType
-	switch clientAuthStr := strings.ToLower(strings.TrimSpace(serverConfig.ClientAuthPolicy)); clientAuthStr {
-	case "":
-		fallthrough
-	case "none":
-		clientAuth = tls.NoClientCert
-	case "request-cert":
-		clientAuth = tls.RequestClientCert
-	case "require-any":
-		clientAuth = tls.RequireAnyClientCert
-	case "verify-if-given":
-		clientAuth = tls.VerifyClientCertIfGiven
-	case "require-and-verify":
-		clientAuth = tls.RequireAndVerifyClientCert
-	default:
-		return nil, fmt.Errorf("invalid client auth type: %s", serverConfig.ClientAuthPolicy)
-	}
-
-	var keyLogWriter io.Writer = nil
-	if serverConfig.KeyLogFile != "" {
-		if keyLogWriter, err = os.OpenFile(serverConfig.KeyLogFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644); err != nil {
-			return nil, err
-		}
-	}
-
-	tlsConfig := tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   serverTlsMin,
-		MaxVersion:   serverTlsMax,
-		ClientAuth:   clientAuth,
-		KeyLogWriter: keyLogWriter,
-	}
-
-	return &tlsConfig, nil
-}
-*/
-
-/*
-func (p *Proxy) getTlsClientConfig() (*tls.Config, error) {
-	clientConfig := p.Config.Client
-
-	var err error
-	clientTlsMin := uint16(tls.VersionTLS10)
-	clientTlsMax := uint16(tls.VersionTLS13)
-	if clientConfig.MinVersion != "" {
-		if clientTlsMin, err = TlsVersionFromString(clientConfig.MinVersion); err != nil {
-			return nil, err
-		}
-	}
-
-	if clientConfig.MaxVersion != "" {
-		if clientTlsMax, err = TlsVersionFromString(clientConfig.MaxVersion); err != nil {
-			return nil, err
-		}
-	}
-
-	var alpnStrings []string = nil
-	if len(clientConfig.ALPN) > 0 {
-		alpnStrings = clientConfig.ALPN
-	}
-
-	var keyLogWriter io.Writer = nil
-	if clientConfig.KeyLogFile != "" {
-		if keyLogWriter, err = os.OpenFile(clientConfig.KeyLogFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644); err != nil {
-			return nil, err
-		}
-	}
-
-	tlsConfig := tls.Config{
-		InsecureSkipVerify: clientConfig.SkipVerify,
-		MinVersion:         clientTlsMin,
-		MaxVersion:         clientTlsMax,
-		ServerName:         p.Config.Client.ServerName,
-		NextProtos:         alpnStrings,
-		KeyLogWriter:       keyLogWriter,
-	}
-
-	return &tlsConfig, nil
-}
-*/
-
 func (p *Proxy) startPlainProxy() error {
 	listener, err := net.Listen("tcp", p.Config.ListenEndpoint)
 	if err != nil {
@@ -197,16 +92,6 @@ func (p *Proxy) startPlainProxy() error {
 		go handler.HandleConnection(conn)
 	}
 }
-
-/*
-func (p *Proxy) loadCert(certPath, keyPath string) (tls.Certificate, error) {
-	if certPath == "" || keyPath == "" {
-		return tls.Certificate{}, fmt.Errorf("server certificate pem and key path must be provided")
-	}
-
-	return tls.LoadX509KeyPair(certPath, keyPath)
-}
-*/
 
 func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) error {
 	listener, err := tls.Listen("tcp", p.Config.ListenEndpoint, tlsServerConfig)
