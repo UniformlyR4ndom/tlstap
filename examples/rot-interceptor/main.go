@@ -80,7 +80,7 @@ func rotLetter(r rune, rot int) rune {
 	}
 }
 
-func configCallback(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
+func configCallback(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
 	if iConfig.Name != "rot" {
 		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}

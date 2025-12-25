@@ -1,13 +1,40 @@
 package tlstap
 
-type ProxyConfig struct {
+type MuxEntry struct {
+	// match patterns
+	Matches []string `json:"match"`
+
+	// where clients should connect to
+	ConnectEndpoint string `json:"connect"`
+
+	// reference to TLS server config
+	ServerRef string `json:"server"`
+
+	// reference to TLS client config
+	ClientRef string `json:"client"`
+
+	// references to interceptors
+	InterceptorsRefs []string `json:"interceptors"`
+
+	// log level; possible values: debug, info (default), warn, error
+	// overwrites LogLevel option of containing proxy configuration
+	LogLevel string `json:"loglevel"`
+
+	// path to log file; if none given, log is written to stdout
+	// overwrites LogFile option of containing proxy configuration
+	LogFile string `json:"logfile"`
+}
+
+type ProxyConfig2 struct {
 	// where the server should listen for incoming connections (e.g. 127.0.0.1:1234 or [::1]:1234)
 	ListenEndpoint string `json:"listen"`
 
 	// where clients should connect to (e.g. 127.0.0.1:1234 or [::1]:1234)
 	ConnectEndpoint string `json:"connect"`
 
-	// mode of the proxy; acceptable values: plain, tls, detecttls (default)
+	// mode of the proxy; acceptable values: plain, tls, detecttls (default), mux
+	// in mux mode, TLS multiplexing is available but mode for all TLS proxies of the multiplexer
+	// is fixed to 'tls'
 	Mode string `json:"mode"`
 
 	// log level; possible values: debug, info (default), warn, error
@@ -16,14 +43,33 @@ type ProxyConfig struct {
 	// path to log file; if none given, log is written to stdout
 	LogFile string `json:"logfile"`
 
-	// intercpetors
-	Interceptors []InterceptorConfig `json:"interceptors"`
-
 	// configuration for the server part of the proxy
-	Server TlsServerConfig `json:"server"`
+	ServerRef string `json:"server"`
 
 	// configuration for the client part of the proxy
-	Client TlsClientConfig `json:"client"`
+	ClientRef string `json:"client"`
+
+	// references to interceptors
+	InterceptorsRefs []string `json:"interceptors"`
+
+	// TLS multiplexer (only available in mode 'mux')
+	// depending on the SNI information different TLS configurations can be used
+	// and traffic can be forwarded to different upstream targets
+	Mux map[string]MuxEntry `json:"mux"`
+}
+
+type ConfigFile struct {
+	// the available proxy configurations
+	Proxies map[string]ProxyConfig2 `json:"proxies"`
+
+	// the available TLS server configurations
+	TlsServerConfigs map[string]TlsServerConfig `json:"tls-server-configs"`
+
+	// the available TLS server configurations
+	TlsClientConfigs map[string]TlsClientConfig `json:"tls-client-configs"`
+
+	// the available interceptors
+	Interceptors map[string]InterceptorConfig `json:"interceptors"`
 }
 
 type InterceptorConfig struct {
@@ -42,6 +88,7 @@ type InterceptorConfig struct {
 
 	// same as InterceptorArgs but the bytes representing the JSON string
 	// useful to pass to json.Unmarshal directly to recover custom structs
+	// do not set directly, instead use Args option
 	ArgsJson []byte `json:"args-json"`
 }
 
@@ -105,4 +152,17 @@ type TlsClientConfig struct {
 
 	// Whether the key log file should be truncated upon start
 	KeyLogTruncate bool `json:"truncate-keylog"`
+}
+
+type ResolvedProxyConfig struct {
+	ListenEndpoint  string  `json:"listen"`
+	ConnectEndpoint *string `json:"connect"`
+	Mode            string  `json:"mode"`
+
+	LogLevel string `json:"loglevel"`
+	LogFile  string `json:"logfile"`
+
+	Interceptors []InterceptorConfig `json:"interceptors"`
+	Server       *TlsServerConfig    `json:"server"`
+	Client       *TlsClientConfig    `json:"client"`
 }

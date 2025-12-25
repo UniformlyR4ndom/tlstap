@@ -15,8 +15,9 @@ import (
 	tlstap "tlstap/proxy"
 )
 
-type InterceptorCallback func(config tlstap.ProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
+type InterceptorCallback func(config tlstap.ResolvedProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
 
+// TODO: add callback mechanism
 func StartWithCli(interceptorCallback InterceptorCallback) {
 	optEnable := flag.String("enable", "", `Comma-separated list of proxy configurations to enable (e.g. "myconfig-a,myconfig-b")`)
 	optConfig := flag.String("config", "config.json", "Path to configuration file (JSON)")
@@ -31,13 +32,13 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	configData, err := os.ReadFile(configPath)
 	checkFatal(&mainLogger, err)
 
-	var configs map[string]tlstap.ProxyConfig
-	checkFatal(&mainLogger, json.Unmarshal(configData, &configs))
+	var configFile tlstap.ConfigFile
+	checkFatal(&mainLogger, json.Unmarshal(configData, &configFile))
 
 	var enabledConfigs []string
 	enabledList := strings.TrimSpace(*optEnable)
 	if enabledList == "" {
-		for k := range configs {
+		for k := range configFile.Proxies {
 			enabledConfigs = append(enabledConfigs, k)
 		}
 
@@ -48,18 +49,60 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	}
 
 	for _, configName := range enabledConfigs {
-		config, ok := configs[configName]
+
+		config, ok := configFile.Proxies[configName]
 		if !ok {
 			mainLogger.Fatal("Unknown config: %s", configName)
 		}
 
-		for i, iConfig := range config.Interceptors {
-			iArgsJson, err := json.Marshal(iConfig.Args)
-			checkFatal(&mainLogger, err)
-			config.Interceptors[i].ArgsJson = iArgsJson
+		pConfig := tlstap.ResolvedProxyConfig{
+			ListenEndpoint: config.ListenEndpoint,
+			Mode:           config.Mode,
+			LogFile:        config.LogFile,
+			LogLevel:       config.LogLevel,
 		}
 
-		proxy, err := proxyFromConfig(&config, &mainLogger, interceptorCallback)
+		if config.ConnectEndpoint != "" {
+			pConfig.ConnectEndpoint = &config.ConnectEndpoint
+		}
+
+		if config.ServerRef != "" {
+			server, ok := configFile.TlsServerConfigs[config.ServerRef]
+			if !ok {
+				mainLogger.Fatal("TLS server config '%s' not defined.", config.ServerRef)
+			}
+
+			pConfig.Server = &server
+		}
+
+		if config.ClientRef != "" {
+			client, ok := configFile.TlsClientConfigs[config.ClientRef]
+			if !ok {
+				mainLogger.Fatal("TLS client config '%s' not defined.", config.ServerRef)
+			}
+
+			pConfig.Client = &client
+		}
+
+		if len(config.InterceptorsRefs) > 0 {
+			interceptors := make([]tlstap.InterceptorConfig, len(config.InterceptorsRefs))
+			for i, iConfigRef := range config.InterceptorsRefs {
+				iConfig, ok := configFile.Interceptors[iConfigRef]
+				if !ok {
+					mainLogger.Fatal("Interceptor '%s' not defined.", config.ServerRef)
+				}
+
+				iArgsJson, err := json.Marshal(iConfig.Args)
+				checkFatal(&mainLogger, err)
+				iConfig.ArgsJson = iArgsJson
+
+				interceptors[i] = iConfig
+			}
+
+			pConfig.Interceptors = interceptors
+		}
+
+		proxy, err := proxyFromConfig(&pConfig, &mainLogger, interceptorCallback)
 		checkFatal(&mainLogger, err)
 		go startProxy(proxy, &mainLogger)
 	}
@@ -70,7 +113,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	wg.Wait()
 }
 
-func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb InterceptorCallback) (*tlstap.Proxy, error) {
+func proxyFromConfig(config *tlstap.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback) (*tlstap.Proxy, error) {
 	var mode tlstap.Mode
 	switch m := strings.ToLower(strings.TrimSpace(config.Mode)); m {
 	case "plain":
@@ -79,6 +122,8 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 		mode = tlstap.ModeTls
 	case "detecttls":
 		mode = tlstap.ModeDetectTls
+	case "tls-mux":
+		logger.Error("TODO: implement tls-mux")
 	default:
 		return nil, fmt.Errorf("invalid proxy mode: %s", config.Mode)
 	}
@@ -108,63 +153,63 @@ func proxyFromConfig(config *tlstap.ProxyConfig, logger *logging.Logger, cb Inte
 	var interceptorsUp []tlstap.Interceptor
 	var interceptorsDown []tlstap.Interceptor
 	var interceptorsAll []tlstap.Interceptor
-	for _, iConfig := range config.Interceptors {
-		if iConfig.Disable {
-			logger.Warn("interceptor %s disabled", iConfig.Name)
-			continue
+	if config.Interceptors != nil {
+		for _, iConfig := range config.Interceptors {
+			if iConfig.Disable {
+				logger.Warn("interceptor %s disabled", iConfig.Name)
+				continue
+			}
+
+			var interceptor tlstap.Interceptor
+			switch iConfig.Name {
+			case "hexdump":
+				interceptor = &intercept.HexDumpInterceptor{Logger: &proxyLogger}
+			case "bridge":
+				var bridgeConf intercept.BridgeConfig
+				if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
+					return nil, err
+				}
+
+				i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
+				interceptor = &i
+			case "pcapdump":
+				var pcapConfig intercept.PcapConfig
+				if err := json.Unmarshal(iConfig.ArgsJson, &pcapConfig); err != nil {
+					return nil, err
+				}
+
+				i := intercept.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
+				interceptor = &i
+			case "none", "null", "nil", "":
+				// ignore
+			default:
+				var err error
+				if cb != nil {
+					interceptor, err = cb(*config, iConfig, logger)
+				}
+
+				switch {
+				case err != nil:
+					return nil, err
+				case interceptor == nil:
+					return nil, fmt.Errorf("unknown (custom) interceptor: %s", iConfig.Name)
+				}
+			}
+
+			switch dir := strings.ToLower(iConfig.Direction); dir {
+			case "up":
+				interceptorsUp = append(interceptorsUp, interceptor)
+			case "down":
+				interceptorsDown = append(interceptorsDown, interceptor)
+			case "any", "":
+				interceptorsUp = append(interceptorsUp, interceptor)
+				interceptorsDown = append(interceptorsDown, interceptor)
+			default:
+				return nil, fmt.Errorf("invalid direction: %s", dir)
+			}
+
+			interceptorsAll = append(interceptorsAll, interceptor)
 		}
-
-		var interceptor tlstap.Interceptor
-		switch iConfig.Name {
-		case "hexdump":
-			interceptor = &intercept.HexDumpInterceptor{Logger: &proxyLogger}
-		case "bridge":
-			var bridgeConf intercept.BridgeConfig
-			if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
-				return nil, err
-			}
-
-			i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
-			interceptor = &i
-		case "pcapdump":
-			var pcapConfig intercept.PcapConfig
-			if err := json.Unmarshal(iConfig.ArgsJson, &pcapConfig); err != nil {
-				return nil, err
-			}
-
-			i := intercept.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
-			interceptor = &i
-		case "none", "null", "nil", "":
-			// ignore
-		default:
-			var err error
-			if cb != nil {
-				interceptor, err = cb(*config, iConfig, logger)
-			}
-
-			switch {
-			case err != nil:
-				return nil, err
-			case interceptor == nil:
-				return nil, fmt.Errorf("unknown (custom) interceptor: %s", iConfig.Name)
-			}
-		}
-
-		switch dir := strings.ToLower(iConfig.Direction); dir {
-		case "up":
-			interceptorsUp = append(interceptorsUp, interceptor)
-		case "down":
-			interceptorsDown = append(interceptorsDown, interceptor)
-		case "any":
-			fallthrough
-		case "":
-			interceptorsUp = append(interceptorsUp, interceptor)
-			interceptorsDown = append(interceptorsDown, interceptor)
-		default:
-			return nil, fmt.Errorf("invalid direction: %s", dir)
-		}
-
-		interceptorsAll = append(interceptorsAll, interceptor)
 	}
 
 	p := tlstap.NewProxy(*config, mode, interceptorsUp, interceptorsDown, interceptorsAll, proxyLogger)

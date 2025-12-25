@@ -10,7 +10,7 @@ import (
 )
 
 type Proxy struct {
-	Config ProxyConfig
+	Config ResolvedProxyConfig
 
 	Mode Mode
 
@@ -23,7 +23,7 @@ type Proxy struct {
 	nextConnId uint32
 }
 
-func NewProxy(config ProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
+func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
 	return Proxy{
 		Config:           config,
 		Mode:             mode,
@@ -39,22 +39,34 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("listen endpoint must be specified")
 	}
 
-	if p.Config.ConnectEndpoint == "" {
+	if p.Config.ConnectEndpoint == nil || *p.Config.ConnectEndpoint == "" {
 		return fmt.Errorf("connect endpoint must be specified")
 	}
 
 	var tlsServerConfig, tlsClientconfig *tls.Config
 	var err error
+
 	switch p.Mode {
-	case ModeTls:
-		fallthrough
-	case ModeDetectTls:
-		if tlsServerConfig, err = ParseServerConfig(&p.Config.Server); err != nil {
+	case ModeTls, ModeDetectTls:
+		switch {
+		case p.Config.Server == nil:
+			p.logger.Fatal("A TLS server configuration is required in this mode.")
+		case p.Config.Client == nil:
+			p.logger.Fatal("A TLS client configuration is required in this mode.")
+		case p.Config.ConnectEndpoint == nil || *p.Config.ConnectEndpoint == "":
+			p.logger.Fatal("A connect endpoint is required in this mode.")
+		}
+
+		if tlsServerConfig, err = ParseServerConfig(p.Config.Server); err != nil {
 			return err
 		}
 
-		if tlsClientconfig, err = ParseClientConfig(&p.Config.Client); err != nil {
+		if tlsClientconfig, err = ParseClientConfig(p.Config.Client); err != nil {
 			return err
+		}
+	case ModePlain:
+		if p.Config.ConnectEndpoint == nil || *p.Config.ConnectEndpoint == "" {
+			p.logger.Fatal("A connect endpoint is required in this mode.")
 		}
 	}
 
@@ -76,7 +88,7 @@ func (p *Proxy) startPlainProxy() error {
 		return err
 	}
 
-	p.logger.Info("proxy (mode plain) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
+	p.logger.Info("proxy (mode plain) listening at %s and forwarding to %s", p.Config.ListenEndpoint, *p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -99,7 +111,7 @@ func (p *Proxy) startTlsProxy(tlsServerConfig, tlsClientConfig *tls.Config) erro
 		return err
 	}
 
-	p.logger.Info("proxy (mode TLS) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
+	p.logger.Info("proxy (mode TLS) listening at %s and forwarding to %s", p.Config.ListenEndpoint, *p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -124,7 +136,7 @@ func (p *Proxy) startDetectTlsProxy(tlsServerConfig, tlsClientconfig *tls.Config
 		return err
 	}
 
-	p.logger.Info("proxy (mode detecttls) listening at %s and forwarding to %s", p.Config.ListenEndpoint, p.Config.ConnectEndpoint)
+	p.logger.Info("proxy (mode detecttls) listening at %s and forwarding to %s", p.Config.ListenEndpoint, *p.Config.ConnectEndpoint)
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
 	notifyInit(p.InterceptorsAll, *tcpAddr)
@@ -146,7 +158,7 @@ func (p *Proxy) startDetectTlsProxy(tlsServerConfig, tlsClientconfig *tls.Config
 func (p *Proxy) newHandler(mode Mode) *ConnHandler {
 	handler := ConnHandler{
 		Setting: ConnSettings{
-			ConnectEndpoint: p.Config.ConnectEndpoint,
+			ConnectEndpoint: *p.Config.ConnectEndpoint,
 			Mode:            mode,
 		},
 		InterceptorsUp:   p.InterceptorsUp,

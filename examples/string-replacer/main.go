@@ -32,7 +32,7 @@ func (i *StringReplacer) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, e
 	return []byte(str), nil
 }
 
-func configCallback(config proxy.ProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
+func configCallback(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error) {
 	if iConfig.Name != "replacer" {
 		return nil, fmt.Errorf("unexpected interceptor name: %s", iConfig.Name)
 	}
