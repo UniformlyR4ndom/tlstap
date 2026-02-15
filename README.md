@@ -76,7 +76,7 @@ The full configuration options are:
 "example-proxy": {
     "listen": "127.0.0.1:8443",
     "connect": "10.10.10.10:443",
-    "mode": "plain|tls|detecttls|mux",
+    "mode": "plain|tls|detecttls|tls-mux",
     "loglevel": "debug|info|warn|error",
     "logtime": false,
     "logfile": "/path/to/example-proxy.log",
@@ -96,7 +96,7 @@ The full configuration options are:
     - `plain` - forward TCP traffic raw
     - `tls` - intercept TLS connections (TLS handshake immediately after TCP connection initiation)
     - `detecttls` - forward raw TCP traffic until TLS Client Hello is detected, then intercept TLS
-    - `mux` - depending on the incoming server name (SNI), decide where to forward traffic and which server certificate to present
+    - `tls-mux` - depending on the incoming server name (SNI), decide where to forward traffic and which server certificate to present
 - `loglevel` - log level; available values: `debug`, `info` (default), `warn`, `error`; log levels below `info` should usually be avoided
 - `logtime` - whether to include timestamps in the logging messages (default: `false`)
 - `logfile` - path to file where the log output should be written; by default logs are written to stdout
