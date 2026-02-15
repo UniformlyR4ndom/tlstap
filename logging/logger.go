@@ -11,9 +11,9 @@ type Logger struct {
 	logger *slog.Logger
 }
 
-func NewLogger(writer io.Writer, options *slog.HandlerOptions) Logger {
+func NewLogger(writer io.Writer, options *slog.HandlerOptions, includeTimestamp bool) Logger {
 	return Logger{
-		logger: slog.New(NewHandler(writer, options)),
+		logger: slog.New(NewHandler(writer, options, includeTimestamp)),
 	}
 }
 

@@ -1,9 +1,21 @@
 {
     "proxies":{
+        "tcp-forwarder": {
+            "mode": "plain",
+            "listen": "127.0.0.1:8000",
+            "connect": "127.0.0.1:9000"
+        },
+        "example-match-replace": {
+            "mode": "plain",
+            "listen": "127.0.0.1:8001",
+            "connect": "127.0.0.1:9001",
+            "interceptors": ["match-replace-demo"]
+        },
         "example-tls-basic": {
             "mode": "tls",
             "listen": "127.0.0.1:443",
             "connect": "74.125.29.101:443",
+            "logtime": true,
             "server": "basic-server",
             "client": "basic-client",
             "interceptors": ["hexdump"]
@@ -14,33 +26,62 @@
             "connect": "127.0.0.1:9443",
             "server": "basic-server",
             "client": "basic-client",
+            "logtime": true,
+            "loglevel": "debug",
+            "interceptors": ["hexdump"],
             "mux": {
-                "test": {
-                    "sni-matches": [".*test.*"],
-                    "connect": "127.0.0.1:9000",
-                    "tls-server": "basic-server",
-                    "tls-client": "basic-client",
+                "nmap": {
+                    "sni-matches": [".*nmap.org.*"],
+                    "connect": "[2600:3c01:e000:3e6::6d4e:7061]:443",
+                    "server": "alpn-server",
+                    "client": "passthrough-client",
                     "interceptors": ["hexdump"]
                 },
                 "example": {
-                    "sni-matches": ["*.example.*", ".*demo.*"],
-                    "connect": "127.0.0.1:9001",
-                    "tls-server": "basic-server",
-                    "tls-client": "basic-client",
+                    "sni-matches": ["example.org"],
+                    "connect": "104.18.3.24:443",
+                    "server": "alpn-server",
+                    "client": "passthrough-client",
                     "interceptors": ["hexdump"]
                 }
             }
+        },
+        "test-example.org": {
+            "mode": "tls",
+            "listen": "127.0.0.1:8443",
+            "connect": "104.18.2.24:443",
+            "loglevel": "info",
+            "server": "alpn-server",
+            "client": "passthrough-client",
+            "comment": "test with: curl -iks https://127.0.0.1:8443/ -H 'Host: example.org'"
+        },
+        "test-passthrough": {
+            "mode": "tls",
+            "listen": "127.0.0.1:8443",
+            "connect": "50.116.1.184:443",
+            "server": "basic-server",
+            "client": "passthrough-client",
+            "comment": "resolve nmap.org to 127.0.0.1; test with: curl -iks https://nmap.org:8443/ -H 'Host: nmap.org'"
         }
     },
     "tls-server-configs": {
         "basic-server": {
             "cert-pem": "test/certs/server.pem",
-            "cert-key": "test/certs/server.key"
+            "cert-key": "test/certs/server.key",
+            "keylog": "key.log"
+        },
+        "alpn-server": {
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key",
+            "alpn": ["h2", "http/1.1"],
+            "keylog": "key.log"
         }
     },
     "tls-client-configs": {
         "basic-client": {
-            "skip-verify": true
+            "skip-verify": true,
+            "sni-passthrough": true,
+            "keylog": "key.log"
         },
         "demo-client": {
             "alpn": ["test", "alpn is fun"],
@@ -51,6 +92,16 @@
             "tls-min": "1.1",
             "skip-verify": true,
             "keylog": "key.log"
+        },
+        "sni-alpn-demo-client": {
+            "server-name": "nmap.org",
+            "alpn": ["test"],
+            "skip-verify": true
+        },
+        "passthrough-client": {
+            "sni-passthrough": true,
+            "alpn-passthrough": true,
+            "skip-verify": true
         }
     },
     "interceptors": {
@@ -62,6 +113,15 @@
             "args": {
                 "file": "dump.pcap",
                 "truncate": true
+            }
+        },
+        "match-replace-demo": {
+            "name": "match-replace",
+            "args": {
+                "replacements": [
+                    {"one": "1"},
+                    {"delete[0-9]*": ""}
+                ]
             }
         }
     }

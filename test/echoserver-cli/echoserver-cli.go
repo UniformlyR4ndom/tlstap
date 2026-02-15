@@ -45,7 +45,7 @@ func main() {
 		trigger = config.Trigger
 	}
 
-	tlsConfig, err := tlstap.ParseServerConfig(&config.TlsServerConfig)
+	tlsConfig, _, err := tlstap.ParseServerConfig(&config.TlsServerConfig)
 	tlstap.CheckFatal(err)
 
 	server := test.NewEchoServer(config.Listen, bufSize, tlsConfig, []byte(trigger))

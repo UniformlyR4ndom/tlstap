@@ -1,38 +1,50 @@
 package tlstap
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"tlstap/assert"
+	"tlstap/logging"
 )
 
-func ParseServerConfig(config *TlsServerConfig) (*tls.Config, error) {
+var (
+	extKeyUsageMap = genExtKeyUsageMap()
+	cipherSuiteMap = genCipherSuiteMap()
+)
+
+func ParseServerConfig(config *TlsServerConfig) (*tls.Config, []string, error) {
 	if config.CertPem == "" || config.CertKey == "" {
-		return nil, fmt.Errorf("path to certificate and key (both in PEM format) must be provided")
+		return nil, nil, fmt.Errorf("path to certificate and key (both in PEM format) must be provided")
 	}
 
 	cert, err := tls.LoadX509KeyPair(config.CertPem, config.CertKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var clientCAs *x509.CertPool = nil
 	if config.ClientRoots != "" {
 		if clientCAs, err = LoadCertPool(config.ClientRoots); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	clientAuthType := tls.NoClientCert
 	if config.ClientAuthPolicy != "" {
-		if clientAuthType, err = ParseClientAuthPoicy(config.ClientAuthPolicy); err != nil {
-			return nil, err
+		if clientAuthType, err = ParseClientAuthPolicy(config.ClientAuthPolicy); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -41,7 +53,7 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, error) {
 		if v, err := ParseTlsVersion(config.MinVersion); err == nil {
 			minVersion = v
 		} else {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -50,19 +62,19 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, error) {
 		if v, err := ParseTlsVersion(config.MaxVersion); err == nil {
 			maxVersion = v
 		} else {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if minVersion > maxVersion {
-		return nil, fmt.Errorf("minimum version (%d) cannot exceed maximum version (%d)", minVersion, maxVersion)
+		return nil, nil, fmt.Errorf("minimum version (%d) cannot exceed maximum version (%d)", minVersion, maxVersion)
 	}
 
 	var keylogWriter io.WriteCloser = nil
 	if config.KeyLogFile != "" {
 		keylogWriter, err = OpenKelogWriter(config.KeyLogFile, config.KeyLogTruncate)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -75,7 +87,7 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, error) {
 		KeyLogWriter: keylogWriter,
 	}
 
-	return &serverConf, nil
+	return &serverConf, config.ALPN, nil
 }
 
 func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
@@ -142,6 +154,20 @@ func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
 		KeyLogWriter:       keylogWriter,
 	}
 
+	if len(config.CipherSuitesOverride) > 0 {
+		var cipherSuites []uint16
+		for _, cs := range config.CipherSuitesOverride {
+			id, err := cipherSuiteNameToId(cs)
+			if err != nil {
+				return nil, err
+			}
+
+			cipherSuites = append(cipherSuites, id)
+		}
+
+		clientConf.CipherSuites = cipherSuites
+	}
+
 	if certificate != nil {
 		clientConf.Certificates = []tls.Certificate{*certificate}
 	}
@@ -174,7 +200,7 @@ func LoadCertPool(pathList string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-func ParseClientAuthPoicy(policy string) (tls.ClientAuthType, error) {
+func ParseClientAuthPolicy(policy string) (tls.ClientAuthType, error) {
 	switch p := strings.TrimSpace(strings.ToLower(policy)); p {
 	case "none":
 		return tls.NoClientCert, nil
@@ -208,6 +234,31 @@ func ParseTlsVersion(versionStr string) (uint16, error) {
 	return 0, fmt.Errorf("unknown TLS version: %s", versionStr)
 }
 
+func CheckFatal(err error) {
+	if err != nil {
+		log.Fatalf("Fatal error: %v", err)
+	}
+}
+
+func getModifiedConfig(config *tls.Config, defaultServerName string, defaultAlpn []string) *tls.Config {
+	overrideSni := config.ServerName == "" && defaultServerName != ""
+	overrideAlpn := len(config.NextProtos) == 0 && len(defaultAlpn) > 0
+	if !(overrideSni || overrideAlpn) {
+		return config
+	}
+
+	c := config.Clone()
+	if overrideSni {
+		c.ServerName = defaultServerName
+	}
+
+	if overrideAlpn {
+		c.NextProtos = defaultAlpn
+	}
+
+	return c
+}
+
 func tryReadUint8(data []byte, offset int) (uint8, bool) {
 	if offset+1 <= len(data) {
 		return uint8(data[offset]), true
@@ -228,8 +279,226 @@ func readUint16(data []byte, offset int) uint16 {
 	return binary.BigEndian.Uint16(data[offset : offset+2])
 }
 
-func CheckFatal(err error) {
-	if err != nil {
-		log.Fatalf("Fatal error: %v", err)
+// find the first element of supported that is contained in the offered strings
+func getFirstMatch(offered, supported []string) (string, bool) {
+	for _, s := range supported {
+		if slices.Contains(offered, s) {
+			return s, true
+		}
 	}
+
+	return "", false
+}
+
+func selectNextProto(info *tls.ClientHelloInfo, acceptableProtos []string, logger *logging.Logger) (string, bool) {
+	if len(info.SupportedProtos) == 0 {
+		return "", false
+	}
+
+	offered := info.SupportedProtos
+	offeredStr := strings.Join(offered, ", ")
+	if len(acceptableProtos) == 0 {
+		logger.Warn("Client offered next protocols [%s] but server does not support ALPN", offeredStr)
+		return "", false
+	}
+
+	selectedProto, ok := getFirstMatch(info.SupportedProtos, acceptableProtos)
+	if !ok {
+		supportedStr := strings.Join(acceptableProtos, ", ")
+		logger.Warn("No mutual next protocol (ALPN): client offered [%s], server accepts [%s]", offeredStr, supportedStr)
+		return "", false
+	}
+
+	return selectedProto, true
+}
+
+func certToString(cert *x509.Certificate) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  Subject: %s\n", cert.Subject))
+	sb.WriteString(fmt.Sprintf("  Issuer: %s\n", cert.Issuer))
+	sb.WriteString(fmt.Sprintf("  DNS names: %v\n", strings.Join(cert.DNSNames, ", ")))
+	sb.WriteString(fmt.Sprintf("  Validity: %v - %v\n", cert.NotBefore, cert.NotAfter))
+
+	keyUsages := decodeKeyUsage(cert.KeyUsage)
+
+	var extKeyUsages []string
+	for _, e := range cert.ExtKeyUsage {
+		eku, ok := extKeyUsageMap[e]
+		if !ok {
+			eku = fmt.Sprintf("? (%v)", eku)
+		}
+
+		extKeyUsages = append(extKeyUsages, eku)
+	}
+
+	sb.WriteString(fmt.Sprintf("  Key usages: %s (extended: %s)\n", strings.Join(keyUsages, ", "), strings.Join(extKeyUsages, ", ")))
+	sb.WriteString(fmt.Sprintf("  Serial: %v\n", cert.SerialNumber))
+
+	fingerprint := sha256.Sum256(cert.Raw)
+	sb.WriteString(fmt.Sprintf("  Fingerprint (SHA256): %s", hex.EncodeToString(fingerprint[:])))
+
+	return sb.String()
+}
+
+func chainToStringX509(certs []*x509.Certificate) string {
+	if len(certs) == 0 {
+		return "none"
+	}
+
+	var sb strings.Builder
+	for i, c := range certs {
+		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s\n", i, certToString(c)))
+	}
+
+	return sb.String()
+}
+
+func chainToString(certs []tls.Certificate) string {
+	if len(certs) == 0 {
+		return "none"
+	}
+
+	var sb strings.Builder
+	for i, certPair := range certs {
+		cert, err := x509.ParseCertificate(certPair.Certificate[0])
+		assert.Assertf(err == nil, "Unexpected error parsing certificate: %v", err)
+
+		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s", i, certToString(cert)))
+	}
+
+	return sb.String()
+}
+
+func clientHelloInfoToString(info *tls.ClientHelloInfo) string {
+	var sb strings.Builder
+
+	var sniInfo = "no server name (SNI) present"
+	if info.ServerName != "" {
+		sniInfo = fmt.Sprintf("Server name (SNI): %s\n", info.ServerName)
+	}
+	sb.WriteString(sniInfo)
+
+	var alpnInfo = "no supported protocols (ALPN) present"
+	if len(info.SupportedProtos) > 0 {
+		alpnInfo = fmt.Sprintf("%d supported protocols (ALPN): %s\n", len(info.SupportedProtos), strings.Join(info.SupportedProtos, ", "))
+	}
+	sb.WriteString(alpnInfo)
+
+	var versions []string
+	for _, v := range info.SupportedVersions {
+		versions = append(versions, tls.VersionName(v))
+	}
+	sb.WriteString(fmt.Sprintf("%d supported versions: %s\n", len(versions), strings.Join(versions, ", ")))
+
+	var ciphersuites []string
+	for _, cs := range info.CipherSuites {
+		ciphersuites = append(ciphersuites, translateCipherSuite(cs))
+	}
+	sb.WriteString(fmt.Sprintf("%d supported cipher suites: %s", len(ciphersuites), strings.Join(ciphersuites, ", ")))
+
+	return sb.String()
+}
+
+func translateCipherSuite(code uint16) string {
+	name := tls.CipherSuiteName(code)
+	if strings.HasPrefix(name, "0x") {
+		name = fmt.Sprintf("? (%s)", name)
+	}
+
+	return name
+}
+
+func certRequestInfoToString(info *tls.CertificateRequestInfo) string {
+	var cas []string
+	for _, ca := range info.AcceptableCAs {
+		var name pkix.Name
+		_, err := asn1.Unmarshal(ca, &name)
+		if err != nil {
+			cas = append(cas, fmt.Sprintf("name parsing failed; raw (hex): %s", hex.EncodeToString(ca)))
+			continue
+		}
+
+		cas = append(cas, name.String())
+	}
+
+	return strings.Join(cas, "; ")
+}
+
+func decodeKeyUsage(ku x509.KeyUsage) []string {
+	var kus []string
+	if ku&x509.KeyUsageDigitalSignature != 0 {
+		kus = append(kus, "digitalSignature")
+	}
+
+	if ku&x509.KeyUsageContentCommitment != 0 {
+		kus = append(kus, "contentCommitment")
+	}
+
+	if ku&x509.KeyUsageKeyEncipherment != 0 {
+		kus = append(kus, "keyEncipherment")
+	}
+
+	if ku&x509.KeyUsageDataEncipherment != 0 {
+		kus = append(kus, "dataEncipherment")
+	}
+
+	if ku&x509.KeyUsageKeyAgreement != 0 {
+		kus = append(kus, "keyAgreement")
+	}
+
+	if ku&x509.KeyUsageCertSign != 0 {
+		kus = append(kus, "keyCertSign")
+	}
+
+	if ku&x509.KeyUsageCRLSign != 0 {
+		kus = append(kus, "cRLSign")
+	}
+
+	if ku&x509.KeyUsageEncipherOnly != 0 {
+		kus = append(kus, "encipherOnly")
+	}
+
+	if ku&x509.KeyUsageDecipherOnly != 0 {
+		kus = append(kus, "decipherOnly")
+	}
+
+	return kus
+}
+
+func genExtKeyUsageMap() map[x509.ExtKeyUsage]string {
+	m := make(map[x509.ExtKeyUsage]string)
+	m[x509.ExtKeyUsageAny] = "anyExtendedKeyUsage"
+	m[x509.ExtKeyUsageServerAuth] = "serverAuth"
+	m[x509.ExtKeyUsageClientAuth] = "clientAuth"
+	m[x509.ExtKeyUsageCodeSigning] = "codeSigning"
+	m[x509.ExtKeyUsageEmailProtection] = "emailProtection"
+	m[x509.ExtKeyUsageIPSECEndSystem] = "ipsecEndSystem"
+	m[x509.ExtKeyUsageIPSECTunnel] = "ipsecTunnel"
+	m[x509.ExtKeyUsageIPSECUser] = "ipsecUser"
+	m[x509.ExtKeyUsageTimeStamping] = "timeStamping"
+	m[x509.ExtKeyUsageOCSPSigning] = "OCSPSigning"
+	m[x509.ExtKeyUsageMicrosoftServerGatedCrypto] = "msSGC"
+	m[x509.ExtKeyUsageNetscapeServerGatedCrypto] = "nsSGC"
+	m[x509.ExtKeyUsageMicrosoftCommercialCodeSigning] = "msCodeCom"
+	m[x509.ExtKeyUsageMicrosoftKernelCodeSigning] = "msKernelCode"
+	return m
+}
+
+func genCipherSuiteMap() map[string]uint16 {
+	m := make(map[string]uint16)
+	for _, c := range tls.CipherSuites() {
+		name := strings.ToLower(c.Name)
+		m[name] = c.ID
+	}
+
+	return m
+}
+
+func cipherSuiteNameToId(name string) (uint16, error) {
+	cleanName := strings.TrimSpace(strings.ToLower(name))
+	if id, ok := cipherSuiteMap[cleanName]; ok {
+		return id, nil
+	}
+
+	return 0, fmt.Errorf("unknown cipher suite: %s", name)
 }

@@ -20,14 +20,6 @@ const (
 	drainTimeoutMs = 10
 )
 
-const (
-	ModePlain Mode = iota
-	ModeTls
-	ModeDetectTls
-)
-
-type Mode byte
-
 type ConnHandler struct {
 	Setting ConnSettings
 
@@ -55,7 +47,7 @@ func (h *ConnHandler) HandleConnection(conn net.Conn) error {
 	switch h.Setting.Mode {
 	case ModePlain:
 		err = h.forwardPlain(conn)
-	case ModeTls:
+	case ModeTls, ModeMux:
 		c, ok := conn.(*tls.Conn)
 		assert.Assertf(ok, "conn must be of type *tls.Conn")
 		err = h.forwardTls(c)
@@ -106,6 +98,9 @@ func (h *ConnHandler) forwardTls(conn *tls.Conn) error {
 	lUp := h.ConnUp.LocalAddr().String()
 	rUp := h.ConnUp.RemoteAddr().String()
 	h.logger.Info("Upstream connection (%d): %s <-> %s (%s)", h.ConnId, lUp, rUp, SummarizeTlsConn(connUp))
+
+	serverCerts := connUp.ConnectionState().PeerCertificates
+	h.logger.Debug("Upstream server certificate chain:\n%s", chainToStringX509(serverCerts))
 
 	return h.forwardGeneric()
 }

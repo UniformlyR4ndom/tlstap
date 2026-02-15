@@ -14,77 +14,170 @@ Multiple interceptors can be active at the same time.
 # Building
 *tlstap* is written in Go and can therefore be used across multiple platforms.
 You can build it for (and from) Linux or Windows like so (if you are building for the same platform you are currently running, you do not need to specify `GOOS`.):
-```
+```powershell
 # for Windows
 GOOS=windows go build -o tlstap.exe .
 ```
-```
+```shell
 # for Linux
 GOOS=linux go build -o tlstap .
 ```
 
 # Usage
-*tlstap* only takes two arguments:
+*tlstap* only takes two commandline arguments:
 - `config` - path to the configuration file
 - `enable` - comma-separated list of configurations to enable
 
 ## Configuration file
-The global JSON configuration file contains one or more named configurations and has the following structure (see `ProxyConfig` in [config.go](./proxy/config.go)):
+The global JSON configuration contains four sections see `ProxyConfig` in [config.go](./proxy/config.go)):
+The `proxies`-section contains all the proxy definitions.
+Any of the proxies defined here can then be enabled via the `-enable` command line option.
+Each proxy definition makes use of one or more TLS server or client configuations and can use any of the defined `interceptors`.
+The `tls-server-configs` and `tls-client-configs` define the available TLS server and client configurations.
+Finally, all available interceptors are defined under `interceptors`.
+
 ```json
 {
-    "config-a": { 
+    "proxies": {
+        "proxy-a": {
+            "...": "..."
+        },
+        "proxy-b": {
+            "...": "..."
+        },
+        "proxy-c": {
+            "...": "..."
+        }
+    },
+    "tls-server-configs": {
         "...": "..."
     },
-    "config-b": { 
-        "...": "..."
+    "tls-client-configs": {
+
     },
-    "config-c": { 
+    "interceptors": {
         "...": "..."
     }
 }
-```
-Then one or more configurations can be enabled like this (as long as they are not conflicting):
-```
-wcfproxy.exe -config config.json -enable config-a,config-c
 ```
 
-### Proxy configuration
-The top-level configuration is given by `ProxyConfig` (see [config.go](./proxy/config.go)).
+Then one or more configurations can be enabled like this (as long as they are not conflicting):
+```
+tlstap.exe -config config.json -enable proxy-a,proxy-c
+```
+
+An example configuration can be found in [config.json](config.json).
+
+
+### Proxies
+Each proxy configuration must define the mode, listen and connect (forward) endpoint as well as the TLS configurations to use.
+The full configuration options are:
 ```json
-{
-    "listen": "127.0.0.1:8000",
-    "connect": "127.0.0.1:9000",
-    "mode": "plain|detecttls|tls",
+"example-proxy": {
+    "listen": "127.0.0.1:8443",
+    "connect": "10.10.10.10:443",
+    "mode": "plain|tls|detecttls|mux",
     "loglevel": "debug|info|warn|error",
-    "logfile": "path/to/log/file",
-    "interceptors": { 
-        "...": "..."
-    },
-    "server": {
-        "...": "..."
-    },
-    "client": {
-        "...": "..."
+    "logtime": false,
+    "logfile": "/path/to/example-proxy.log",
+    "server": "name-of-tls-server-config",
+    "client": "name-of-tls-client-config",
+    "interceptors": ["hexdump"],
+    "mux": {
+        "mux-handler-name": {
+            "...": "..."
+        }
     }
 }
 ```
-It has the folloing options:
 - `listen` - TCP endpoint where the server part of *tlstap* should listen
 - `connect` - TCP endpoint where incoming traffic should be relayed to
 - `mode` - mode of operation; available vaules:
     - `plain` - forward TCP traffic raw
     - `tls` - intercept TLS connections (TLS handshake immediately after TCP connection initiation)
-    - `detecttls` - forward raw TCP traffic until TLS Client Hello is detected, then intercept TLS connection
+    - `detecttls` - forward raw TCP traffic until TLS Client Hello is detected, then intercept TLS
+    - `mux` - depending on the incoming server name (SNI), decide where to forward traffic and which server certificate to present
 - `loglevel` - log level; available values: `debug`, `info` (default), `warn`, `error`; log levels below `info` should usually be avoided
+- `logtime` - whether to include timestamps in the logging messages (default: `false`)
 - `logfile` - path to file where the log output should be written; by default logs are written to stdout
-- `interceptors` - interceptor configuration, see [Interceptor configuration](#interceptor-configuration)
-- `server` - TLS server configuration, see [TLS server & client configuration](#tls-server--client-configuration)
-- `client` - TLS client configuration, see [TLS server & client configuration](#tls-server--client-configuration)
+- `server` - name of a TLS server configuration defined in the global `tls-server-configs` section
+- `client` - name of a TLS client configuration defined in the global `tls-client-configs` section
+- `interceptors` - array of names of interceptors defined in global `interceptors`
+- `mux` - a multiplexer definition
+
+
+### TLS server & client configuration
+The TLS server and client configuration allow to specify most commonly used TLS options.
+TLS server and client configuration have a similar structure (see `TlsServerConfig` and `TlsClientConfig` [config.go](./proxy/config.go)).
+Server and client configuration are placed in the global `tls-server-config` and `tls-client-config` sections respectively.
+
+
+#### Server config
+TLS server configurations offers the following options:
+```json
+"example-server": {
+    "cert-pem": "/path/to/server.pem",
+    "cert-key": "/path/to/server.key",
+    "client-roots": "path/to/client-ca1.pem,path/to/client-ca2.pem",
+    "client-auth": "none|request|require-any|verify-if-given|require-and-verify",
+    "alpn": ["h2", "http/1.1"],
+    "min-version": "1.0|1.1|1.2|1.3",
+    "max-version": "1.0|1.1|1.2|1.3",
+    "keylog": "path/to/key.log",
+    "truncate-keylog": false
+}
+```
+- `cert-pem` - path to certificate in PEM format
+- `cert-key` - path to certificate key
+- `client-roots` - comma-separated list of paths to client trust roots (used to verify client certificates)
+- `client-auth` - client authentication policy; available values (also see [ClientAuthType](https://pkg.go.dev/crypto/tls#ClientAuthType)):
+    - `none` - do not request client certificate
+    - `request` - request client certificate; client is not required to send one
+    - `require-any` - requires the client to send a certificate; the certificate is not validated
+    - `verify-if-given` - request a client certificate; client is not required to send one, but if sent, the certificate is validated
+    - `require-and-verify` - require the client to send a certificate; the certificate is validated against the `client-roots`
+- `min-version` - minimum acceptable TLS version; available values: `1.0` (default),`1.1`, `1.2`, `1.3`
+- `max-version` - maximum acceptable TLS version; available values: `1.0`,`1.1`, `1.2`, `1.3` (default)
+- `alpn` - which next protocol (ALPN) values to accept (the first one in this list that is also offered by the client will be accepted)
+- `keylog` - path to TLS keylog file; if not specified, no TLS key logs are written
+- `truncate-keylog` - whether the keylog file should be truncated on startup; default: `false`
+
+
+#### Client config
+TLS client configurations offers the following options:
+```json
+"example-client": {
+    "cert-pem": "/path/to/client.pem",
+    "cert-key": "/path/to/client.key",
+    "roots": "path/to/ca1.pem,path/to/ca2.pem",
+    "skip-verify": false,
+    "min-version": "1.0|1.1|1.2|1.3",
+    "max-version": "1.0|1.1|1.2|1.3",
+    "server-name": "target-server.local",
+    "sni-passthroug": false,
+    "alpn": ["h2"],
+    "alpn-passthrough": false,
+    "ciphersuites-override": ["TLS_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"],
+    "keylog": "path/to/key.log",
+    "truncate-keylog": false
+}
+```
+Most options are analogous to the corresponding TLS server configuration options.
+These differ:
+- `roots` - comma-separated list of paths to CA certificates
+- `skip-verify` - whether server certificate validation should be skipped (default: `false`)
+- `server-name` - name of the target server (SNI) to send; overrides SNI passthrough
+- `sni-passthrough` - whether the server name picked up from the downstream client should be used to connect to the upstream server (default: `false`)
+- `alpn` - list of next protocols (ALPN) to send; overrides ALPN passthrough
+- `alpn-passthrough` - whether the application protocol negotiated between the downstream and the proxy server should be forwarded to the upstream server (default: `false`)
+- `ciphersuites-override` - list of names of ciphersuites to offer the upstream server (see [Go TLS cipher suites](https://pkg.go.dev/crypto/tls#CipherSuites))
+
+
 
 ### Interceptor configuration
 The interceptor configuration allows specifying the active interceptors and has the following structure (see [InterceptorConfig](./proxy/config.go)):
 ```json
-{
+"my-interceptor": {
     "name": "my-interceptor",
     "disable": false,
     "direction": "up|down|any",
@@ -103,70 +196,11 @@ The interceptor configuration allows specifying the active interceptors and has 
 - `args` - interceptor arguments as `map[string]any` structure
 - `args-json` - `args` but serialized to a single JSON string; *should not be set directly*; useful in conjunction with  [json.Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal)
 
-### TLS server & client configuration
-The TLS server and client configuration allow to specify most commonly used TLS options.
-TLS server and client configuration have a similar structure (see `TlsServerConfig` and `TlsClientConfig` [config.go](./proxy/config.go)).
-
-#### Server config
-TLS server configurations look like this:
-```json
-{
-    "cert-pem": "server.pem",
-    "cert-key": "server.key",
-    "client-roots": "path/to/client-ca1.pem,path/to/client-ca2.pem",
-    "client-auth": "none|request|require-any|verify-if-given|require-and-verify",
-    "min-version": "1.0|1.1|1.2|1.3",
-    "max-version": "1.0|1.1|1.2|1.3",
-    "keylog": "path/to/key.log",
-    "truncate-keylog": false
-}
-```
-- `cert-pem` - path to certificate in PEM format
-- `cert-key` - path to certificate key
-- `client-roots` - comma-separated list of paths to client trust roots (used to verify client certificates)
-- `client-auth` - client authentication policy; available values (also see [ClientAuthType](https://pkg.go.dev/crypto/tls#ClientAuthType)):
-    - `none` - do not request client certificate
-    - `request` - request client certificate; client is not required to send one
-    - `require-any` - requires the client to send a certificate; the certificate is not validated
-    - `verify-if-given` - request a client certificate; client is not required to send one, but if sent, the certificate is validated
-    - `require-and-verify` - require the client to send a certificate; the certificate is validated against the `client-roots`
-- `min-version` - minimum acceptable TLS version; available values: `1.0` (default),`1.1`, `1.2`, `1.3`
-- `max-version` - maximum acceptable TLS version; available values: `1.0`,`1.1`, `1.2`, `1.3` (default)
-- `keylog` - path to TLS keylog file; if not specified, no TLS key logs are written
-- `truncate-keylog` - whether the keylog file should be truncated on startup; default: `false`
-
-#### Client config
-TLS client configurations look like this:
-```json
-{
-    "cert-pem": "client.pem",
-    "cert-key": "client.key",
-    "roots": "path/to/ca1.pem,path/to/ca2.pem",
-    "skip-verify": false,
-    "server-name": "target-server.local",
-    "alpn": [
-        "h2", 
-        "some-other-protocol"
-    ],
-    "min-version": "1.0|1.1|1.2|1.3",
-    "max-version": "1.0|1.1|1.2|1.3",
-    "keylog": "path/to/key.log",
-    "truncate-keylog": false
-}
-```
-Most options are analogous to the corresponding TLS server configuration options.
-These differ:
-- `roots` - comma-separated list of paths to CA certificates
-- `skip-verify` - whether server certificate validation should be skipped (default: `false`)
-- `server-name` - name of the target server (Server Name Indication)
-- `alpn` - list of next protocols (Application-Layer Protocol Negotiation)
-
-
 
 # Interceptors
 *tlstap* comes with a few interceptors that may be useful in various scenarios.
 
-## hexdump interceptor
+## hexdump interceptor (`hexdump`)
 The hexdump interceptor creates a simple hexdump of all data passing through it.
 The following shows an example of the usage of the hexdump interceptor with the following configuration:
 ```json
@@ -207,7 +241,7 @@ INFO: Connection terminated: 0 (127.0.0.1:38250->127.0.0.1:6000)
 INFO: Connection terminated: 0 (127.0.0.1:6000->127.0.0.1:38250)
 ```
 
-## pcapdump intercepotor
+## pcapdump intercepotor (`pcapdump`)
 The pcapdump interceptor writes all data passing through it to a pcap file.
 This may be useful e.g. in conjunction with with [Wireshark](https://www.wireshark.org).
 ![demo](./doc/tlstap-pcapdump-demo.png)
@@ -328,3 +362,10 @@ Note that this restriction is quite fundamental since there is no reliable way t
 It is possible to detect the Client Hello after enough of it has been received, but by then part of it may already have been sent on to the destination.
 At this point interception is, while in theory still possible with a custom TLS implementation, no longer practical.
 
+
+
+# TODO
+- test SNI and SNI passthrough (with and without mux mode)
+- test mux mode with different TLS server & client configs for different targets
+- test per-handler interceptors in mux mode
+- test per-handler log files & levels

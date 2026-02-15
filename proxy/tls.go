@@ -57,29 +57,9 @@ func DetectClientHello(data []byte, thorough, search bool) *DetectionResult {
 	return &result
 }
 
-func getMinMaxTLSVersion(versions []uint16) (uint16, uint16, error) {
-	if len(versions) == 0 {
-		return 0, 0, fmt.Errorf("no versions given")
-	}
-
-	minV, maxV := uint16(0xffff), uint16(0)
-	for _, v := range versions {
-		minV = min(minV, v)
-		maxV = max(maxV, v)
-	}
-
-	return minV, maxV, nil
-}
-
-// TODO: alert in case of valid but unsupported version
 func isValidTLSVersion(version uint16) bool {
 	major, minor := uint8(version>>8), uint8(version)
 	return (major == 2 && minor == 0) || (major == 3 && minor <= 4)
-}
-
-func isSupportedTLSVersion(version uint16) bool {
-	major, minor := uint8(version>>8), uint8(version)
-	return major == 3 && minor >= 1 && minor <= 4
 }
 
 func getTLSVersions(data []byte, thorough bool) []uint16 {
