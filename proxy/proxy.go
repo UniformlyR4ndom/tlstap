@@ -368,7 +368,7 @@ func notifyInit(interceptors []Interceptor, listenAddress net.TCPAddr) error {
 
 func (p *Proxy) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) {
 	serverConfig := p.serverConfig
-	p.logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info))
+	p.logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info, "  "))
 
 	if selectedNextProto, ok := selectNextProto(info, p.serverNextProtos, &p.logger); ok {
 		p.logger.Debug("Selected application protocol: %s", selectedNextProto)
@@ -381,10 +381,12 @@ func (p *Proxy) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) 
 }
 
 func (p *Proxy) getClientCertificate(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	p.logger.Debug("Recieved Certificate Request: %s", certRequestInfoToString(info))
+	p.logger.Debug("Received Certificate Request:\n%s", certRequestInfoToString(info, "  "))
 	var cert *tls.Certificate
 	if p.clientConfig != nil && len(p.clientConfig.Certificates) > 0 {
 		cert = &p.clientConfig.Certificates[0]
+		chain := []tls.Certificate{*cert}
+		p.logger.Debug("Using client certificate:\n%s", chainToString(chain, "  "))
 	} else {
 		p.logger.Error("No client certificate provided")
 	}
@@ -438,6 +440,8 @@ func (p *Proxy) warnPassthroughUnsupported() {
 }
 
 func (p *Proxy) logStartupInfo() {
+	p.logger.Info("################ Config %s start ################", p.Config.Name)
+
 	switch p.Mode {
 	case ModeMux:
 		if p.Config.ConnectEndpoint == nil {
@@ -451,13 +455,13 @@ func (p *Proxy) logStartupInfo() {
 		for _, h := range p.Mux.handlers {
 			p.logger.Info("%s: %v -> %s", h.Name, h.Patterns, h.Connect)
 			if p.serverConfig != nil && len(p.serverConfig.Certificates) > 0 {
-				p.logger.Debug("Server certificate chain:\n%s", chainToString(p.serverConfig.Certificates))
+				p.logger.Debug("Server certificate chain:\n%s", chainToString(p.serverConfig.Certificates, "  "))
 			} else {
 				p.logger.Debug("No default server certificate given")
 			}
 
 			if p.clientConfig != nil && len(p.clientConfig.Certificates) > 0 {
-				p.logger.Debug("Client certificate chain:\n%s", chainToString(p.serverConfig.Certificates))
+				p.logger.Debug("Client certificate chain:\n%s", chainToString(p.serverConfig.Certificates, "  "))
 			} else {
 				p.logger.Debug("No default client certificate given")
 			}
@@ -466,9 +470,9 @@ func (p *Proxy) logStartupInfo() {
 
 	case ModeTls, ModeDetectTls:
 		p.logger.Info("Proxy (mode %s) listening at %s and forwarding to %s", p.Mode.String(), p.Config.ListenEndpoint, *p.Config.ConnectEndpoint)
-		p.logger.Debug("Server certificate chain:\n%s", chainToString(p.serverConfig.Certificates))
+		p.logger.Debug("Server certificate chain:\n%s", chainToString(p.serverConfig.Certificates, "  "))
 		if len(p.clientConfig.Certificates) > 0 {
-			p.logger.Debug("Client certificate chain:\n%s", chainToString(p.clientConfig.Certificates))
+			p.logger.Debug("Client certificate chain:\n%s", chainToString(p.clientConfig.Certificates, "  "))
 		} else {
 			p.logger.Debug("No TLS client authentication supported")
 		}
@@ -477,4 +481,5 @@ func (p *Proxy) logStartupInfo() {
 		p.logger.Info("Proxy (mode %s) listening at %s and forwarding to %s", p.Mode.String(), p.Config.ListenEndpoint, *p.Config.ConnectEndpoint)
 	}
 
+	p.logger.Info("################ Config %s end ################", p.Config.Name)
 }

@@ -100,7 +100,7 @@ func (h *ConnHandler) forwardTls(conn *tls.Conn) error {
 	h.logger.Info("Upstream connection (%d): %s <-> %s (%s)", h.ConnId, lUp, rUp, SummarizeTlsConn(connUp))
 
 	serverCerts := connUp.ConnectionState().PeerCertificates
-	h.logger.Debug("Upstream server certificate chain:\n%s", chainToStringX509(serverCerts))
+	h.logger.Debug("Upstream server certificate chain:\n%s", chainToStringX509(serverCerts, "  "))
 
 	return h.forwardGeneric()
 }

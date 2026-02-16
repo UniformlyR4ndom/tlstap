@@ -69,6 +69,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			LogFile:        config.LogFile,
 			LogLevel:       config.LogLevel,
 			LogTime:        config.LogTime,
+			Name:           configName,
 		}
 
 		if config.ConnectEndpoint != "" {
@@ -249,7 +250,7 @@ func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.Re
 				continue
 			}
 
-			interceptor, err := buildInterceptor(&iConfig, config, mainLogger, cb)
+			interceptor, err := buildInterceptor(&iConfig, config, &proxyLogger, cb)
 			checkFatal(mainLogger, err)
 
 			switch dir := strings.ToLower(iConfig.Direction); dir {

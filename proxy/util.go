@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -19,10 +17,24 @@ import (
 	"tlstap/logging"
 )
 
-var (
-	extKeyUsageMap = genExtKeyUsageMap()
-	cipherSuiteMap = genCipherSuiteMap()
-)
+var extKeyUsageMap = map[x509.ExtKeyUsage]string{
+	x509.ExtKeyUsageAny:                            "anyExtendedKeyUsage",
+	x509.ExtKeyUsageServerAuth:                     "serverAuth",
+	x509.ExtKeyUsageClientAuth:                     "clientAuth",
+	x509.ExtKeyUsageCodeSigning:                    "codeSigning",
+	x509.ExtKeyUsageEmailProtection:                "emailProtection",
+	x509.ExtKeyUsageIPSECEndSystem:                 "ipsecEndSystem",
+	x509.ExtKeyUsageIPSECTunnel:                    "ipsecTunnel",
+	x509.ExtKeyUsageIPSECUser:                      "ipsecUser",
+	x509.ExtKeyUsageTimeStamping:                   "timeStamping",
+	x509.ExtKeyUsageOCSPSigning:                    "OCSPSigning",
+	x509.ExtKeyUsageMicrosoftServerGatedCrypto:     "msSGC",
+	x509.ExtKeyUsageNetscapeServerGatedCrypto:      "nsSGC",
+	x509.ExtKeyUsageMicrosoftCommercialCodeSigning: "msCodeCom",
+	x509.ExtKeyUsageMicrosoftKernelCodeSigning:     "msKernelCode",
+}
+
+var cipherSuiteMap = genCipherSuiteMap()
 
 func ParseServerConfig(config *TlsServerConfig) (*tls.Config, []string, error) {
 	if config.CertPem == "" || config.CertKey == "" {
@@ -312,12 +324,12 @@ func selectNextProto(info *tls.ClientHelloInfo, acceptableProtos []string, logge
 	return selectedProto, true
 }
 
-func certToString(cert *x509.Certificate) string {
+func certToString(cert *x509.Certificate, indent string) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("  Subject: %s\n", cert.Subject))
-	sb.WriteString(fmt.Sprintf("  Issuer: %s\n", cert.Issuer))
-	sb.WriteString(fmt.Sprintf("  DNS names: %v\n", strings.Join(cert.DNSNames, ", ")))
-	sb.WriteString(fmt.Sprintf("  Validity: %v - %v\n", cert.NotBefore, cert.NotAfter))
+	sb.WriteString(fmt.Sprintf("%sSubject: %s\n", indent, cert.Subject))
+	sb.WriteString(fmt.Sprintf("%sIssuer: %s\n", indent, cert.Issuer))
+	sb.WriteString(fmt.Sprintf("%sDNS names: %v\n", indent, strings.Join(cert.DNSNames, ", ")))
+	sb.WriteString(fmt.Sprintf("%sValidity: %v - %v\n", indent, cert.NotBefore, cert.NotAfter))
 
 	keyUsages := decodeKeyUsage(cert.KeyUsage)
 
@@ -331,29 +343,38 @@ func certToString(cert *x509.Certificate) string {
 		extKeyUsages = append(extKeyUsages, eku)
 	}
 
-	sb.WriteString(fmt.Sprintf("  Key usages: %s (extended: %s)\n", strings.Join(keyUsages, ", "), strings.Join(extKeyUsages, ", ")))
-	sb.WriteString(fmt.Sprintf("  Serial: %v\n", cert.SerialNumber))
+	kus := "none"
+	if len(keyUsages) > 0 {
+		kus = strings.Join(keyUsages, ", ")
+	}
+
+	ekus := "none"
+	if len(extKeyUsages) > 0 {
+		ekus = strings.Join(extKeyUsages, ", ")
+	}
+
+	sb.WriteString(fmt.Sprintf("%sKey usages: %s (extended: %s)\n", indent, kus, ekus))
+	sb.WriteString(fmt.Sprintf("%sSerial: %v\n", indent, cert.SerialNumber))
 
 	fingerprint := sha256.Sum256(cert.Raw)
-	sb.WriteString(fmt.Sprintf("  Fingerprint (SHA256): %s", hex.EncodeToString(fingerprint[:])))
-
+	sb.WriteString(fmt.Sprintf("%sFingerprint (SHA256): %s", indent, hex.EncodeToString(fingerprint[:])))
 	return sb.String()
 }
 
-func chainToStringX509(certs []*x509.Certificate) string {
+func chainToStringX509(certs []*x509.Certificate, indent string) string {
 	if len(certs) == 0 {
 		return "none"
 	}
 
 	var sb strings.Builder
 	for i, c := range certs {
-		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s\n", i, certToString(c)))
+		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s\n", i, certToString(c, indent)))
 	}
 
 	return sb.String()
 }
 
-func chainToString(certs []tls.Certificate) string {
+func chainToString(certs []tls.Certificate, indent string) string {
 	if len(certs) == 0 {
 		return "none"
 	}
@@ -363,24 +384,24 @@ func chainToString(certs []tls.Certificate) string {
 		cert, err := x509.ParseCertificate(certPair.Certificate[0])
 		assert.Assertf(err == nil, "Unexpected error parsing certificate: %v", err)
 
-		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s", i, certToString(cert)))
+		sb.WriteString(fmt.Sprintf("Certificate %d:\n%s", i, certToString(cert, indent)))
 	}
 
 	return sb.String()
 }
 
-func clientHelloInfoToString(info *tls.ClientHelloInfo) string {
+func clientHelloInfoToString(info *tls.ClientHelloInfo, indent string) string {
 	var sb strings.Builder
 
-	var sniInfo = "no server name (SNI) present"
+	var sniInfo = indent + "No server name (SNI) present\n"
 	if info.ServerName != "" {
-		sniInfo = fmt.Sprintf("Server name (SNI): %s\n", info.ServerName)
+		sniInfo = fmt.Sprintf("%sServer name (SNI): %s\n", indent, info.ServerName)
 	}
 	sb.WriteString(sniInfo)
 
-	var alpnInfo = "no supported protocols (ALPN) present"
+	var alpnInfo = indent + "No supported protocols (ALPN) present\n"
 	if len(info.SupportedProtos) > 0 {
-		alpnInfo = fmt.Sprintf("%d supported protocols (ALPN): %s\n", len(info.SupportedProtos), strings.Join(info.SupportedProtos, ", "))
+		alpnInfo = fmt.Sprintf("%s%d Supported protocols (ALPN): %s\n", indent, len(info.SupportedProtos), strings.Join(info.SupportedProtos, ", "))
 	}
 	sb.WriteString(alpnInfo)
 
@@ -388,13 +409,13 @@ func clientHelloInfoToString(info *tls.ClientHelloInfo) string {
 	for _, v := range info.SupportedVersions {
 		versions = append(versions, tls.VersionName(v))
 	}
-	sb.WriteString(fmt.Sprintf("%d supported versions: %s\n", len(versions), strings.Join(versions, ", ")))
+	sb.WriteString(fmt.Sprintf("%s%d supported versions: %s\n", indent, len(versions), strings.Join(versions, ", ")))
 
 	var ciphersuites []string
 	for _, cs := range info.CipherSuites {
 		ciphersuites = append(ciphersuites, translateCipherSuite(cs))
 	}
-	sb.WriteString(fmt.Sprintf("%d supported cipher suites: %s", len(ciphersuites), strings.Join(ciphersuites, ", ")))
+	sb.WriteString(fmt.Sprintf("%s%d supported cipher suites: %s", indent, len(ciphersuites), strings.Join(ciphersuites, ", ")))
 
 	return sb.String()
 }
@@ -408,20 +429,18 @@ func translateCipherSuite(code uint16) string {
 	return name
 }
 
-func certRequestInfoToString(info *tls.CertificateRequestInfo) string {
+func certRequestInfoToString(info *tls.CertificateRequestInfo, indent string) string {
 	var cas []string
-	for _, ca := range info.AcceptableCAs {
-		var name pkix.Name
-		_, err := asn1.Unmarshal(ca, &name)
-		if err != nil {
-			cas = append(cas, fmt.Sprintf("name parsing failed; raw (hex): %s", hex.EncodeToString(ca)))
-			continue
+	for i, ca := range info.AcceptableCAs {
+		caStr, err := decodeAsn1Value(ca)
+		if err == nil {
+			cas = append(cas, fmt.Sprintf("%s%d: %s", indent, i, caStr))
+		} else {
+			cas = append(cas, fmt.Sprintf("%s%d: name parsing failed; raw (hex): %s", indent, i, hex.EncodeToString(ca)))
 		}
-
-		cas = append(cas, name.String())
 	}
 
-	return strings.Join(cas, "; ")
+	return strings.Join(cas, "\n")
 }
 
 func decodeKeyUsage(ku x509.KeyUsage) []string {

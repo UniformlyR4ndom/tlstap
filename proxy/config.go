@@ -190,6 +190,8 @@ type ResolvedProxyConfig struct {
 	Interceptors []InterceptorConfig
 	Server       *TlsServerConfig
 	Client       *TlsClientConfig
+
+	Name string
 }
 
 type ResolvedMuxHandler struct {

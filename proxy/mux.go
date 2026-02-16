@@ -34,10 +34,12 @@ func (h *Handler) MatchesSni(sni string) bool {
 }
 
 func (h *Handler) getClientCertificate(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	h.Logger.Debug("Recieved Certificate Request: %s", certRequestInfoToString(info))
+	h.Logger.Debug("Received Certificate Request:\n%s", certRequestInfoToString(info, "  "))
 	var cert *tls.Certificate
 	if h.ClientConfig != nil && len(h.ClientConfig.Certificates) > 0 {
 		cert = &h.ClientConfig.Certificates[0]
+		chain := []tls.Certificate{*cert}
+		h.Logger.Debug("Using client certificate:\n%s", chainToString(chain, "  "))
 	} else {
 		h.Logger.Error("No client certificate provided")
 	}
@@ -99,7 +101,7 @@ func (m *Mux) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) {
 		logger = &m.proxy.logger
 	}
 
-	logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info))
+	logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info, "  "))
 	if selectedNextProto, ok := selectNextProto(info, serverNextProtos, logger); ok {
 		logger.Debug("Selected application protocol: %s", selectedNextProto)
 		config := serverConfig.Clone()
