@@ -41,6 +41,10 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, []string, error) {
 		return nil, nil, fmt.Errorf("path to certificate and key (both in PEM format) must be provided")
 	}
 
+	if len(config.ALPNPreference) > 0 && config.ALPNProbe {
+		return nil, nil, fmt.Errorf("options alpn-preference and alpn-passthrough are incompatible")
+	}
+
 	cert, err := tls.LoadX509KeyPair(config.CertPem, config.CertKey)
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +88,7 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, []string, error) {
 
 	var keylogWriter io.WriteCloser = nil
 	if config.KeyLogFile != "" {
-		keylogWriter, err = OpenKelogWriter(config.KeyLogFile, config.KeyLogTruncate)
+		keylogWriter, err = OpenKeylogWriter(config.KeyLogFile, config.KeyLogTruncate)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -99,7 +103,7 @@ func ParseServerConfig(config *TlsServerConfig) (*tls.Config, []string, error) {
 		KeyLogWriter: keylogWriter,
 	}
 
-	return &serverConf, config.ALPN, nil
+	return &serverConf, config.ALPNPreference, nil
 }
 
 func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
@@ -116,6 +120,10 @@ func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
 		}
 
 		certificate = &c
+	}
+
+	if len(config.ALPN) > 0 && config.ALPNPassthrough {
+		return nil, fmt.Errorf("options alpn and alpn-passthrough are incompatible")
 	}
 
 	var err error
@@ -150,7 +158,7 @@ func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
 
 	var keylogWriter io.WriteCloser = nil
 	if config.KeyLogFile != "" {
-		keylogWriter, err = OpenKelogWriter(config.KeyLogFile, config.KeyLogTruncate)
+		keylogWriter, err = OpenKeylogWriter(config.KeyLogFile, config.KeyLogTruncate)
 		if err != nil {
 			return nil, err
 		}
@@ -187,7 +195,7 @@ func ParseClientConfig(config *TlsClientConfig) (*tls.Config, error) {
 	return &clientConf, nil
 }
 
-func OpenKelogWriter(path string, truncate bool) (io.WriteCloser, error) {
+func OpenKeylogWriter(path string, truncate bool) (io.WriteCloser, error) {
 	mode := os.O_APPEND
 	if truncate {
 		mode = os.O_TRUNC

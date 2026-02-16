@@ -14,7 +14,7 @@ Multiple interceptors can be active at the same time.
 # Building
 *tlstap* is written in Go and can therefore be used across multiple platforms.
 You can build it for (and from) Linux or Windows like so (if you are building for the same platform you are currently running, you do not need to specify `GOOS`.):
-```powershell
+```shell
 # for Windows
 GOOS=windows go build -o tlstap.exe .
 ```
@@ -365,6 +365,7 @@ At this point interception is, while in theory still possible with a custom TLS 
 
 
 # TODO
+- document mux mode
 - test SNI and SNI passthrough (with and without mux mode)
 - test mux mode with different TLS server & client configs for different targets
 - test per-handler interceptors in mux mode

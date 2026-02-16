@@ -7,8 +7,8 @@
             "cert-key": "../certs/server.key",
             "client-roots": "../certs/ca.pem",
             "client-auth": "require-and-verify",
-            "min-version": "",
-            "max-version": "1.2"
+            "min-version": "1.0",
+            "max-version": "1.3"
         }
     }
 }

@@ -17,6 +17,8 @@ func main() {
 	optMode := flag.String("mode", "", "mode (plain, tls, or starttls)")
 	optCertPem := flag.String("cert-pem", "", "path to certificate file (in PEM format)")
 	optCertKey := flag.String("cert-key", "", "path to certificate key (in PEM format)")
+	optClientAuth := flag.Bool("client-auth", false, "require client auth")
+	acceptProto := flag.String("accept-proto", "", "ALPN value to accept")
 	flag.Parse()
 
 	switch mode := strings.ToLower(*optMode); mode {
@@ -29,7 +31,7 @@ func main() {
 
 		cert, err := tls.LoadX509KeyPair(*optCertPem, *optCertKey)
 		checkFatal(err)
-		startTlsEchoServer(*optListen, &cert)
+		startTlsEchoServer(*optListen, &cert, *optClientAuth, *acceptProto)
 	default:
 		log.Fatalf("invalid mode: %s", mode)
 	}
@@ -48,9 +50,18 @@ func startPlainEchoServer(listenEndpoint string) {
 	}
 }
 
-func startTlsEchoServer(listenEndpoint string, cert *tls.Certificate) {
+func startTlsEchoServer(listenEndpoint string, cert *tls.Certificate, requireClientAuth bool, proto string) {
 	config := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
+		MinVersion:   tls.VersionTLS10,
+	}
+
+	if requireClientAuth {
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	if proto != "" {
+		config.NextProtos = []string{proto}
 	}
 
 	listener, err := tls.Listen("tcp", listenEndpoint, config)

@@ -46,6 +46,14 @@
                 }
             }
         },
+        "test-alpn-passthrough":{
+            "mode": "tls",
+            "listen": "127.0.0.1:8000",
+            "connect": "127.0.0.1:8100",
+            "loglevel": "debug",
+            "server": "alpn-probe-server",
+            "client": "passthrough-client"
+        },
         "test-example.org": {
             "mode": "tls",
             "listen": "127.0.0.1:8443",
@@ -73,14 +81,23 @@
         "alpn-server": {
             "cert-pem": "test/certs/server.pem",
             "cert-key": "test/certs/server.key",
-            "alpn": ["h2", "http/1.1"],
+            "alpn-preference": ["h2", "http/1.1"],
             "keylog": "key.log"
+        },
+        "alpn-probe-server": {
+            "cert-pem": "test/certs/server.pem",
+            "cert-key": "test/certs/server.key",
+            "max-version": "1.2",
+            "min-version": "1.0",
+            "alpn-probe": true,
+            "alpn-probe-cache": false
         }
     },
     "tls-client-configs": {
         "basic-client": {
             "skip-verify": true,
             "sni-passthrough": true,
+            "alpn-passthrough": true,
             "keylog": "key.log"
         },
         "demo-client": {
@@ -88,8 +105,6 @@
             "server-name": "server.local",
             "cert-pem": "test/certs/client-int-1-chain.pem",
             "cert-key": "test/certs/client-int-1.key",
-            "tls-max": "1.2",
-            "tls-min": "1.1",
             "skip-verify": true,
             "keylog": "key.log"
         },
@@ -101,7 +116,9 @@
         "passthrough-client": {
             "sni-passthrough": true,
             "alpn-passthrough": true,
-            "skip-verify": true
+            "skip-verify": true,
+            "max-version": "1.3",
+            "min-version": "1.0"
         }
     },
     "interceptors": {

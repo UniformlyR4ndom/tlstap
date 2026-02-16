@@ -409,8 +409,9 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 		InterceptorAll:   iAll,
 		ClientConfig:     clientConfig,
 		ServerConfig:     serverConfig,
-		ServerNextProtos: serverNextProtos,
+		ALPNPreference:   serverNextProtos,
 		Logger:           localLogger,
+		Prober:           tlstap.NewProber(muxSpec.Server.ALPNProbeCache),
 	}
 
 	if clientConfig != nil {

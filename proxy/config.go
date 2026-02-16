@@ -91,10 +91,24 @@ type TlsServerConfig struct {
 	MinVersion string `json:"min-version"`
 	MaxVersion string `json:"max-version"`
 
-	// List of acceptable next protocols.
+	// List of acceptable next protocols (by order of preference).
 	// The server will select the first mutually acceptable protocol (i.e. the first
-	// protocol in the server ALPN list that is also offered by the client; if any).
-	ALPN []string `json:"alpn"`
+	// protocol in the server ALPNPreference list that is also offered by the client; if any).
+	// This option is incompatible with alpn-passthrough.
+	ALPNPreference []string `json:"alpn-preference"`
+
+	// If set and the TLS client has alpn-passtrough enabled, send a probe request to find
+	// the preferred application protocol of the upstream server.
+	// The client TLS configuration is used with the ALPN values set to those
+	// provided by the downstream client.
+	// The result is cached (for each ordered list of ALPN values, only one probe is done).
+	// This option is incompatible with alpn-preference.
+	ALPNProbe bool `json:"alpn-probe"`
+
+	// Use ALPN probe cache that to avoid probes on every connection initiation.
+	// This may cuase problems for dealing with wonky loadbalancer setups that
+	// forward to servers with differing TLS configurations.
+	ALPNProbeCache bool `json:"alpn-probe-cache"`
 
 	// Path to file to which TLS pre-master secrets should be written (for the client <-> proxy connection).
 	// See KeyLogWriter in https://pkg.go.dev/crypto/tls#Config
@@ -132,12 +146,14 @@ type TlsClientConfig struct {
 	// Next protocol (ALPN) values.
 	// Overrides ALPN passthrough behavior.
 	// See NextProtos in https://pkg.go.dev/crypto/tls#Config
+	// This option is incompatible with alpn-passthrough (client).
 	ALPN []string `json:"alpn"`
 
-	// If no ALPN values are given, pass the application protocol selected by the (tlstap) server
+	// If no ALPN values are given, pass the application protocol selected by the TLS server
 	// on to the upstream server.
 	// Note that at most one ALPN value is passed instead of all protocols offered by the client.
-	// Use the (server-side) ALPN option to configure the order of preferred application protocols.
+	// This option is best used together with the server-side option alpn-probe.
+	// This option is incompatible with alpn (client).
 	ALPNPassthrough bool `json:"alpn-passthrough"`
 
 	// Cipher suites to offer.

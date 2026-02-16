@@ -18,9 +18,13 @@ type Handler struct {
 	InterceptorAll   []Interceptor
 	ClientConfig     *tls.Config
 	ServerConfig     *tls.Config
-	ServerNextProtos []string
+
+	ALPNPreference []string
+	ALPNProbe      bool
 
 	Logger *logging.Logger
+
+	Prober Prober
 }
 
 func (h *Handler) MatchesSni(sni string) bool {
@@ -41,10 +45,15 @@ func (h *Handler) getClientCertificate(info *tls.CertificateRequestInfo) (*tls.C
 		chain := []tls.Certificate{*cert}
 		h.Logger.Debug("Using client certificate:\n%s", chainToString(chain, "  "))
 	} else {
-		h.Logger.Error("No client certificate provided")
+		h.Logger.Error("No client certificate configured")
 	}
 
-	return cert, nil
+	var err error
+	if cert == nil {
+		err = fmt.Errorf("Cannot provide cert")
+	}
+
+	return cert, err
 }
 
 type Mux struct {
@@ -89,25 +98,36 @@ func (m *Mux) GetMatch(serverName string) (*Handler, error) {
 
 func (m *Mux) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) {
 	h, err := m.GetMatch(info.ServerName)
-	serverConfig := h.ServerConfig
-	serverNextProtos := h.ServerNextProtos
-	logger := h.Logger
-	switch {
-	case err != nil:
+	if err != nil {
 		return nil, err
-	case h == nil:
-		serverConfig = m.proxy.serverConfig
-		serverNextProtos = m.proxy.serverNextProtos
-		logger = &m.proxy.logger
+	}
+
+	serverConfig := m.proxy.serverConfig
+	clientConfig := m.proxy.clientConfig
+	alpnPreference := m.proxy.Config.Server.ALPNPreference
+	alpnProbe := m.proxy.Config.Server.ALPNProbe
+	prober := &m.proxy.prober
+	connectEndpoint := m.proxy.Config.ConnectEndpoint
+	logger := &m.proxy.logger
+	if h != nil {
+		if h.ServerConfig != nil {
+			serverConfig = h.ServerConfig
+		}
+
+		if h.ClientConfig != nil {
+			clientConfig = h.ClientConfig
+		}
+
+		if h.Logger != nil {
+			logger = h.Logger
+		}
+
+		alpnPreference = h.ALPNPreference
+		alpnProbe = h.ALPNProbe
+		prober = &h.Prober
+		connectEndpoint = &h.Connect
 	}
 
 	logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info, "  "))
-	if selectedNextProto, ok := selectNextProto(info, serverNextProtos, logger); ok {
-		logger.Debug("Selected application protocol: %s", selectedNextProto)
-		config := serverConfig.Clone()
-		config.NextProtos = []string{selectedNextProto}
-		return config, nil
-	}
-
-	return serverConfig, nil
+	return negotiateALPN(info, serverConfig, clientConfig, alpnPreference, alpnProbe, prober, *connectEndpoint, logger)
 }

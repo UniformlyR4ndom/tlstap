@@ -27,6 +27,8 @@ type Proxy struct {
 	clientConfig     *tls.Config
 	serverConfig     *tls.Config
 	serverNextProtos []string
+
+	prober Prober
 }
 
 func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
@@ -37,6 +39,7 @@ func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Intercep
 		InterceptorsDown: iDown,
 		InterceptorsAll:  iAll,
 		logger:           logger,
+		prober:           NewProber(config.Server.ALPNProbeCache),
 	}
 
 }
@@ -50,7 +53,7 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("connect endpoint must be specified")
 	}
 
-	var tlsServerConfig, tlsClientconfig *tls.Config
+	var tlsServerConfig, tlsClientConfig *tls.Config
 	var tlsServerNextProtos []string
 	var err error
 
@@ -74,27 +77,47 @@ func (p *Proxy) Start() error {
 			return err
 		}
 
-		if tlsClientconfig, err = ParseClientConfig(p.Config.Client); err != nil {
+		tlsServerConfig.GetConfigForClient = p.getServerConfig
+
+		if tlsClientConfig, err = ParseClientConfig(p.Config.Client); err != nil {
 			return err
 		}
 
-		tlsServerConfig.GetConfigForClient = p.getServerConfig
+		if tlsClientConfig != nil {
+			tlsClientConfig.GetClientCertificate = p.getClientCertificate
+		}
 
 	case ModeMux:
 		if p.Config.Server == nil {
 			p.logger.Warn("No default TLS server configuration available. No fallback for mux possible.")
-		} else {
-			if tlsServerConfig, tlsServerNextProtos, err = ParseServerConfig(p.Config.Server); err == nil {
-				tlsServerConfig.GetConfigForClient = p.Mux.getServerConfig
-			} else {
-				return err
-			}
+		} else if tlsServerConfig, tlsServerNextProtos, err = ParseServerConfig(p.Config.Server); err != nil {
+			return err
 		}
+
+		if tlsServerConfig == nil {
+			tlsServerConfig = &tls.Config{}
+		}
+
+		tlsServerConfig.GetConfigForClient = p.Mux.getServerConfig
 
 		if p.Config.Client == nil {
 			p.logger.Warn("No default TLS client configuration available. No fallback for mux possible.")
-		} else if tlsClientconfig, err = ParseClientConfig(p.Config.Client); err != nil {
+		} else if tlsClientConfig, err = ParseClientConfig(p.Config.Client); err != nil {
 			return err
+		}
+
+		if tlsClientConfig != nil {
+			tlsClientConfig.GetClientCertificate = p.getClientCertificate
+		}
+
+		for _, h := range p.Mux.handlers {
+			if h.ServerConfig == nil && p.serverConfig == nil {
+				return fmt.Errorf("neither TLS server config nor fallback config defined for mux handler %s", h.Name)
+			}
+
+			if h.ClientConfig != nil {
+				h.ClientConfig.GetClientCertificate = h.getClientCertificate
+			}
 		}
 
 		if p.Config.ConnectEndpoint == nil || *p.Config.ConnectEndpoint == "" {
@@ -107,7 +130,7 @@ func (p *Proxy) Start() error {
 
 	// must be called after initialization of TLS client config
 	p.warnPassthroughUnsupported()
-	p.clientConfig = tlsClientconfig
+	p.clientConfig = tlsClientConfig
 	p.serverConfig = tlsServerConfig
 	p.serverNextProtos = tlsServerNextProtos
 	switch p.Mode {
@@ -150,15 +173,9 @@ func (p *Proxy) startPlainProxy() error {
 }
 
 func (p *Proxy) startTlsProxy() error {
-	tlsServerConfig := p.serverConfig
-	tlsClientConfig := p.clientConfig
-	listener, err := tls.Listen("tcp", p.Config.ListenEndpoint, tlsServerConfig)
+	listener, err := tls.Listen("tcp", p.Config.ListenEndpoint, p.serverConfig)
 	if err != nil {
 		return err
-	}
-
-	if tlsClientConfig != nil {
-		tlsClientConfig.GetClientCertificate = p.getClientCertificate
 	}
 
 	p.logStartupInfo()
@@ -183,28 +200,50 @@ func (p *Proxy) startTlsProxy() error {
 		handler, err := p.newHandler(ModeTls, nil, "")
 		CheckFatal(err)
 
-		handler.Setting.TlsServerConfig = tlsServerConfig
-		handler.Setting.TlsClientConfig = tlsClientConfig
-
 		// handle SNI and ALPN passthrough
 		if p.Config.Client.SniPassthroug || p.Config.Client.ALPNPassthrough {
 			connState := tlsConn.ConnectionState()
-			protos := []string{connState.NegotiatedProtocol}
-			if len(protos) > 0 {
-				p.logger.Debug("Picked up ALPN values from client: %s", strings.Join(protos, ", "))
-			}
-
 			serverName := connState.ServerName
 			if serverName != "" {
 				p.logger.Debug("Picked up server name (SNI) form client: %s", serverName)
 			}
 
+			protos := []string{connState.NegotiatedProtocol}
+			if len(protos) > 0 {
+				p.logger.Debug("Picked up ALPN values from client: %s", strings.Join(protos, ", "))
+			}
+
 			// only if current config does not specify SNI or ALPN respectively the overrides are applied
-			handler.Setting.TlsClientConfig = getModifiedConfig(tlsClientConfig, serverName, protos)
+			handler.Setting.TlsClientConfig = getModifiedConfig(p.clientConfig, serverName, protos)
 		}
 
 		logClientConfigInfo(handler.ConnId, handler.logger, handler.Setting.TlsClientConfig)
 		go handler.HandleConnection(tlsConn)
+	}
+}
+
+func (p *Proxy) startDetectTlsProxy() error {
+	listener, err := net.Listen("tcp", p.Config.ListenEndpoint)
+	if err != nil {
+		return err
+	}
+
+	p.logStartupInfo()
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	notifyInit(p.InterceptorsAll, *tcpAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			p.logger.Error("failed to establish connection: %v", err)
+			continue
+		}
+
+		handler, err := p.newHandler(ModeDetectTls, nil, "")
+		CheckFatal(err)
+
+		go handler.HandleConnection(conn)
 	}
 }
 
@@ -218,10 +257,6 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 	listener, err := tls.Listen("tcp", p.Config.ListenEndpoint, tlsServerConfig)
 	if err != nil {
 		return err
-	}
-
-	if tlsClientConfig != nil {
-		tlsClientConfig.GetClientCertificate = p.getClientCertificate
 	}
 
 	p.logStartupInfo()
@@ -254,10 +289,7 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 
 		// if no specific config is provided by the mux handler, set the default one
 		if handler.Setting.TlsServerConfig == nil {
-			if tlsServerConfig == nil {
-				return fmt.Errorf("neither mux handler nor default TLS server config provided")
-			}
-
+			assert.Assertf(tlsServerConfig != nil, "Neither mux handler nor default TLS server config provided. This is a bug.")
 			handler.Setting.TlsServerConfig = tlsServerConfig
 		}
 
@@ -275,39 +307,6 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 		}
 
 		logClientConfigInfo(handler.ConnId, handler.logger, handler.Setting.TlsClientConfig)
-		go handler.HandleConnection(conn)
-	}
-}
-
-func (p *Proxy) startDetectTlsProxy() error {
-	tlsServerConfig := p.serverConfig
-	tlsClientConfig := p.clientConfig
-	listener, err := net.Listen("tcp", p.Config.ListenEndpoint)
-	if err != nil {
-		return err
-	}
-
-	if tlsClientConfig != nil {
-		tlsClientConfig.GetClientCertificate = p.getClientCertificate
-	}
-
-	p.logStartupInfo()
-	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
-	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
-	notifyInit(p.InterceptorsAll, *tcpAddr)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			p.logger.Error("failed to establish connection: %v", err)
-			continue
-		}
-
-		handler, err := p.newHandler(ModeDetectTls, nil, "")
-		CheckFatal(err)
-
-		handler.Setting.TlsServerConfig = tlsServerConfig
-		handler.Setting.TlsClientConfig = tlsClientConfig
 		go handler.HandleConnection(conn)
 	}
 }
@@ -367,16 +366,53 @@ func notifyInit(interceptors []Interceptor, listenAddress net.TCPAddr) error {
 }
 
 func (p *Proxy) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) {
-	serverConfig := p.serverConfig
 	p.logger.Debug("Received Client Hello:\n%s", clientHelloInfoToString(info, "  "))
+	alpnPreference := p.Config.Server.ALPNPreference
+	alpnProbe := p.Config.Server.ALPNProbe
+	return negotiateALPN(info, p.serverConfig, p.clientConfig, alpnPreference, alpnProbe, &p.prober, *p.Config.ConnectEndpoint, &p.logger)
+}
 
-	if selectedNextProto, ok := selectNextProto(info, p.serverNextProtos, &p.logger); ok {
-		p.logger.Debug("Selected application protocol: %s", selectedNextProto)
-		config := p.serverConfig.Clone()
-		config.NextProtos = []string{selectedNextProto}
+func negotiateALPN(info *tls.ClientHelloInfo, serverConfig, clientConfig *tls.Config, alpnPreference []string, alpnProbe bool,
+	prober *Prober, connectEndpoint string, logger *logging.Logger) (*tls.Config, error) {
+	offeredProtos := info.SupportedProtos
+	if len(alpnPreference) > 0 {
+		if selectedNextProto, ok := selectNextProto(info, offeredProtos, logger); ok {
+			logger.Debug("Selected application protocol: %s", selectedNextProto)
+			config := serverConfig.Clone()
+			config.NextProtos = []string{selectedNextProto}
+			return config, nil
+		}
+
+		return serverConfig, nil
+	}
+
+	switch len(offeredProtos) {
+	case 0:
+		return serverConfig, nil
+	case 1:
+		selected := offeredProtos[0]
+		config := serverConfig.Clone()
+		config.NextProtos = []string{selected}
+
+		logger.Debug("Only one next protcol offered: %s; accepting it", selected)
 		return config, nil
 	}
 
+	if alpnProbe {
+		logger.Debug("Probing for accepted next protocol (offered: %v)", offeredProtos)
+		selected, cached, err := prober.Probe(connectEndpoint, clientConfig, offeredProtos)
+		if err != nil {
+			logger.Warn("ALPN probe failed: %v", err)
+			return serverConfig, nil
+		}
+
+		logger.Debug("ALPN probe returned protocol choice %s (cached: %v)", selected, cached)
+		config := serverConfig.Clone()
+		config.NextProtos = []string{selected}
+		return config, nil
+	}
+
+	logger.Warn("Multiple next protocols offered by client but neither alpn-preference nor alpn-probe configured")
 	return serverConfig, nil
 }
 
@@ -388,10 +424,15 @@ func (p *Proxy) getClientCertificate(info *tls.CertificateRequestInfo) (*tls.Cer
 		chain := []tls.Certificate{*cert}
 		p.logger.Debug("Using client certificate:\n%s", chainToString(chain, "  "))
 	} else {
-		p.logger.Error("No client certificate provided")
+		p.logger.Error("No client certificate configured")
 	}
 
-	return cert, nil
+	var err error
+	if cert == nil {
+		err = fmt.Errorf("Cannot provide cert")
+	}
+
+	return cert, err
 }
 
 func logSni(connId uint32, logger *logging.Logger, config *tls.Config) {
