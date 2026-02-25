@@ -176,6 +176,11 @@ func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	return err
 }
 
+func (i *BridgeInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+	// TODO: give the option to terminate the connection from the other side
+	return nil
+}
+
 func (i *BridgeInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	infoFrame := InfoFrame{
 		EventId:    BridgeEventConnTerminated,

@@ -27,6 +27,10 @@ func (i *HexDumpInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error 
 	return nil
 }
 
+func (i *HexDumpInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+	return nil
+}
+
 func (i *HexDumpInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	if i.Logger != nil {
 		i.Logger.Info("Connection terminated: %v (%v->%v)", info.ConnID, info.SrcEndpoint, info.DstEndpoint)

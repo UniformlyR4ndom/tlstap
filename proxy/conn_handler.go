@@ -156,9 +156,14 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 			assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 			assert.Assertf(read == peeked, "Peeked %d bytes but read %d bytes. This is a bug.", peeked, read)
 
-			if data := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); len(data) > 0 {
+			switch data, err := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); {
+			case err != nil:
+				h.terminate()
+				return err
+			case len(data) > 0:
 				h.ConnUp.Write(data)
 			}
+
 			continue
 		}
 
@@ -168,7 +173,11 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 			assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 			assert.Assertf(read == result.StartIndex, "Expected to read %d bytes but read %d. This is a bug.", result.StartIndex, read)
 
-			if data := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); len(data) > 0 {
+			switch data, err := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); {
+			case err != nil:
+				h.terminate()
+				return err
+			case len(data) > 0:
 				h.ConnUp.Write(data)
 			}
 		}
@@ -210,6 +219,11 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 			return err
 		}
 
+		if err = h.notifyConnUpgraded(); err != nil {
+			h.terminate()
+			return err
+		}
+
 		lDown := tlsConnDown.LocalAddr().String()
 		rDown := tlsConnDown.RemoteAddr().String()
 		h.logger.Info("Upgraded downstream connection (%d): %s <-> %s (%s)", h.ConnId, rDown, lDown, SummarizeTlsConn(tlsConnDown))
@@ -235,7 +249,11 @@ func (h *ConnHandler) forwardDetectTlsDown() error {
 		read, err := h.ConnUp.Read(buf)
 		switch {
 		case err == nil:
-			if data := h.intercept(h.InterceptorsDown, buf[:read], &connInfo); len(data) > 0 {
+			switch data, err := h.intercept(h.InterceptorsDown, buf[:read], &connInfo); {
+			case err != nil:
+				h.terminate()
+				return err
+			case len(data) > 0:
 				h.ConnDown.Write(data)
 			}
 		case len(h.upgradeChan) > 0 && errors.Is(err, os.ErrDeadlineExceeded):
@@ -265,7 +283,10 @@ func (h *ConnHandler) drainConn(b []byte, connIn, connOut net.Conn, interceptors
 		case errors.Is(err, os.ErrDeadlineExceeded):
 			return nil
 		case err == nil:
-			if data := h.intercept(interceptors, b[:read], info); len(data) > 0 {
+			switch data, err := h.intercept(interceptors, b[:read], info); {
+			case err != nil:
+				return err
+			case len(data) > 0:
 				connOut.Write(data)
 			}
 		default:
@@ -287,6 +308,10 @@ func (h *ConnHandler) forwardGeneric() error {
 		return err
 	}
 
+	if err := h.notifyConnUpgraded(); err != nil {
+		return err
+	}
+
 	h.wg.Add(1)
 	go h.forwardOneWay(h.ConnDown, h.ConnUp, bufUp, h.InterceptorsUp, &connInfoUp)
 	h.forwardOneWay(h.ConnUp, h.ConnDown, bufDown, h.InterceptorsDown, &connInfoDown)
@@ -300,16 +325,43 @@ func (h *ConnHandler) forwardGeneric() error {
 func (h *ConnHandler) notifyConnEstablished() error {
 	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
 	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
-	h.notifyEstablished(h.InterceptorsUp, &connInfoUp)
-	h.notifyEstablished(h.InterceptorsDown, &connInfoDown)
+	if err := h.notifyEstablished(h.InterceptorsUp, &connInfoUp); err != nil {
+		return err
+	}
+
+	if err := h.notifyEstablished(h.InterceptorsDown, &connInfoDown); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (h *ConnHandler) notifyConnTerminated() {
+func (h *ConnHandler) notifyConnUpgraded() error {
 	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
 	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
-	h.notifyTerminated(h.InterceptorsUp, &connInfoUp)
-	h.notifyTerminated(h.InterceptorsDown, &connInfoDown)
+	if err := h.notifyUpgraded(h.InterceptorsUp, &connInfoUp); err != nil {
+		return err
+	}
+
+	if err := h.notifyUpgraded(h.InterceptorsDown, &connInfoDown); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (h *ConnHandler) notifyConnTerminated() error {
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	if err := h.notifyTerminated(h.InterceptorsUp, &connInfoUp); err != nil {
+		return err
+	}
+
+	if err := h.notifyTerminated(h.InterceptorsDown, &connInfoDown); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, interceptors []Interceptor, info *ConnInfo) error {
@@ -334,15 +386,19 @@ func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, inter
 			continue
 		}
 
-		if data := h.intercept(interceptors, buf[:r], info); len(data) > 0 {
+		switch data, err := h.intercept(interceptors, buf[:r], info); {
+		case err != nil:
+			h.terminate()
+			return err
+		case len(data) > 0:
 			dstConn.Write(data)
 		}
 	}
 }
 
-func (h *ConnHandler) intercept(interceptors []Interceptor, data []byte, info *ConnInfo) []byte {
+func (h *ConnHandler) intercept(interceptors []Interceptor, data []byte, info *ConnInfo) ([]byte, error) {
 	if interceptors == nil {
-		return data
+		return data, nil
 	}
 
 	var err error
@@ -353,14 +409,17 @@ func (h *ConnHandler) intercept(interceptors []Interceptor, data []byte, info *C
 		}
 
 		tmp, err = i.Intercept(info, data)
-		if err == nil {
+		switch {
+		case err == nil:
 			data = tmp
-		} else {
+		case err == ErrAbort:
+			return nil, err
+		default:
 			h.logger.Warn("Got error during intercetion of connection %d: %v. Forwarding original data.", h.ConnId, err)
 		}
 	}
 
-	return data
+	return data, nil
 }
 
 func (h *ConnHandler) terminate() {
@@ -373,18 +432,35 @@ func (h *ConnHandler) terminate() {
 		})
 }
 
-func (h *ConnHandler) notifyEstablished(interceptors []Interceptor, info *ConnInfo) {
+func (h *ConnHandler) notifyEstablished(interceptors []Interceptor, info *ConnInfo) error {
 	for _, i := range interceptors {
 		if err := i.ConnectionEstablished(info); err != nil {
 			h.logger.Warn("Error on established notification: %v", err)
+			return err
 		}
 	}
+
+	return nil
 }
 
-func (h *ConnHandler) notifyTerminated(interceptors []Interceptor, info *ConnInfo) {
+func (h *ConnHandler) notifyUpgraded(interceptor []Interceptor, info *ConnInfo) error {
+	for _, i := range interceptor {
+		if err := i.ConnectionUpgraded(info); err != nil {
+			h.logger.Warn("Error on upgrade notification: %v", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (h *ConnHandler) notifyTerminated(interceptors []Interceptor, info *ConnInfo) error {
 	for _, i := range interceptors {
 		if err := i.ConnectionTerminated(info); err != nil {
 			h.logger.Warn("Error on termination notification: %v", err)
+			return err
 		}
 	}
+
+	return nil
 }

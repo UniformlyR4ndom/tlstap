@@ -260,20 +260,20 @@ func CheckFatal(err error) {
 	}
 }
 
-func getModifiedConfig(config *tls.Config, defaultServerName string, defaultAlpn []string) *tls.Config {
-	overrideSni := config.ServerName == "" && defaultServerName != ""
-	overrideAlpn := len(config.NextProtos) == 0 && len(defaultAlpn) > 0
+func getModifiedConfig(config *tls.Config, serverNameOverride string, alpnOverride []string) *tls.Config {
+	overrideSni := config.ServerName == "" && serverNameOverride != ""
+	overrideAlpn := len(config.NextProtos) == 0 && len(alpnOverride) > 0
 	if !(overrideSni || overrideAlpn) {
 		return config
 	}
 
 	c := config.Clone()
 	if overrideSni {
-		c.ServerName = defaultServerName
+		c.ServerName = serverNameOverride
 	}
 
 	if overrideAlpn {
-		c.NextProtos = defaultAlpn
+		c.NextProtos = alpnOverride
 	}
 
 	return c

@@ -23,6 +23,7 @@ const (
 	InterceptorPcapdump     = "pcapdump"
 	InterceptorMatchReplace = "match-replace"
 	InterceptorBridge       = "bridge"
+	InterceptorDropTls      = "droptls"
 )
 
 type InterceptorCallback func(config tlstap.ResolvedProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
@@ -88,7 +89,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 		if config.ClientRef != "" {
 			client, ok := configFile.TlsClientConfigs[config.ClientRef]
 			if !ok {
-				mainLogger.Fatal("TLS client config '%s' not defined.", config.ServerRef)
+				mainLogger.Fatal("TLS client config '%s' not defined.", config.ClientRef)
 			}
 
 			pConfig.Client = &client
@@ -99,7 +100,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			for i, iConfigRef := range config.InterceptorRefs {
 				iConfig, ok := configFile.Interceptors[iConfigRef]
 				if !ok {
-					mainLogger.Fatal("Interceptor '%s' not defined.", config.ServerRef)
+					mainLogger.Fatal("Interceptor '%s' not defined.", iConfigRef)
 				}
 
 				iArgsJson, err := json.Marshal(iConfig.Args)
@@ -311,6 +312,10 @@ func buildInterceptor(iConfig *tlstap.InterceptorConfig, pConfig *tlstap.Resolve
 
 		i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
 		interceptor = &i
+	case InterceptorDropTls:
+		interceptor = &intercept.DropTlsInterceptor{
+			Logger: logger,
+		}
 	default:
 		var err error
 		if cb != nil {

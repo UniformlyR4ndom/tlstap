@@ -21,6 +21,10 @@ func (i *NullInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	return nil
 }
 
+func (i *NullInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+	return nil
+}
+
 func (i *NullInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	return nil
 }

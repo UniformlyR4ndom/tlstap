@@ -1,9 +1,13 @@
 package tlstap
 
 import (
+	"errors"
 	"net"
 	"tlstap/assert"
 )
+
+// tell handler to drop the connection (e.g. to attmept TLS downgrade)
+var ErrAbort = errors.New("drop connection")
 
 type Interceptor interface {
 
@@ -15,6 +19,9 @@ type Interceptor interface {
 
 	// called once for each conneciton established
 	ConnectionEstablished(info *ConnInfo) error
+
+	// called when a connection is upgraded to TLS
+	ConnectionUpgraded(info *ConnInfo) error
 
 	// called once for each connection after it is terminated
 	ConnectionTerminated(info *ConnInfo) error

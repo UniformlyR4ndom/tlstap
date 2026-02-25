@@ -79,6 +79,10 @@ func (i *PcapDumpInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error
 	return nil
 }
 
+func (i *PcapDumpInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+	return nil
+}
+
 func (i *PcapDumpInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	delete(i.dumpers, info.ConnID)
 	return nil

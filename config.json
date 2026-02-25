@@ -13,12 +13,20 @@
         },
         "example-tls-basic": {
             "mode": "tls",
-            "listen": "127.0.0.1:443",
-            "connect": "74.125.29.101:443",
+            "listen": "127.0.0.1:1337",
+            "connect": "127.0.0.1:1338",
             "logtime": true,
             "server": "basic-server",
             "client": "basic-client",
             "interceptors": ["hexdump"]
+        },
+        "example-droptls": {
+            "mode": "detecttls",
+            "listen": "127.0.0.1:8000",
+            "connect": "127.0.0.1:8100",
+            "server": "basic-server",
+            "client": "basic-client",
+            "interceptors": ["droptls"]
         },
         "example-tls-mux": {
             "mode": "tls-mux",
@@ -124,6 +132,9 @@
     "interceptors": {
         "hexdump": {
             "name": "hexdump"
+        },
+        "droptls": {
+            "name": "droptls"
         },
         "pcapdump": {
             "name": "pcapdump",

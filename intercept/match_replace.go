@@ -66,6 +66,10 @@ func (i *MatchReplaceInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) e
 	return nil
 }
 
+func (i *MatchReplaceInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+	return nil
+}
+
 func (i *MatchReplaceInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	return nil
 }
