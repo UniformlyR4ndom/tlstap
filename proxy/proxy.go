@@ -208,9 +208,10 @@ func (p *Proxy) startTlsProxy() error {
 				p.logger.Debug("Picked up server name (SNI) form client: %s", serverName)
 			}
 
-			protos := []string{connState.NegotiatedProtocol}
-			if len(protos) > 0 {
-				p.logger.Debug("Picked up ALPN values from client: %s", strings.Join(protos, ", "))
+			var protos []string
+			if connState.NegotiatedProtocol != "" {
+				protos = []string{connState.NegotiatedProtocol}
+				p.logger.Debug("Picked up next protocol (ALPN) from client: %s", connState.NegotiatedProtocol)
 			}
 
 			// only if current config does not specify SNI or ALPN respectively the overrides are applied
