@@ -5,6 +5,12 @@
             "listen": "127.0.0.1:8000",
             "connect": "127.0.0.1:9000"
         },
+        "pcap-test": {
+            "mode": "plain",
+            "listen": "127.0.0.1:8000",
+            "connect": "127.0.0.1:8100",
+            "interceptors": ["pcapdump"]
+        },
         "example-match-replace": {
             "mode": "plain",
             "listen": "127.0.0.1:8001",

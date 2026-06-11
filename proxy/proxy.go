@@ -1,4 +1,4 @@
-package tlstap
+package proxy
 
 import (
 	"crypto/tls"
@@ -32,16 +32,21 @@ type Proxy struct {
 }
 
 func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
-	return Proxy{
+	proxy := Proxy{
 		Config:           config,
 		Mode:             mode,
 		InterceptorsUp:   iUp,
 		InterceptorsDown: iDown,
 		InterceptorsAll:  iAll,
 		logger:           logger,
-		prober:           NewProber(config.Server.ALPNProbeCache),
 	}
 
+	switch mode {
+	case ModeTls, ModeMux:
+		proxy.prober = NewProber(config.Server.ALPNProbeCache)
+	}
+
+	return proxy
 }
 
 func (p *Proxy) Start() error {

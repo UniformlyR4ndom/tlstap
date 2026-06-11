@@ -1,4 +1,4 @@
-package intercept
+package bridge
 
 import (
 	"bytes"
@@ -9,8 +9,9 @@ import (
 	"sync"
 
 	"tlstap/assert"
+	"tlstap/intercept"
 	"tlstap/logging"
-	tlstap "tlstap/proxy"
+	"tlstap/proxy"
 )
 
 type FrameType byte
@@ -132,7 +133,7 @@ func (f *InfoFrame) ToBytes() []byte {
 }
 
 type BridgeInterceptor struct {
-	NullInterceptor
+	intercept.NullInterceptor
 
 	connectEndpoint string
 	connMap         sync.Map
@@ -158,7 +159,7 @@ func NewBridgeInterceptor(connect string, logger *logging.Logger) BridgeIntercep
 	}
 }
 
-func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
+func (i *BridgeInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	conn, err := net.Dial("tcp", i.connectEndpoint)
 	if err != nil {
 		return err
@@ -176,12 +177,12 @@ func (i *BridgeInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
 	return err
 }
 
-func (i *BridgeInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+func (i *BridgeInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 	// TODO: give the option to terminate the connection from the other side
 	return nil
 }
 
-func (i *BridgeInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
+func (i *BridgeInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	infoFrame := InfoFrame{
 		EventId:    BridgeEventConnTerminated,
 		ConnId:     uint32(info.ConnID),
@@ -202,7 +203,7 @@ func (i *BridgeInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
 	return nil
 }
 
-func (i *BridgeInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
+func (i *BridgeInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	n := uint32(len(data))
 	assert.Assertf(int(n) == len(data), "Length truncated")
 

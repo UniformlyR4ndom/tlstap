@@ -12,9 +12,13 @@ import (
 	"strings"
 	"sync"
 
-	"tlstap/intercept"
+	"tlstap/intercept/bridge"
+	"tlstap/intercept/drop"
+	"tlstap/intercept/hexdump"
+	replace "tlstap/intercept/match_replace"
+	"tlstap/intercept/pcapdump"
 	"tlstap/logging"
-	tlstap "tlstap/proxy"
+	"tlstap/proxy"
 )
 
 // known interceptor
@@ -26,7 +30,7 @@ const (
 	InterceptorDropTls      = "droptls"
 )
 
-type InterceptorCallback func(config tlstap.ResolvedProxyConfig, iConfig tlstap.InterceptorConfig, logger *logging.Logger) (tlstap.Interceptor, error)
+type InterceptorCallback func(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
 
 func StartWithCli(interceptorCallback InterceptorCallback) {
 	optEnable := flag.String("enable", "", `Comma-separated list of proxy configurations to enable (e.g. "myconfig-a,myconfig-b")`)
@@ -42,7 +46,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	configData, err := os.ReadFile(configPath)
 	checkFatal(&mainLogger, err)
 
-	var configFile tlstap.ConfigFile
+	var configFile proxy.ConfigFile
 	checkFatal(&mainLogger, json.Unmarshal(configData, &configFile))
 
 	var enabledConfigs []string
@@ -64,7 +68,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			mainLogger.Fatal("Unknown config: %s", configName)
 		}
 
-		pConfig := tlstap.ResolvedProxyConfig{
+		pConfig := proxy.ResolvedProxyConfig{
 			ListenEndpoint: config.ListenEndpoint,
 			Mode:           config.Mode,
 			LogFile:        config.LogFile,
@@ -96,7 +100,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 		}
 
 		if len(config.InterceptorRefs) > 0 {
-			interceptors := make([]tlstap.InterceptorConfig, len(config.InterceptorRefs))
+			interceptors := make([]proxy.InterceptorConfig, len(config.InterceptorRefs))
 			for i, iConfigRef := range config.InterceptorRefs {
 				iConfig, ok := configFile.Interceptors[iConfigRef]
 				if !ok {
@@ -113,7 +117,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			pConfig.Interceptors = interceptors
 		}
 
-		var proxy *tlstap.Proxy
+		var proxy *proxy.Proxy
 		if pConfig.Mode == "tls-mux" {
 			resolvedHandlers, err := resolveMuxHandlers(&config, &configFile, &mainLogger)
 			checkFatal(&mainLogger, err)
@@ -133,8 +137,8 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	wg.Wait()
 }
 
-func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFile, mainLogger *logging.Logger) ([]tlstap.ResolvedMuxHandler, error) {
-	var resolvedHandlers []tlstap.ResolvedMuxHandler
+func resolveMuxHandlers(config *proxy.ProxyConfig, configFile *proxy.ConfigFile, mainLogger *logging.Logger) ([]proxy.ResolvedMuxHandler, error) {
+	var resolvedHandlers []proxy.ResolvedMuxHandler
 	for hName, h := range config.Mux {
 		var matchers []*regexp.Regexp
 		for _, m := range h.Matchers {
@@ -150,7 +154,7 @@ func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFil
 			mainLogger.Warn("No matchers defined for mux handler %s. This handler will not be used.", hName)
 		}
 
-		interceptors := make([]tlstap.InterceptorConfig, len(h.InterceptorRefs))
+		interceptors := make([]proxy.InterceptorConfig, len(h.InterceptorRefs))
 		for i, iRef := range h.InterceptorRefs {
 			interceptor, ok := configFile.Interceptors[iRef]
 			if !ok {
@@ -160,7 +164,7 @@ func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFil
 			interceptors[i] = interceptor
 		}
 
-		var server *tlstap.TlsServerConfig
+		var server *proxy.TlsServerConfig
 		if h.ServerRef != "" {
 			s, ok := configFile.TlsServerConfigs[h.ServerRef]
 			if !ok {
@@ -172,7 +176,7 @@ func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFil
 			mainLogger.Warn("No TLS server config provided for mux handler %s.", hName)
 		}
 
-		var client *tlstap.TlsClientConfig
+		var client *proxy.TlsClientConfig
 		if h.ClientRef != "" {
 			c, ok := configFile.TlsClientConfigs[h.ClientRef]
 			if !ok {
@@ -184,7 +188,7 @@ func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFil
 			mainLogger.Warn("No TLS client config provided for mux handler %s.", hName)
 		}
 
-		resolvedHandler := tlstap.ResolvedMuxHandler{
+		resolvedHandler := proxy.ResolvedMuxHandler{
 			Name:            hName,
 			ConnectEndpoint: h.ConnectEndpoint,
 			Matchers:        matchers,
@@ -201,7 +205,7 @@ func resolveMuxHandlers(config *tlstap.ProxyConfig, configFile *tlstap.ConfigFil
 	return resolvedHandlers, nil
 }
 
-func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback) (*tlstap.Proxy, error) {
+func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback) (*proxy.Proxy, error) {
 	logWriter := os.Stdout
 	if config.LogFile != "" {
 		logFile, err := os.OpenFile(config.LogFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
@@ -218,17 +222,17 @@ func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.Re
 
 	proxyLogger := logging.NewLogger(logWriter, &slog.HandlerOptions{Level: logLevel}, config.LogTime)
 
-	var mode tlstap.Mode
-	var handlers []tlstap.Handler
+	var mode proxy.Mode
+	var handlers []proxy.Handler
 	switch m := strings.ToLower(strings.TrimSpace(config.Mode)); m {
 	case "plain":
-		mode = tlstap.ModePlain
+		mode = proxy.ModePlain
 	case "tls":
-		mode = tlstap.ModeTls
+		mode = proxy.ModeTls
 	case "detecttls":
-		mode = tlstap.ModeDetectTls
+		mode = proxy.ModeDetectTls
 	case "tls-mux":
-		mode = tlstap.ModeMux
+		mode = proxy.ModeMux
 		for _, h := range muxHandlers {
 			handler, err := buildMuxHandler(h, config, mainLogger, &proxyLogger, cb)
 			if err != nil {
@@ -241,9 +245,9 @@ func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.Re
 		return nil, fmt.Errorf("invalid proxy mode: %s", config.Mode)
 	}
 
-	var interceptorsUp []tlstap.Interceptor
-	var interceptorsDown []tlstap.Interceptor
-	var interceptorsAll []tlstap.Interceptor
+	var interceptorsUp []proxy.Interceptor
+	var interceptorsDown []proxy.Interceptor
+	var interceptorsAll []proxy.Interceptor
 	if config.Interceptors != nil {
 		for _, iConfig := range config.Interceptors {
 			if iConfig.Disable {
@@ -270,9 +274,9 @@ func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.Re
 		}
 	}
 
-	p := tlstap.NewProxy(*config, mode, interceptorsUp, interceptorsDown, interceptorsAll, proxyLogger)
-	if mode == tlstap.ModeMux {
-		mux := tlstap.NewMux(handlers)
+	p := proxy.NewProxy(*config, mode, interceptorsUp, interceptorsDown, interceptorsAll, proxyLogger)
+	if mode == proxy.ModeMux {
+		mux := proxy.NewMux(handlers)
 		p.Mux = mux
 		mux.SetProxy(&p)
 	}
@@ -280,40 +284,40 @@ func proxyFromConfig(config *tlstap.ResolvedProxyConfig, muxHandlers []tlstap.Re
 	return &p, nil
 }
 
-func buildInterceptor(iConfig *tlstap.InterceptorConfig, pConfig *tlstap.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback) (tlstap.Interceptor, error) {
-	var interceptor tlstap.Interceptor
+func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback) (proxy.Interceptor, error) {
+	var interceptor proxy.Interceptor
 	switch iConfig.Name {
 	case InterceptorHexdump:
-		interceptor = &intercept.HexDumpInterceptor{Logger: logger}
+		interceptor = &hexdump.HexDumpInterceptor{Logger: logger}
 	case InterceptorPcapdump:
-		var pcapConfig intercept.PcapConfig
+		var pcapConfig pcapdump.PcapConfig
 		if err := json.Unmarshal(iConfig.ArgsJson, &pcapConfig); err != nil {
 			return nil, err
 		}
 
-		i := intercept.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
+		i := pcapdump.NewPcapDumpInterceptor(pcapConfig.FilePath, pcapConfig.Truncate)
 		interceptor = &i
 	case InterceptorMatchReplace:
-		var matchReplaceConfig intercept.MatchReplaceConfig
+		var matchReplaceConfig replace.MatchReplaceConfig
 		if err := json.Unmarshal(iConfig.ArgsJson, &matchReplaceConfig); err != nil {
 			return nil, err
 		}
 
-		if i, err := intercept.NewMatchReplaceInterceptor(&matchReplaceConfig); err != nil {
+		if i, err := replace.NewMatchReplaceInterceptor(&matchReplaceConfig); err != nil {
 			return nil, err
 		} else {
 			interceptor = &i
 		}
 	case InterceptorBridge:
-		var bridgeConf intercept.BridgeConfig
+		var bridgeConf bridge.BridgeConfig
 		if err := json.Unmarshal(iConfig.ArgsJson, &bridgeConf); err != nil {
 			return nil, err
 		}
 
-		i := intercept.NewBridgeInterceptor(bridgeConf.Connect, logger)
+		i := bridge.NewBridgeInterceptor(bridgeConf.Connect, logger)
 		interceptor = &i
 	case InterceptorDropTls:
-		interceptor = &intercept.DropTlsInterceptor{
+		interceptor = &drop.DropTlsInterceptor{
 			Logger: logger,
 		}
 	default:
@@ -333,7 +337,7 @@ func buildInterceptor(iConfig *tlstap.InterceptorConfig, pConfig *tlstap.Resolve
 	return interceptor, nil
 }
 
-func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback) (tlstap.Handler, error) {
+func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback) (proxy.Handler, error) {
 	logFile := pConfig.LogFile
 	if muxSpec.LogFile != "" {
 		logFile = muxSpec.LogFile
@@ -348,21 +352,21 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 	if logFile != pConfig.LogFile || logLevel != pConfig.LogLevel {
 		level, err := parseLogLevel(logLevel)
 		if err != nil {
-			return tlstap.Handler{}, err
+			return proxy.Handler{}, err
 		}
 
 		logWriter, err := os.OpenFile(logFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
 		if err != nil {
-			return tlstap.Handler{}, err
+			return proxy.Handler{}, err
 		}
 
 		l := logging.NewLogger(logWriter, &slog.HandlerOptions{Level: level}, pConfig.LogTime)
 		localLogger = &l
 	}
 
-	var iUp []tlstap.Interceptor
-	var iDown []tlstap.Interceptor
-	var iAll []tlstap.Interceptor
+	var iUp []proxy.Interceptor
+	var iDown []proxy.Interceptor
+	var iAll []proxy.Interceptor
 	for _, iConfig := range muxSpec.Interceptors {
 		if iConfig.Disable {
 			localLogger.Warn("Interceptor %s disabled", iConfig.Name)
@@ -371,7 +375,7 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 
 		interceptor, err := buildInterceptor(&iConfig, pConfig, localLogger, cb)
 		if err != nil {
-			return tlstap.Handler{}, err
+			return proxy.Handler{}, err
 		}
 
 		switch dir := iConfig.Direction; dir {
@@ -383,7 +387,7 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 			iUp = append(iUp, interceptor)
 			iDown = append(iDown, interceptor)
 		default:
-			return tlstap.Handler{}, fmt.Errorf("invalid direction: %s", dir)
+			return proxy.Handler{}, fmt.Errorf("invalid direction: %s", dir)
 		}
 
 		iAll = append(iAll, interceptor)
@@ -394,18 +398,18 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 	var serverNextProtos []string
 	var err error
 	if muxSpec.Server != nil {
-		if serverConfig, serverNextProtos, err = tlstap.ParseServerConfig(muxSpec.Server); err != nil {
-			return tlstap.Handler{}, err
+		if serverConfig, serverNextProtos, err = proxy.ParseServerConfig(muxSpec.Server); err != nil {
+			return proxy.Handler{}, err
 		}
 	}
 
 	if muxSpec.Client != nil {
-		if clientConfig, err = tlstap.ParseClientConfig(muxSpec.Client); err != nil {
-			return tlstap.Handler{}, err
+		if clientConfig, err = proxy.ParseClientConfig(muxSpec.Client); err != nil {
+			return proxy.Handler{}, err
 		}
 	}
 
-	handler := tlstap.Handler{
+	handler := proxy.Handler{
 		Name:             muxSpec.Name,
 		Connect:          muxSpec.ConnectEndpoint,
 		Patterns:         muxSpec.Matchers,
@@ -416,7 +420,7 @@ func buildMuxHandler(muxSpec tlstap.ResolvedMuxHandler, pConfig *tlstap.Resolved
 		ServerConfig:     serverConfig,
 		ALPNPreference:   serverNextProtos,
 		Logger:           localLogger,
-		Prober:           tlstap.NewProber(muxSpec.Server.ALPNProbeCache),
+		Prober:           proxy.NewProber(muxSpec.Server.ALPNProbeCache),
 	}
 
 	if clientConfig != nil {
@@ -441,7 +445,7 @@ func parseLogLevel(level string) (slog.Level, error) {
 	}
 }
 
-func startProxy(p *tlstap.Proxy, logger *logging.Logger) {
+func startProxy(p *proxy.Proxy, logger *logging.Logger) {
 	if p == nil {
 		logger.Fatal("Cannot start nil proxy.")
 	}

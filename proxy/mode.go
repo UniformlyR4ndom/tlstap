@@ -1,4 +1,4 @@
-package tlstap
+package proxy
 
 type Mode byte
 

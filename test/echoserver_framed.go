@@ -10,15 +10,15 @@ import (
 	"net"
 )
 
-type EchoServer struct {
+type FramedEchoServer struct {
 	listenEndpoint string
 	bufSize        int
 	trigger        []byte
 	tlsConfig      *tls.Config
 }
 
-func NewEchoServer(listen string, bufSize int, config *tls.Config, trigger []byte) EchoServer {
-	return EchoServer{
+func NewFramedEchoServer(listen string, bufSize int, config *tls.Config, trigger []byte) FramedEchoServer {
+	return FramedEchoServer{
 		listenEndpoint: listen,
 		bufSize:        bufSize,
 		tlsConfig:      config,
@@ -26,7 +26,7 @@ func NewEchoServer(listen string, bufSize int, config *tls.Config, trigger []byt
 	}
 }
 
-func (s *EchoServer) Start() error {
+func (s *FramedEchoServer) Start() error {
 	listener, err := net.Listen("tcp", s.listenEndpoint)
 	if err != nil {
 		return err
@@ -43,9 +43,9 @@ func (s *EchoServer) Start() error {
 	}
 }
 
-func (s *EchoServer) handleConn(conn net.Conn) error {
+func (s *FramedEchoServer) handleConn(conn net.Conn) error {
 	var upgraded bool
-	log.Printf("Hanndling new connection: %s <-> %s", conn.RemoteAddr().String(), conn.LocalAddr().String())
+	log.Printf("Handling new connection: %s <-> %s", conn.RemoteAddr().String(), conn.LocalAddr().String())
 	var frameSize uint32
 	buf := make([]byte, s.bufSize)
 	for {

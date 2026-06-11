@@ -1,14 +1,15 @@
-package intercept
+package pcapdump
 
 import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 
-	tlstap "tlstap/proxy"
+	"tlstap/proxy"
 )
 
 type PcapConfig struct {
@@ -23,6 +24,7 @@ type PcapDumpInterceptor struct {
 
 	pcapFile *os.File
 	writer   *pcapgo.Writer
+	writerMu sync.Mutex
 
 	dumpers map[uint32]*ConnDumper
 }
@@ -54,7 +56,7 @@ func (i *PcapDumpInterceptor) Init(addr net.TCPAddr) error {
 	i.pcapFile = f
 	i.writer = pcapgo.NewWriter(f)
 	if writeHeader {
-		return i.writer.WriteFileHeader(65535, layers.LinkTypeEthernet)
+		return i.writer.WriteFileHeader(65535, layers.LinkTypeRaw)
 	}
 
 	return nil
@@ -64,13 +66,12 @@ func (i *PcapDumpInterceptor) Finalize(addr net.TCPAddr) {
 	i.pcapFile.Close()
 }
 
-func (i *PcapDumpInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
+func (i *PcapDumpInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	if _, ok := i.dumpers[info.ConnID]; ok {
 		return nil
 	}
 
-	mac := [6]byte{0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0x00}
-	dumper, err := NewConnDumper(mac, mac, info.SrcIP, info.DstIP, info.SrcPort, info.DstPort)
+	dumper, err := NewConnDumper(info.SrcIP, info.DstIP, info.SrcPort, info.DstPort, &i.writerMu)
 	if err != nil {
 		return err
 	}
@@ -79,16 +80,16 @@ func (i *PcapDumpInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error
 	return nil
 }
 
-func (i *PcapDumpInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+func (i *PcapDumpInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 	return nil
 }
 
-func (i *PcapDumpInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
+func (i *PcapDumpInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	delete(i.dumpers, info.ConnID)
 	return nil
 }
 
-func (i *PcapDumpInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
+func (i *PcapDumpInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	dumper, ok := i.dumpers[info.ConnID]
 	if !ok {
 		// TODO: return an error here?

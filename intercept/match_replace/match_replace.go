@@ -1,10 +1,10 @@
-package intercept
+package replace
 
 import (
 	"fmt"
 	"net"
 	"regexp"
-	tlstap "tlstap/proxy"
+	"tlstap/proxy"
 )
 
 type MatchReplaceConfig struct {
@@ -62,19 +62,19 @@ func (i *MatchReplaceInterceptor) Init(addr net.TCPAddr) error {
 
 func (i *MatchReplaceInterceptor) Finalize(addr net.TCPAddr) {}
 
-func (i *MatchReplaceInterceptor) ConnectionEstablished(info *tlstap.ConnInfo) error {
+func (i *MatchReplaceInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	return nil
 }
 
-func (i *MatchReplaceInterceptor) ConnectionUpgraded(info *tlstap.ConnInfo) error {
+func (i *MatchReplaceInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 	return nil
 }
 
-func (i *MatchReplaceInterceptor) ConnectionTerminated(info *tlstap.ConnInfo) error {
+func (i *MatchReplaceInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	return nil
 }
 
-func (i *MatchReplaceInterceptor) Intercept(info *tlstap.ConnInfo, data []byte) ([]byte, error) {
+func (i *MatchReplaceInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	for _, r := range i.order {
 		replacement := i.replacements[r]
 		data = r.ReplaceAll(data, replacement)

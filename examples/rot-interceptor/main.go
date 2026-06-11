@@ -9,7 +9,7 @@ import (
 	"tlstap/cli"
 	"tlstap/intercept"
 	"tlstap/logging"
-	proxy "tlstap/proxy"
+	"tlstap/proxy"
 )
 
 type RotConfig struct {

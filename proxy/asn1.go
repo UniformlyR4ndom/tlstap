@@ -1,4 +1,4 @@
-package tlstap
+package proxy
 
 import (
 	"encoding/asn1"
