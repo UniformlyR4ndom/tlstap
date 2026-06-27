@@ -1,0 +1,10 @@
+[      65ms] TypeError: h.push is not a function
+    at http://127.0.0.1:9090/ui/vendor/htm.module.js:1:1053
+    at g.default (http://127.0.0.1:9090/ui/vendor/htm.module.js:1:1168)
+    at x.App [as constructor] (http://127.0.0.1:9090/ui/components/App.js:41:16)
+    at x.B [as render] (http://127.0.0.1:9090/ui/vendor/preact.module.js:1:9118)
+    at j (http://127.0.0.1:9090/ui/vendor/preact.module.js:1:6248)
+    at $ (http://127.0.0.1:9090/ui/vendor/preact.module.js:1:1813)
+    at j (http://127.0.0.1:9090/ui/vendor/preact.module.js:1:6468)
+    at D (http://127.0.0.1:9090/ui/vendor/preact.module.js:1:9281)
+    at http://127.0.0.1:9090/ui/main.js:6:1

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"regexp"
 	"slices"
@@ -13,12 +15,14 @@ import (
 	"sync"
 
 	"tlstap/intercept/bridge"
+	"tlstap/intercept/dbdump"
 	"tlstap/intercept/drop"
 	"tlstap/intercept/hexdump"
 	replace "tlstap/intercept/match_replace"
 	"tlstap/intercept/pcapdump"
 	"tlstap/logging"
 	"tlstap/proxy"
+	tlstapweb "tlstap/web"
 )
 
 // known interceptor
@@ -28,6 +32,7 @@ const (
 	InterceptorMatchReplace = "match-replace"
 	InterceptorBridge       = "bridge"
 	InterceptorDropTls      = "droptls"
+	InterceptorDbDump       = "dbdump"
 )
 
 type InterceptorCallback func(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
@@ -61,6 +66,15 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	} else {
 		enabledConfigs = strings.Split(enabledList, ",")
 	}
+
+	canonicalRegistered := make(map[string]bool)
+	apiMux := http.NewServeMux()
+
+	sub, _ := fs.Sub(tlstapweb.FS, ".")
+	apiMux.Handle("/ui/", http.StripPrefix("/ui", http.FileServer(http.FS(sub))))
+	apiMux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
 
 	for _, configName := range enabledConfigs {
 		config, ok := configFile.Proxies[configName]
@@ -121,14 +135,23 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 		if pConfig.Mode == "tls-mux" {
 			resolvedHandlers, err := resolveMuxHandlers(&config, &configFile, &mainLogger)
 			checkFatal(&mainLogger, err)
-			proxy, err = proxyFromConfig(&pConfig, resolvedHandlers, &mainLogger, interceptorCallback)
+			proxy, err = proxyFromConfig(&pConfig, resolvedHandlers, &mainLogger, interceptorCallback, apiMux, canonicalRegistered)
 			checkFatal(&mainLogger, err)
 		} else {
-			proxy, err = proxyFromConfig(&pConfig, nil, &mainLogger, interceptorCallback)
+			proxy, err = proxyFromConfig(&pConfig, nil, &mainLogger, interceptorCallback, apiMux, canonicalRegistered)
 			checkFatal(&mainLogger, err)
 		}
 
 		go startProxy(proxy, &mainLogger)
+	}
+
+	if configFile.Api != nil && configFile.Api.Listen != "" {
+		mainLogger.Info("Starting API server at %s", configFile.Api.Listen)
+		go func() {
+			if err := http.ListenAndServe(configFile.Api.Listen, apiMux); err != nil {
+				mainLogger.Error("API server: %v", err)
+			}
+		}()
 	}
 
 	// TODO: can we do better?
@@ -205,7 +228,7 @@ func resolveMuxHandlers(config *proxy.ProxyConfig, configFile *proxy.ConfigFile,
 	return resolvedHandlers, nil
 }
 
-func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback) (*proxy.Proxy, error) {
+func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (*proxy.Proxy, error) {
 	logWriter := os.Stdout
 	if config.LogFile != "" {
 		logFile, err := os.OpenFile(config.LogFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
@@ -234,7 +257,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 	case "tls-mux":
 		mode = proxy.ModeMux
 		for _, h := range muxHandlers {
-			handler, err := buildMuxHandler(h, config, mainLogger, &proxyLogger, cb)
+			handler, err := buildMuxHandler(h, config, mainLogger, &proxyLogger, cb, apiMux, canonicalRegistered)
 			if err != nil {
 				return nil, err
 			}
@@ -255,7 +278,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 				continue
 			}
 
-			interceptor, err := buildInterceptor(&iConfig, config, &proxyLogger, cb)
+			interceptor, err := buildInterceptor(&iConfig, config, &proxyLogger, cb, apiMux, canonicalRegistered)
 			checkFatal(mainLogger, err)
 
 			switch dir := strings.ToLower(iConfig.Direction); dir {
@@ -284,7 +307,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 	return &p, nil
 }
 
-func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback) (proxy.Interceptor, error) {
+func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (proxy.Interceptor, error) {
 	var interceptor proxy.Interceptor
 	switch iConfig.Name {
 	case InterceptorHexdump:
@@ -320,6 +343,14 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 		interceptor = &drop.DropTlsInterceptor{
 			Logger: logger,
 		}
+	case InterceptorDbDump:
+		var dbDumpConf dbdump.DbDumpConfig
+		if err := json.Unmarshal(iConfig.ArgsJson, &dbDumpConf); err != nil {
+			return nil, err
+		}
+
+		i := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, *pConfig)
+		interceptor = &i
 	default:
 		var err error
 		if cb != nil {
@@ -334,10 +365,21 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 		}
 	}
 
+	if ap, ok := interceptor.(proxy.ApiProvider); ok {
+		basePath := fmt.Sprintf("/%s/api/i/%s", pConfig.Name, iConfig.Name)
+		ap.RegisterRoutes(apiMux, basePath)
+
+		canonicalPath := fmt.Sprintf("/api/i/%s", iConfig.Name)
+		if !canonicalRegistered[canonicalPath] {
+			ap.RegisterRoutes(apiMux, canonicalPath)
+			canonicalRegistered[canonicalPath] = true
+		}
+	}
+
 	return interceptor, nil
 }
 
-func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback) (proxy.Handler, error) {
+func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (proxy.Handler, error) {
 	logFile := pConfig.LogFile
 	if muxSpec.LogFile != "" {
 		logFile = muxSpec.LogFile
@@ -373,7 +415,7 @@ func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedPr
 			continue
 		}
 
-		interceptor, err := buildInterceptor(&iConfig, pConfig, localLogger, cb)
+		interceptor, err := buildInterceptor(&iConfig, pConfig, localLogger, cb, apiMux, canonicalRegistered)
 		if err != nil {
 			return proxy.Handler{}, err
 		}

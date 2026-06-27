@@ -1,34 +1,40 @@
 import { h } from 'preact'
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
 import htm from 'htm'
-import { getChunkList, fetchChunks } from '../api.js'
+import { openStidStream, getChunkStid, getByteStid } from '../api.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
 
 const html = htm.bind(h)
 
 const BATCH = 50
 
-export default function TrafficView({ stream }) {
-    const [display,    setDisplay]    = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
+export default function TrafficView({ stream, globalOffset, jumpTo }) {
+    const [display,    setDisplay]    = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading,    setLoading]    = useState(false)
     const [error,      setError]      = useState(null)
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
 
-    // Mutable state accessed by the stable handleScrollEnd callback.
-    const nextIdRef      = useRef([0, 0])   // next chunk ID to load forward, per chunk direction
-    const prevIdRef      = useRef([0, 0])   // earliest chunk ID in buffer, per chunk direction
-    const hasMoreRef     = useRef([false, false])
+    // nextStidRef: first stid to load on forward scroll (exclusive upper bound of buffer)
+    // prevStidRef: stid of the first chunk in the buffer (for backward scroll guard + fetch)
+    const nextStidRef    = useRef(0)
+    const prevStidRef    = useRef(0)
+    const hasMoreRef     = useRef(false)
     const loadingMoreRef = useRef(false)
-    const generationRef  = useRef(0)        // increments on each new stream; stale fetches bail on mismatch
+    const generationRef  = useRef(0)
     const streamRef      = useRef(stream)
+    const wsRef          = useRef(null)
     useEffect(() => { streamRef.current = stream }, [stream])
 
     // Initial load — runs whenever the selected stream changes.
     useEffect(() => {
         if (!stream) {
             setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
+            setTotalBytes({ up: -1, down: -1 })
             return
         }
+
+        const ws = openStidStream()
+        wsRef.current = ws
 
         generationRef.current++
         const gen = generationRef.current
@@ -37,124 +43,147 @@ export default function TrafficView({ stream }) {
         setLoading(true)
         setError(null)
         setTotalBytes({ up: stream.length0 ?? -1, down: stream.length1 ?? -1 })
-        nextIdRef.current      = [0, 0]
-        prevIdRef.current      = [0, 0]
-        hasMoreRef.current     = [false, false]
+        nextStidRef.current    = 0
+        prevStidRef.current    = 0
+        hasMoreRef.current     = false
         loadingMoreRef.current = false
 
         ;(async () => {
             try {
-                const cl = await getChunkList(stream.id)
+                const chunks = await ws.fetch(stream.session, stream.id, 0, BATCH)
                 if (generationRef.current !== gen) return
-                setTotalBytes({ up: cl.length0, down: cl.length1 })
-
-                const [c0, c1] = await Promise.all([
-                    cl.latest0 >= 0 ? fetchChunks(stream.id, 0, 0, BATCH) : Promise.resolve([]),
-                    cl.latest1 >= 0 ? fetchChunks(stream.id, 1, 0, BATCH) : Promise.resolve([]),
-                ])
-                if (generationRef.current !== gen) return
-
-                nextIdRef.current  = [c0.length, c1.length]
-                prevIdRef.current  = [0, 0]
-                hasMoreRef.current = [c0.length === BATCH, c1.length === BATCH]
-
-                setDisplay({
-                    rows:          buildRows(interleave(c0, c1), stream.start),
-                    scrollAdjust:  0,
-                    adjustVersion: 0,
-                })
+                prevStidRef.current = chunks[0]?.stid ?? 0
+                nextStidRef.current = chunks.length > 0 ? chunks[chunks.length - 1].stid + 1 : 0
+                hasMoreRef.current  = chunks.length === BATCH
+                setDisplay({ rows: buildRows(chunks, stream.start), scrollAdjust: 0, adjustVersion: 0 })
             } catch (e) {
                 if (generationRef.current === gen) setError(e.message)
             } finally {
                 if (generationRef.current === gen) setLoading(false)
             }
         })()
+
+        return () => {
+            ws.close()
+            wsRef.current = null
+        }
     }, [stream?.id])
 
+    // Jump effect — fires when jumpTo.version changes.
+    useEffect(() => {
+        if (!jumpTo || !streamRef.current) return
+        const s = streamRef.current
+
+        // Close any in-flight WS and open a fresh one to ensure clean state.
+        wsRef.current?.close()
+        const ws = openStidStream()
+        wsRef.current = ws
+
+        generationRef.current++
+        const gen = generationRef.current
+
+        loadingMoreRef.current = false
+        setLoading(true)
+        setError(null)
+        setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
+
+        ;(async () => {
+            try {
+                let targetStid = jumpTo.value
+                let targetByteOffset = null
+                if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
+                    const direction = jumpTo.unit === 'chunks-c2s' ? 0 : 1
+                    const result = await getChunkStid(s.session, s.id, direction, jumpTo.value)
+                    if (generationRef.current !== gen) return
+                    targetStid = result.stid
+                } else if (jumpTo.unit === 'offset-c2s' || jumpTo.unit === 'offset-s2c') {
+                    const direction = jumpTo.unit === 'offset-c2s' ? 0 : 1
+                    const result = await getByteStid(s.session, s.id, direction, jumpTo.value)
+                    if (generationRef.current !== gen) return
+                    targetStid = result.stid
+                    targetByteOffset = jumpTo.value
+                }
+                const startStid = Math.max(0, targetStid - Math.floor(BATCH / 2))
+                const chunks = await ws.fetch(s.session, s.id, startStid, BATCH)
+                if (generationRef.current !== gen) return
+                prevStidRef.current = chunks[0]?.stid ?? startStid
+                nextStidRef.current = chunks.length > 0 ? chunks[chunks.length - 1].stid + 1 : startStid
+                hasMoreRef.current  = chunks.length === BATCH
+                const rows = buildRows(chunks, s.start)
+                let targetRowPx = 0
+                for (let i = 0; i < rows.length; i++) {
+                    const row = rows[i]
+                    if (targetByteOffset !== null) {
+                        if (row.type === 'hex' && row.offset <= targetByteOffset && targetByteOffset < row.offset + row.bytes.length) {
+                            targetRowPx = i * ROW_HEIGHT
+                            break
+                        }
+                    } else {
+                        if (row.type === 'header' && row.stid === targetStid) {
+                            targetRowPx = i * ROW_HEIGHT
+                            break
+                        }
+                    }
+                }
+                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, scrollTo: targetRowPx, scrollToVersion: jumpTo.version })
+            } catch (e) {
+                if (generationRef.current === gen) setError(e.message)
+            } finally {
+                if (generationRef.current === gen) setLoading(false)
+            }
+        })()
+    }, [jumpTo?.version])
+
     // Stable callback — reads all mutable state via refs.
-    // scrollDir: 1 = near bottom (load forward), -1 = near top (load backward)
     const handleScrollEnd = useCallback(async (scrollDir) => {
         const goingForward = scrollDir === 1
 
-        if (goingForward) {
-            if (!hasMoreRef.current[0] && !hasMoreRef.current[1]) return
-        } else {
-            if (prevIdRef.current[0] === 0 && prevIdRef.current[1] === 0) return
-        }
+        if (goingForward  && !hasMoreRef.current)        return
+        if (!goingForward && prevStidRef.current === 0)  return
         if (loadingMoreRef.current) return
 
         const capturedGen    = generationRef.current
         const capturedStream = streamRef.current
-        if (!capturedStream) return
+        const capturedWs     = wsRef.current
+        if (!capturedStream || !capturedWs) return
 
         loadingMoreRef.current = true
         setLoading(true)
 
         try {
-            let c0, c1
+            let chunks
             if (goingForward) {
-                ;[c0, c1] = await Promise.all([
-                    hasMoreRef.current[0]
-                        ? fetchChunks(capturedStream.id, 0, nextIdRef.current[0], BATCH)
-                        : Promise.resolve([]),
-                    hasMoreRef.current[1]
-                        ? fetchChunks(capturedStream.id, 1, nextIdRef.current[1], BATCH)
-                        : Promise.resolve([]),
-                ])
+                chunks = await capturedWs.fetch(capturedStream.session, capturedStream.id, nextStidRef.current, BATCH)
             } else {
-                ;[c0, c1] = await Promise.all([
-                    prevIdRef.current[0] > 0
-                        ? fetchChunks(capturedStream.id, 0, Math.max(0, prevIdRef.current[0] - BATCH), BATCH)
-                        : Promise.resolve([]),
-                    prevIdRef.current[1] > 0
-                        ? fetchChunks(capturedStream.id, 1, Math.max(0, prevIdRef.current[1] - BATCH), BATCH)
-                        : Promise.resolve([]),
-                ])
+                const start = Math.max(0, prevStidRef.current - BATCH)
+                const n     = prevStidRef.current - start
+                chunks = await capturedWs.fetch(capturedStream.session, capturedStream.id, start, n)
             }
             if (generationRef.current !== capturedGen) return
+            if (chunks.length === 0) return
 
-            if (goingForward) {
-                nextIdRef.current  = [nextIdRef.current[0] + c0.length, nextIdRef.current[1] + c1.length]
-                hasMoreRef.current = [c0.length === BATCH, c1.length === BATCH]
-            } else {
-                prevIdRef.current  = [prevIdRef.current[0] - c0.length, prevIdRef.current[1] - c1.length]
-            }
-
-            const newChunks = interleave(c0, c1)
-            if (newChunks.length === 0) return
-
-            const newChunkRows = buildRows(newChunks, capturedStream.start)
+            const newChunkRows = buildRows(chunks, capturedStream.start)
 
             setDisplay(prev => {
                 if (goingForward) {
-                    // Evict front half, append new rows at back, scroll up.
-                    const cutIdx   = findChunkBoundaryNearHalf(prev.rows, 0)
-                    const newPrevId = [...prevIdRef.current]
-                    for (let i = 0; i < cutIdx; i++) {
-                        if (prev.rows[i].type === 'header') {
-                            newPrevId[prev.rows[i].direction] = prev.rows[i].chunkId + 1
-                        }
+                    const cutIdx = findChunkBoundaryNearHalf(prev.rows, 0)
+                    if (cutIdx > 0) prevStidRef.current = prev.rows[cutIdx].stid
+                    for (let i = newChunkRows.length - 1; i >= 0; i--) {
+                        if (newChunkRows[i].type === 'header') { nextStidRef.current = newChunkRows[i].stid + 1; break }
                     }
-                    prevIdRef.current = newPrevId
+                    hasMoreRef.current = chunks.length === BATCH
                     return {
                         rows:          [...prev.rows.slice(cutIdx), ...newChunkRows],
                         scrollAdjust:  -(cutIdx * ROW_HEIGHT),
                         adjustVersion: prev.adjustVersion + 1,
                     }
                 } else {
-                    // Prepend new rows at front, evict back half, scroll down.
-                    const keepLen    = findChunkBoundaryNearHalf(prev.rows, prev.rows.length)
-                    const newNextId  = [...nextIdRef.current]
-                    const newHasMore = [...hasMoreRef.current]
-                    for (let i = keepLen; i < prev.rows.length; i++) {
-                        if (prev.rows[i].type === 'header') {
-                            const dir = prev.rows[i].direction
-                            if (prev.rows[i].chunkId < newNextId[dir]) newNextId[dir] = prev.rows[i].chunkId
-                            newHasMore[dir] = true
-                        }
+                    const keepLen = findChunkBoundaryNearHalf(prev.rows, prev.rows.length)
+                    for (let i = keepLen - 1; i >= 0; i--) {
+                        if (prev.rows[i].type === 'header') { nextStidRef.current = prev.rows[i].stid + 1; break }
                     }
-                    nextIdRef.current  = newNextId
-                    hasMoreRef.current = newHasMore
+                    if (newChunkRows[0]?.type === 'header') prevStidRef.current = newChunkRows[0].stid
+                    hasMoreRef.current = true
                     return {
                         rows:          [...newChunkRows, ...prev.rows.slice(0, keepLen)],
                         scrollAdjust:  newChunkRows.length * ROW_HEIGHT,
@@ -190,6 +219,9 @@ export default function TrafficView({ stream }) {
                 onScrollEnd=${handleScrollEnd}
                 scrollAdjust=${display.scrollAdjust}
                 adjustVersion=${display.adjustVersion}
+                scrollTo=${display.scrollTo}
+                scrollToVersion=${display.scrollToVersion}
+                globalOffset=${globalOffset}
             />
         </div>
     `
@@ -197,11 +229,6 @@ export default function TrafficView({ stream }) {
 
 // ── pure helpers ──────────────────────────────────────────────────────────────
 
-// Returns the index of the first chunk header at or after the midpoint.
-// Falls back to scanning backward if the second half has no headers.
-// `fallback` is returned when no header is found at all:
-//   - pass 0           when used as an evict-from-front cutpoint (no eviction)
-//   - pass rows.length when used as a keep-until-back endpoint  (no eviction)
 function findChunkBoundaryNearHalf(rows, fallback) {
     const half = Math.floor(rows.length / 2)
     for (let i = half; i < rows.length; i++) {
@@ -213,34 +240,24 @@ function findChunkBoundaryNearHalf(rows, fallback) {
     return fallback
 }
 
-function interleave(c0, c1) {
-    const out = []
-    let i = 0, j = 0
-    while (i < c0.length && j < c1.length) {
-        if (c0[i].time <= c1[j].time) out.push(c0[i++])
-        else out.push(c1[j++])
-    }
-    while (i < c0.length) out.push(c0[i++])
-    while (j < c1.length) out.push(c1[j++])
-    return out
-}
-
 function buildRows(chunks, streamStart) {
     const rows = []
     for (const chunk of chunks) {
         rows.push({
             type:      'header',
             direction: chunk.direction,
+            stid:      chunk.stid,
             chunkId:   chunk.chunkId,
             relTime:   fmtRelTime(chunk.time, streamStart),
             size:      chunk.data.length,
         })
         for (let off = 0; off < chunk.data.length; off += 16) {
             rows.push({
-                type:      'hex',
-                direction: chunk.direction,
-                bytes:     chunk.data.slice(off, off + 16),
-                offset:    chunk.offset + off,
+                type:        'hex',
+                direction:   chunk.direction,
+                bytes:       chunk.data.slice(off, off + 16),
+                offset:      chunk.offset + off,
+                localOffset: off,
             })
         }
     }

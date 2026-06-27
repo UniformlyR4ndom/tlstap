@@ -1,0 +1,359 @@
+import { h } from 'preact'
+import { useState, useEffect, useRef } from 'preact/hooks'
+import htm from 'htm'
+import { getChunkList, fetchChunks } from '../api.js'
+import { RingBuffer } from '../ringbuffer.js'
+import HexDump from './HexDump.js'
+
+const html = htm.bind(h)
+
+const BATCH        = 50
+const CACHE_BYTES  = 256 * 1024   // max bytes kept per before/after eviction region
+const ROW_HEIGHT   = 22
+const PREFETCH_SCR = 2            // prefetch when within 2 viewport-heights of loaded edge
+
+export default function TrafficView({ stream }) {
+    const [rows,       setRows]       = useState([])
+    const [loading,    setLoading]    = useState(false)
+    const [error,      setError]      = useState(null)
+    const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
+
+    // Ring buffer of chunk objects; parallel arrays track row layout
+    const chunkBuf    = useRef(new RingBuffer())
+    const rowCounts   = useRef([])   // rowCounts[i] = rows for chunk i
+    const rowStarts   = useRef([])   // rowStarts[i] = first absolute row index of chunk i
+    const streamStart = useRef(0)
+
+    // Per-direction load cursors
+    const firstId     = useRef([-1, -1])  // lowest loaded chunk ID per direction (-1 = none)
+    const nextId      = useRef([0, 0])    // next chunk ID to fetch forward per direction
+    const totalChunks = useRef([-1, -1])  // latest known chunk ID per direction
+
+    const beforeCount  = useRef(0)
+    const cancelledRef = useRef(false)
+    const fetchingFwd  = useRef(false)
+    const fetchingBwd  = useRef(false)
+    const viewportRef  = useRef({ scrollTop: 0, height: 400 })
+    const adjustScroll = useRef(null)   // set by HexDump; call .current(delta) to nudge scrollTop
+    // Counter incremented before each programmatic scrollTop change, decremented after a RAF.
+    // handleScroll returns early while > 0 to break the adjustScroll → scroll-event → handleScroll loop.
+    const adjustingRef = useRef(0)
+
+    // ── core helpers ──────────────────────────────────────────────────────────
+
+    function rebuildRows() {
+        const buf = chunkBuf.current
+        const starts = [], counts = [], all = []
+        for (let i = 0; i < buf.length; i++) {
+            starts.push(all.length)
+            const cr = chunkToRows(buf.get(i), streamStart.current)
+            counts.push(cr.length)
+            for (const r of cr) all.push(r)
+        }
+        rowStarts.current = starts
+        rowCounts.current = counts
+        setRows(all)
+    }
+
+    function applyFrontEvict(count) {
+        const buf = chunkBuf.current
+        count = Math.min(count, buf.length - 1)
+        if (count <= 0) return
+        let rowsRemoved = 0
+        for (let i = 0; i < count; i++) {
+            const chunk = buf.get(0)
+            rowsRemoved += rowCounts.current[0]
+            let nxt = -1
+            for (let j = 1; j < buf.length; j++) {
+                if (buf.get(j).direction === chunk.direction) { nxt = buf.get(j).chunkId; break }
+            }
+            if (firstId.current[chunk.direction] === chunk.chunkId) firstId.current[chunk.direction] = nxt
+            buf.evictFront()
+            rowCounts.current.shift()
+            rowStarts.current.shift()
+        }
+        const starts = rowStarts.current
+        for (let i = 0; i < starts.length; i++) starts[i] -= rowsRemoved
+        beforeCount.current = Math.max(0, beforeCount.current - count)
+        // Shift scrollTop up to keep visible content stable after rows are removed above.
+        if (adjustScroll.current) {
+            adjustingRef.current++
+            adjustScroll.current(-(rowsRemoved * ROW_HEIGHT))
+            requestAnimationFrame(() => { adjustingRef.current-- })
+        }
+    }
+
+    function applyBackEvict(count) {
+        const buf = chunkBuf.current
+        count = Math.min(count, buf.length - 1)
+        if (count <= 0) return
+        for (let i = 0; i < count; i++) {
+            const chunk = buf.get(buf.length - 1)
+            if (nextId.current[chunk.direction] > chunk.chunkId)
+                nextId.current[chunk.direction] = chunk.chunkId
+            buf.evictBack()
+            rowCounts.current.pop()
+            rowStarts.current.pop()
+        }
+    }
+
+    // ── scroll handler ────────────────────────────────────────────────────────
+
+    function handleScroll(scrollTop, height) {
+        viewportRef.current = { scrollTop, height }
+        if (adjustingRef.current > 0) return
+        const buf = chunkBuf.current
+        if (buf.length === 0) return
+
+        const starts    = rowStarts.current
+        const counts    = rowCounts.current
+        const topRow    = Math.floor(scrollTop / ROW_HEIGHT)
+        const bottomRow = Math.ceil((scrollTop + height) / ROW_HEIGHT)
+
+        // Classify chunks as before / in-view / after for eviction decisions
+        let bc = 0, bb = 0, afterStart = buf.length, ab = 0
+        for (let i = 0; i < buf.length; i++) {
+            if (starts[i] + counts[i] <= topRow) {
+                bc = i + 1
+                bb += buf.get(i).data.length
+            } else if (afterStart === buf.length && starts[i] >= bottomRow) {
+                afterStart = i
+            }
+            if (i >= afterStart) ab += buf.get(i).data.length
+        }
+        beforeCount.current = bc
+
+        let frontEvict = 0, tempBb = bb
+        while (tempBb > CACHE_BYTES && bc - frontEvict > 1) {
+            tempBb -= buf.get(frontEvict).data.length
+            frontEvict++
+        }
+        let backEvict = 0, tempAb = ab, backLen = buf.length - afterStart
+        while (tempAb > CACHE_BYTES && backLen - backEvict > 1) {
+            tempAb -= buf.get(buf.length - 1 - backEvict).data.length
+            backEvict++
+        }
+        if (frontEvict > 0) applyFrontEvict(frontEvict)
+        if (backEvict  > 0) applyBackEvict(backEvict)
+        if (frontEvict > 0 || backEvict > 0) rebuildRows()
+
+        // Prefetch based on distance from loaded edges (in rows)
+        const prefetchRows = Math.ceil(PREFETCH_SCR * height / ROW_HEIGHT)
+        const totalRows    = counts.length > 0 ? starts[starts.length - 1] + counts[counts.length - 1] : 0
+
+        if (totalRows - bottomRow < prefetchRows) fetchForward()
+        if (topRow < prefetchRows && (firstId.current[0] > 0 || firstId.current[1] > 0)) fetchBackward()
+    }
+
+    // ── fetch helpers ─────────────────────────────────────────────────────────
+
+    function fetchForward() {
+        if (fetchingFwd.current || cancelledRef.current) return
+        const tc = totalChunks.current, ni = nextId.current
+        const can0 = tc[0] < 0 || ni[0] <= tc[0]
+        const can1 = tc[1] < 0 || ni[1] <= tc[1]
+        if (!can0 && !can1) return
+
+        fetchingFwd.current = true
+        ;(async () => {
+            try {
+                const [c0, c1] = await Promise.all([
+                    can0 ? fetchChunks(stream.id, 0, ni[0], BATCH) : Promise.resolve([]),
+                    can1 ? fetchChunks(stream.id, 1, ni[1], BATCH) : Promise.resolve([]),
+                ])
+                if (cancelledRef.current) return
+                if (c0.length > 0) nextId.current[0] = c0[c0.length - 1].chunkId + 1
+                if (c1.length > 0) nextId.current[1] = c1[c1.length - 1].chunkId + 1
+                const merged = interleave(c0, c1)
+                if (merged.length > 0) {
+                    for (const chunk of merged) chunkBuf.current.pushBack(chunk)
+                    rebuildRows()
+                }
+            } catch (e) {
+                if (!cancelledRef.current) setError(e.message)
+            } finally {
+                if (!cancelledRef.current) fetchingFwd.current = false
+            }
+        })()
+    }
+
+    function fetchBackward() {
+        if (fetchingBwd.current || cancelledRef.current) return
+        const fi   = firstId.current
+        const lim0 = fi[0] > 0 ? Math.min(BATCH, fi[0]) : 0
+        const lim1 = fi[1] > 0 ? Math.min(BATCH, fi[1]) : 0
+        if (lim0 === 0 && lim1 === 0) return
+
+        fetchingBwd.current = true
+        ;(async () => {
+            try {
+                const [c0, c1] = await Promise.all([
+                    lim0 > 0 ? fetchChunks(stream.id, 0, fi[0] - lim0, lim0) : Promise.resolve([]),
+                    lim1 > 0 ? fetchChunks(stream.id, 1, fi[1] - lim1, lim1) : Promise.resolve([]),
+                ])
+                if (cancelledRef.current) return
+                if (c0.length > 0) firstId.current[0] = c0[0].chunkId
+                if (c1.length > 0) firstId.current[1] = c1[0].chunkId
+                const merged = interleave(c0, c1)
+                if (merged.length > 0) {
+                    let newRows = 0
+                    for (const chunk of merged) newRows += 1 + Math.ceil(chunk.data.length / 16)
+                    for (let i = merged.length - 1; i >= 0; i--) chunkBuf.current.pushFront(merged[i])
+                    beforeCount.current += merged.length
+                    // Shift scrollTop down to compensate for rows prepended above.
+                    if (adjustScroll.current) {
+                        adjustingRef.current++
+                        adjustScroll.current(newRows * ROW_HEIGHT)
+                        requestAnimationFrame(() => { adjustingRef.current-- })
+                    }
+                    rebuildRows()
+                }
+            } catch (e) {
+                if (!cancelledRef.current) setError(e.message)
+            } finally {
+                if (!cancelledRef.current) fetchingBwd.current = false
+            }
+        })()
+    }
+
+    // ── initial load ──────────────────────────────────────────────────────────
+
+    useEffect(() => {
+        if (!stream) { setRows([]); return }
+
+        const initLen = { up: stream.length0 ?? -1, down: stream.length1 ?? -1 }
+        cancelledRef.current  = false
+        chunkBuf.current      = new RingBuffer()
+        rowCounts.current     = []
+        rowStarts.current     = []
+        firstId.current       = [-1, -1]
+        nextId.current        = [0, 0]
+        totalChunks.current   = [-1, -1]
+        beforeCount.current   = 0
+        fetchingFwd.current   = false
+        fetchingBwd.current   = false
+        adjustingRef.current  = 0
+        streamStart.current   = stream.start
+        setRows([])
+        setLoading(true)
+        setError(null)
+        setTotalBytes(initLen)
+
+        ;(async () => {
+            try {
+                const cl = await getChunkList(stream.id)
+                if (cancelledRef.current) return
+                totalChunks.current = [cl.latest0, cl.latest1]
+                setTotalBytes({ up: cl.length0, down: cl.length1 })
+
+                const [c0, c1] = await Promise.all([
+                    cl.latest0 >= 0 ? fetchChunks(stream.id, 0, 0, BATCH) : Promise.resolve([]),
+                    cl.latest1 >= 0 ? fetchChunks(stream.id, 1, 0, BATCH) : Promise.resolve([]),
+                ])
+                if (cancelledRef.current) return
+
+                if (c0.length > 0) { firstId.current[0] = 0; nextId.current[0] = c0[c0.length - 1].chunkId + 1 }
+                if (c1.length > 0) { firstId.current[1] = 0; nextId.current[1] = c1[c1.length - 1].chunkId + 1 }
+
+                const merged = interleave(c0, c1)
+                for (const chunk of merged) chunkBuf.current.pushBack(chunk)
+                rebuildRows()
+
+                const { scrollTop, height } = viewportRef.current
+                const rs = rowStarts.current, rc = rowCounts.current
+                const last = rs.length - 1
+                const totalRowsLoaded = last >= 0 ? rs[last] + rc[last] : 0
+                if (totalRowsLoaded * ROW_HEIGHT < scrollTop + height + PREFETCH_SCR * height) {
+                    fetchForward()
+                }
+            } catch (e) {
+                if (!cancelledRef.current) setError(e.message)
+            } finally {
+                if (!cancelledRef.current) setLoading(false)
+            }
+        })()
+
+        return () => { cancelledRef.current = true }
+    }, [stream?.id])
+
+    // ── render ────────────────────────────────────────────────────────────────
+
+    if (!stream) return html`<div class="placeholder">Select a stream to view traffic</div>`
+
+    const { up, down } = totalBytes
+
+    return html`
+        <div class="traffic-view">
+            <div class="stream-meta">
+                <span><span class="meta-label">src</span><span class="c2s">${stream.src}</span></span>
+                <span><span class="meta-label">dst</span>${stream.dst}</span>
+                <span><span class="meta-label">↑</span>${fmtBytes(up)}</span>
+                <span><span class="meta-label">↓</span>${fmtBytes(down)}</span>
+                <span><span class="meta-label">duration</span>${fmtDuration(stream.start, stream.end)}</span>
+                ${loading && html`<span class="meta-loading">loading…</span>`}
+            </div>
+            ${error && html`<div class="error-msg">${error}</div>`}
+            <${HexDump}
+                key=${stream.id}
+                rows=${rows}
+                onScroll=${handleScroll}
+                adjustScrollRef=${adjustScroll}
+            />
+        </div>
+    `
+}
+
+// ── pure helpers ──────────────────────────────────────────────────────────────
+
+function interleave(c0, c1) {
+    const out = []
+    let i = 0, j = 0
+    while (i < c0.length && j < c1.length) {
+        if (c0[i].time <= c1[j].time) out.push(c0[i++])
+        else out.push(c1[j++])
+    }
+    while (i < c0.length) out.push(c0[i++])
+    while (j < c1.length) out.push(c1[j++])
+    return out
+}
+
+function chunkToRows(chunk, streamStart) {
+    const rows = []
+    const bytes = chunk.data
+    rows.push({
+        type:      'header',
+        direction: chunk.direction,
+        chunkId:   chunk.chunkId,
+        relTime:   fmtRelTime(chunk.time, streamStart),
+        size:      bytes.length,
+    })
+    for (let off = 0; off < bytes.length; off += 16) {
+        rows.push({
+            type:      'hex',
+            direction: chunk.direction,
+            bytes:     bytes.slice(off, off + 16),
+            offset:    chunk.offset + off,
+        })
+    }
+    return rows
+}
+
+function fmtRelTime(ms, base) {
+    const d = ms - base
+    return `+${Math.floor(d / 1000)}.${String(d % 1000).padStart(3, '0')}s`
+}
+
+function fmtBytes(n) {
+    if (n < 0)       return '?'
+    if (n < 1024)    return `${n} B`
+    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+    return `${(n / 1048576).toFixed(1)} MB`
+}
+
+function fmtDuration(start, end) {
+    if (!end) return 'ongoing'
+    const d = end - start
+    if (d < 1000)  return `${d}ms`
+    if (d < 60000) return `${(d / 1000).toFixed(2)}s`
+    return `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+}

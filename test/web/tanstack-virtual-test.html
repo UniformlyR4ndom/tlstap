@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Capped-height virtual scroll — 1M rows</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; font-size: 13px; background: #111; color: #ccc; }
+
+#scroll {
+    height: 100vh;
+    overflow-y: scroll;
+    /* hide the native scrollbar visually — it still handles input */
+    scrollbar-width: thin;
+    scrollbar-color: #444 #1a1a1a;
+}
+#inner {
+    position: relative;
+    width: 100%;
+    /* height set by JS to CAP_HEIGHT */
+}
+.row {
+    position: absolute;
+    left: 0;
+    width: 100%;
+    height: 20px;
+    line-height: 20px;
+    padding: 0 10px;
+    border-bottom: 1px solid #1a1a1a;
+}
+
+#info {
+    position: fixed;
+    top: 8px; right: 8px;
+    background: rgba(0,0,0,0.8);
+    border: 1px solid #333;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #aaa;
+    pointer-events: none;
+    line-height: 1.6;
+}
+</style>
+</head>
+<body>
+<div id="scroll">
+    <div id="inner"></div>
+</div>
+<div id="info">—</div>
+
+<script>
+const COUNT      = 1_000_000;
+const ROW_HEIGHT = 20;
+const OVERSCAN   = 5;
+
+// Cap the DOM scroll height to 5M px.  The browser handles this fine and the
+// scrollbar thumb stays small but functional.  We map scrollTop ∈ [0, CAP_HEIGHT−vh]
+// proportionally to item indices ∈ [0, COUNT−visibleCount].
+const CAP_HEIGHT = 5_000_000;
+
+const scrollEl = document.getElementById('scroll');
+const innerEl  = document.getElementById('inner');
+const infoEl   = document.getElementById('info');
+
+innerEl.style.height = CAP_HEIGHT + 'px';
+
+// DOM pool — never destroyed, just repositioned and reused
+const pool = [];
+function ensurePool(n) {
+    while (pool.length < n) {
+        const div = document.createElement('div');
+        div.className = 'row';
+        innerEl.appendChild(div);
+        pool.push(div);
+    }
+}
+
+function render() {
+    const viewportH = scrollEl.clientHeight;
+    const scrollTop = scrollEl.scrollTop;
+    const scrollMax = Math.max(1, CAP_HEIGHT - viewportH);
+    const fraction  = scrollTop / scrollMax;               // 0..1
+
+    // How many fully visible rows fit?
+    const visCount = Math.ceil(viewportH / ROW_HEIGHT);
+
+    // Exact (fractional) index of the first visible row.
+    // Multiply by (COUNT - visCount) so index=COUNT-1 lands exactly at the bottom.
+    const exactFirst = fraction * Math.max(0, COUNT - visCount);
+    const firstIdx   = Math.floor(exactFirst);
+    const subPx      = (exactFirst - firstIdx) * ROW_HEIGHT  // sub-row pixel offset
+
+    const startIdx  = Math.max(0, firstIdx - OVERSCAN);
+    const endIdx    = Math.min(COUNT, firstIdx + visCount + OVERSCAN + 1);
+    const showCount = endIdx - startIdx;
+
+    ensurePool(showCount);
+
+    // Hide pool slots not needed this frame
+    for (let i = showCount; i < pool.length; i++) {
+        if (pool[i].style.display !== 'none') pool[i].style.display = 'none';
+    }
+
+    // Position and label each visible row.
+    // Item firstIdx should appear at scrollTop (top of viewport), accounting for
+    // the fractional sub-row offset so scrolling is smooth at the pixel level.
+    for (let i = 0; i < showCount; i++) {
+        const itemIdx = startIdx + i;
+        const el      = pool[i];
+        const top     = scrollTop - subPx + (itemIdx - firstIdx) * ROW_HEIGHT;
+        el.style.display = '';
+        el.style.top     = top + 'px';
+        el.textContent   = (itemIdx + 1).toLocaleString();
+    }
+
+    infoEl.innerHTML =
+        `rows&nbsp;&nbsp;&nbsp; ${(firstIdx + 1).toLocaleString()} – ${Math.min(COUNT, firstIdx + visCount).toLocaleString()}<br>` +
+        `total&nbsp;&nbsp; ${COUNT.toLocaleString()}<br>` +
+        `position ${(fraction * 100).toFixed(3)} %<br>` +
+        `DOM&nbsp;ht&nbsp; ${(CAP_HEIGHT / 1e6).toFixed(0)} M px`;
+}
+
+scrollEl.addEventListener('scroll', render, { passive: true });
+window.addEventListener('resize', render);
+render();
+</script>
+</body>
+</html>

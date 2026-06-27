@@ -14,6 +14,14 @@ type ConfigFile struct {
 
 	// The available interceptors.
 	Interceptors map[string]InterceptorConfig `json:"interceptors"`
+
+	// Optional REST API server configuration.
+	Api *ApiConfig `json:"api"`
+}
+
+type ApiConfig struct {
+	// TCP address the API server listens on (e.g. "127.0.0.1:9090").
+	Listen string `json:"listen"`
 }
 
 type ProxyConfig struct {

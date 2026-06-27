@@ -1,0 +1,693 @@
+openapi: 3.1.0
+
+info:
+  title: tlstap API
+  version: 0.3.0
+  description: |
+    REST API exposed by the tlstap TLS intercepting proxy when the `dbdump`
+    interceptor is active and `"api": {"listen": "..."}` is set in `config.json`.
+
+    **Base path:** All `dbdump` endpoints are reachable at the canonical path
+    `/api/i/dbdump/<endpoint>` as well as the proxy-scoped path
+    `/<proxyName>/api/i/dbdump/<endpoint>`.
+
+    **Errors:** All error responses use `Content-Type: application/json` and the
+    body `{"error": "<message>"}` with an appropriate HTTP status code.
+
+servers:
+  - url: http://127.0.0.1:9090
+    description: Default local API server (address configurable via config.json)
+
+tags:
+  - name: status
+    description: Health check
+  - name: sessions
+    description: Capture sessions
+  - name: streams
+    description: TCP streams within a session
+  - name: chunks
+    description: Raw traffic chunks within a stream
+  - name: search
+    description: Pattern search across captured traffic
+  - name: ui
+    description: Embedded web frontend
+
+paths:
+
+  /api/i/dbdump/status:
+    get:
+      tags: [status]
+      summary: Health check
+      operationId: getStatus
+      responses:
+        '200':
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/i/dbdump/sessions:
+    get:
+      tags: [sessions]
+      summary: List all capture sessions
+      operationId: getSessions
+      responses:
+        '200':
+          description: Ordered list of sessions (oldest first)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Session'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/streams:
+    post:
+      tags: [streams]
+      summary: List streams belonging to a session
+      operationId: getStreams
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+      responses:
+        '200':
+          description: Ordered list of streams (by stream ID)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Stream'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/chunklist:
+    post:
+      tags: [chunks]
+      summary: Get latest chunk IDs and total byte counts for a stream
+      description: |
+        Returns the ID of the most recently captured chunk and the total number
+        of captured bytes for each direction.
+      operationId: getChunkList
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+      responses:
+        '200':
+          description: Latest chunk metadata per direction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChunkList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/chunk:
+    post:
+      tags: [chunks]
+      summary: Fetch specific chunks by ID
+      description: |
+        Fetches the raw bytes of an explicitly enumerated list of chunk IDs.
+        Returned as `multipart/form-data`; each part corresponds to one chunk.
+
+        Each part has:
+        - `Content-Disposition: form-data; name="<chunk-id>"`
+        - `Content-Type: application/octet-stream`
+        - `X-Chunk-Offset`: byte offset of the chunk's first byte within its
+          direction stream (integer, decimal string)
+        - `X-Chunk-Time`: capture timestamp in milliseconds since Unix epoch
+          (integer, decimal string)
+        - Body: raw chunk bytes
+
+        Parts are returned in ascending chunk-ID order. An empty chunk list in
+        the request yields an empty multipart response.
+      operationId: getChunks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, direction, chunks]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                direction:
+                  $ref: '#/components/schemas/Direction'
+                chunks:
+                  type: array
+                  items:
+                    type: integer
+                    format: int64
+                  description: Chunk IDs to fetch
+      responses:
+        '200':
+          description: Multipart response with one part per chunk
+          content:
+            multipart/form-data:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/chunk-stid:
+    post:
+      tags: [chunks]
+      summary: Resolve a per-direction chunk ID to an stid
+      description: |
+        Each direction within a stream has its own independent chunk counter
+        (`id`, starting at 0). The `stid` is a direction-agnostic per-stream
+        counter that increases monotonically across both directions. This
+        endpoint translates a per-direction `id` into its corresponding `stid`,
+        which is required to position `stid-stream` requests.
+      operationId: getChunkStid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, direction, id]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                direction:
+                  $ref: '#/components/schemas/Direction'
+                id:
+                  type: integer
+                  format: int64
+                  description: Per-direction chunk ID (0-based)
+      responses:
+        '200':
+          description: The stid of the requested chunk
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stid]
+                properties:
+                  stid:
+                    type: integer
+                    format: int64
+                    description: Stream-local direction-agnostic chunk counter
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No chunk with the given session/stream/direction/id exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/byte-stid:
+    post:
+      tags: [chunks]
+      summary: Resolve a byte offset to the stid of the containing chunk
+      description: |
+        Finds the chunk in the given direction whose byte range contains the
+        specified offset (i.e. the chunk with the largest `offset` value that
+        is still ≤ the requested offset). Returns its `stid` so the caller can
+        position an `stid-stream` request to that chunk.
+      operationId: getByteStid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, direction, offset]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                direction:
+                  $ref: '#/components/schemas/Direction'
+                offset:
+                  type: integer
+                  format: int64
+                  description: Byte offset within the direction stream (0-based)
+      responses:
+        '200':
+          description: The stid of the chunk containing the given byte offset
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stid]
+                properties:
+                  stid:
+                    type: integer
+                    format: int64
+                    description: Stream-local direction-agnostic chunk counter
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No chunks exist for the given direction (stream has no data in that direction)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/stid-stream:
+    get:
+      tags: [chunks]
+      summary: Stream chunks for a single stream ordered by stid
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). Streams
+        chunks from a single stream in `stid` order (direction-agnostic).
+        Multiple sequential requests may be sent on one connection; the server
+        processes them one at a time.
+
+        `stid` is a per-stream direction-agnostic chunk counter that increases
+        monotonically across both directions. It allows the frontend to maintain
+        a single cursor and receive interleaved c→s and s→c chunks in capture
+        order without merging two independent streams.
+
+        **Request frame** (client → server, JSON text):
+        ```json
+        {"session": N, "stream": N, "start": N, "n": N}
+        ```
+        - `session` — session ID
+        - `stream` — stream ID
+        - `start` — first stid to fetch (inclusive, 0-based)
+        - `n` — maximum number of chunks to return; `0` means unlimited
+
+        **Per-chunk response** (server → client, two frames per chunk):
+        1. Text frame (JSON metadata):
+           ```json
+           {"stid": N, "chunk-id": N, "direction": N, "time": N, "offset": N}
+           ```
+           - `stid` — stream-local direction-agnostic chunk index
+           - `chunk-id` — per-direction chunk ID (0-based within direction)
+           - `direction` — `0` = client→server, `1` = server→client
+           - `time` — capture timestamp in milliseconds since Unix epoch
+           - `offset` — byte offset of this chunk's first byte within its direction stream
+        2. Binary frame: raw chunk bytes
+
+        **Done signal** (server → client, JSON text):
+        ```json
+        {"done": true}
+        ```
+        Sent after all matching chunks have been delivered. The client may
+        immediately send the next request frame.
+
+        **Error** (server → client, JSON text):
+        ```json
+        {"error": "<message>"}
+        ```
+        Sent if a database error occurs; the connection is closed afterwards.
+      operationId: stidStream
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/i/dbdump/sgid-stream:
+    get:
+      tags: [chunks]
+      summary: Stream chunks for an entire session ordered by sgid
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). Streams
+        chunks across all streams in a session in `sgid` order.
+        Multiple sequential requests may be sent on one connection.
+
+        `sgid` is a session-global direction-agnostic chunk counter that
+        increases monotonically across all streams in a session. It is used by
+        the combined-stream view to display traffic from multiple streams
+        interleaved in capture order.
+
+        **Request frame** (client → server, JSON text):
+        ```json
+        {"session": N, "start": N, "n": N}
+        ```
+        - `session` — session ID
+        - `start` — first sgid to fetch (inclusive, 0-based)
+        - `n` — maximum number of chunks to return; `0` means unlimited
+
+        **Per-chunk response** (server → client, two frames per chunk):
+        1. Text frame (JSON metadata):
+           ```json
+           {"sgid": N, "stream": N, "chunk-id": N, "direction": N, "time": N, "offset": N}
+           ```
+           - `sgid` — session-global direction-agnostic chunk index
+           - `stream` — stream ID the chunk belongs to
+           - `chunk-id` — per-direction chunk ID (0-based within direction)
+           - `direction` — `0` = client→server, `1` = server→client
+           - `time` — capture timestamp in milliseconds since Unix epoch
+           - `offset` — byte offset of this chunk's first byte within its direction stream
+        2. Binary frame: raw chunk bytes
+
+        **Done signal** (server → client, JSON text):
+        ```json
+        {"done": true}
+        ```
+
+        **Error** (server → client, JSON text):
+        ```json
+        {"error": "<message>"}
+        ```
+        Sent if a database error occurs; the connection is closed afterwards.
+      operationId: sgidStream
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/i/dbdump/search-text:
+    post:
+      tags: [search]
+      summary: Search for a pattern across captured traffic
+      description: |
+        Searches the raw bytes stored in the `chunks` table for occurrences of
+        a pattern. The search can be scoped to a single stream or run across all
+        streams in a session, and can be restricted to one direction.
+
+        **Contiguous vs. non-contiguous mode**
+
+        In the default non-contiguous mode each chunk is searched independently;
+        a pattern that spans a chunk boundary will not be found.
+
+        With `"contiguous": true` the chunks are concatenated into 1 MB batches
+        before searching. Literal patterns carry a `len(pattern)−1` byte overlap
+        between consecutive batches so that matches split across a batch boundary
+        are still found. For regex patterns no overlap is applied (the minimum
+        match length is not known in advance), so a regex match spanning a 1 MB
+        batch boundary may be missed.
+
+        **Pattern encoding**
+
+        | `pattern_encoding` | Meaning |
+        |---|---|
+        | `""` or `"text"` | `pattern` is a raw UTF-8 string; searched as literal bytes |
+        | `"base64"` | `pattern` is base64-encoded; decoded to raw bytes before searching |
+        | `"regex"` | `pattern` is a Go `regexp` expression; compiled and matched with `FindAllIndex` |
+
+        The web frontend always uses `"base64"` for non-regex formats so that
+        arbitrary byte sequences (UTF-16, hex, null bytes) can be transported
+        safely through the JSON body.
+      operationId: searchText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, pattern]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID to search within
+                stream:
+                  type: integer
+                  format: int64
+                  description: |
+                    Stream ID to restrict the search to. If omitted, all streams
+                    in the session are searched.
+                start:
+                  type: integer
+                  format: int64
+                  description: |
+                    Lower bound on the byte offset (inclusive). Only chunks whose
+                    range overlaps `[start, end)` are considered. Default: `0`.
+                end:
+                  type: integer
+                  format: int64
+                  description: |
+                    Upper bound on the byte offset (exclusive). Must be greater
+                    than `start` if supplied.
+                pattern:
+                  type: string
+                  description: |
+                    The search pattern. Interpretation depends on
+                    `pattern_encoding`.
+                pattern_encoding:
+                  type: string
+                  enum: ['', text, base64, regex]
+                  default: text
+                  description: |
+                    How `pattern` should be interpreted:
+                    - `""` / `"text"` — raw UTF-8 literal bytes
+                    - `"base64"` — base64-encoded arbitrary byte sequence
+                    - `"regex"` — Go `regexp` syntax
+                direction:
+                  $ref: '#/components/schemas/Direction'
+                  description: |
+                    Restrict search to one direction. If omitted, both directions
+                    are searched independently.
+                contiguous:
+                  type: boolean
+                  default: false
+                  description: |
+                    If `true`, chunks are concatenated before searching so that
+                    patterns spanning chunk boundaries can be found.
+      responses:
+        '200':
+          description: |
+            Array of matches ordered by stream, then direction, then byte offset.
+            An empty array means no matches were found.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SearchMatch'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /ui:
+    get:
+      tags: [ui]
+      summary: Redirect to web UI
+      operationId: uiRedirect
+      responses:
+        '302':
+          description: Redirect to /ui/
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /ui/
+
+  /ui/:
+    get:
+      tags: [ui]
+      summary: Embedded web frontend
+      description: |
+        Serves the embedded Preact-based traffic viewer. All assets (JS, vendor
+        modules) are available under `/ui/` and are embedded in the binary at
+        build time.
+      operationId: uiIndex
+      responses:
+        '200':
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  schemas:
+
+    Session:
+      type: object
+      required: [id, start, config]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Session ID (auto-increment, globally unique)
+        start:
+          type: integer
+          format: int64
+          description: Session start time in milliseconds since Unix epoch
+        config:
+          type: object
+          description: |
+            JSON snapshot of the proxy configuration at session start
+            (proxy name, listen/connect endpoints, mode, TLS config,
+            interceptor list).
+          additionalProperties: true
+
+    Stream:
+      type: object
+      required: [id, session, src, dst, start, end, length0, length1]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: |
+            Stream ID — equals the proxy's connection counter (`ConnID`).
+            Sequential and 0-based per proxy run; unique only within a session.
+        session:
+          type: integer
+          format: int64
+          description: ID of the session this stream belongs to
+        src:
+          type: string
+          description: Client endpoint (host:port)
+          example: 127.0.0.1:54321
+        dst:
+          type: string
+          description: Upstream endpoint (host:port)
+          example: 93.184.216.34:443
+        start:
+          type: integer
+          format: int64
+          description: Connection start time in milliseconds since Unix epoch
+        end:
+          type: integer
+          format: int64
+          description: Connection end time in milliseconds since Unix epoch; 0 if the connection is still ongoing
+        length0:
+          type: integer
+          format: int64
+          description: Total captured bytes in the client→server direction; -1 if no data captured
+        length1:
+          type: integer
+          format: int64
+          description: Total captured bytes in the server→client direction; -1 if no data captured
+
+    ChunkList:
+      type: object
+      required: [latest0, latest1, length0, length1]
+      properties:
+        latest0:
+          type: integer
+          format: int64
+          description: ID of the most recent chunk in the client→server direction; -1 if no chunks exist
+        latest1:
+          type: integer
+          format: int64
+          description: ID of the most recent chunk in the server→client direction; -1 if no chunks exist
+        length0:
+          type: integer
+          format: int64
+          description: Total captured bytes in the client→server direction; -1 if no chunks exist
+        length1:
+          type: integer
+          format: int64
+          description: Total captured bytes in the server→client direction; -1 if no chunks exist
+
+    SearchMatch:
+      type: object
+      required: [stream, direction, offset, stid]
+      properties:
+        stream:
+          type: integer
+          format: int64
+          description: Stream ID in which the match was found
+        direction:
+          $ref: '#/components/schemas/Direction'
+        offset:
+          type: integer
+          format: int64
+          description: Byte offset of the first matching byte within the direction stream
+        stid:
+          type: integer
+          format: int64
+          description: |
+            `stid` of the chunk that contains the start of the match. Can be
+            used directly as the `start` parameter of an `stid-stream` request
+            to position the view at this match.
+
+    Direction:
+      type: integer
+      enum: [0, 1]
+      description: |
+        Traffic direction:
+        - `0` — client → server (upstream)
+        - `1` — server → client (downstream)
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+
+  responses:
+
+    BadRequest:
+      description: Invalid or malformed request body
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    InternalError:
+      description: Database or server-side error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: The requested resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
