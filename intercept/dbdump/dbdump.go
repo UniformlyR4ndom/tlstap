@@ -9,9 +9,34 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"tlstap/logging"
 	"tlstap/proxy"
+
+	_ "modernc.org/sqlite"
 )
+
+const (
+	bufFlushSize = 2 * 1024 * 1024  // 2 MB: signal the flush goroutine for an early flush
+	bufMaxSize   = 16 * 1024 * 1024 // 16 MB: hard cap; Intercept blocks until buffer is drained
+)
+
+const (
+	directionC2S = 0 // client -> server direction
+	directionS2C = 1 // server -> client direction
+)
+
+// chunkRecord holds all fields needed for one deferred INSERT INTO chunks.
+type chunkRecord struct {
+	id        int64
+	streamID  uint32
+	sessionID int64
+	direction int
+	offset    int64
+	timestamp int64
+	data      []byte
+	sgid      int64
+	stid      int64
+}
 
 type DbDumpConfig struct {
 	FilePath string `json:"file"`
@@ -79,25 +104,38 @@ type DbDumpInterceptor struct {
 
 	// Lazy session creation: the session row (and buffered stream rows) are only
 	// written to the DB on the first Intercept call, so idle runs leave no trace.
-	sessionOnce   sync.Once
-	sessionErr    error  // cached error from the first ensureSession attempt
-	sessionCreated bool   // true once the session row exists; guarded by mu
-	sessionStart   int64  // set in Init, consumed by ensureSession
-	pendingConfig  string // set in Init, consumed by ensureSession
-	pendingStreams  []pendingStream // guarded by mu; flushed by ensureSession
+	sessionOnce    sync.Once
+	sessionErr     error           // cached error from the first ensureSession attempt
+	sessionCreated bool            // true once the session row exists; guarded by mu
+	sessionStart   int64           // set in Init, consumed by ensureSession
+	pendingConfig  string          // set in Init, consumed by ensureSession
+	pendingStreams []pendingStream // guarded by mu; flushed by ensureSession
 
 	// clientEndpoints maps ConnID → client endpoint to derive direction in Intercept.
 	// chunkStates tracks the next chunk ID and byte offset per (stream, direction).
 	// streamNextSTID tracks the next stream-local chunk ID (direction-agnostic) per ConnID.
-	// All three are protected by mu.
+	// pendingChunks / pendingSize are the async write buffer.
+	// All are protected by mu.
 	clientEndpoints map[uint32]string
 	chunkStates     map[chunkKey]chunkState
 	streamNextSTID  map[uint32]int64
 	nextSGID        int64
+	pendingChunks   []chunkRecord
+	pendingSize     int
 	mu              sync.RWMutex
+	cond            *sync.Cond // tied to mu's write lock; used to block Intercept when buffer is full
+
+	// flushCh receives a signal when pendingSize crosses bufFlushSize (early flush).
+	// stopCh is closed by Finalize to trigger a final flush and goroutine exit.
+	// flushDone is closed by the goroutine once it has exited.
+	flushCh   chan struct{}
+	stopCh    chan struct{}
+	flushDone chan struct{}
+
+	logger *logging.Logger
 }
 
-func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.ResolvedProxyConfig) DbDumpInterceptor {
+func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) DbDumpInterceptor {
 	return DbDumpInterceptor{
 		filePath:        path,
 		truncate:        truncate,
@@ -105,6 +143,7 @@ func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.Resolved
 		clientEndpoints: make(map[uint32]string),
 		chunkStates:     make(map[chunkKey]chunkState),
 		streamNextSTID:  make(map[uint32]int64),
+		logger:          logger,
 	}
 }
 
@@ -187,6 +226,14 @@ func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 	// Store session metadata for lazy insertion on first traffic.
 	i.sessionStart = time.Now().UnixMilli()
 	i.pendingConfig = cfgJSON
+
+	// cond must be initialised here (not in NewDbDumpInterceptor) so it points to
+	// the final address of mu rather than a field of a temporary value copy.
+	i.cond = sync.NewCond(&i.mu)
+	i.flushCh = make(chan struct{}, 1)
+	i.stopCh = make(chan struct{})
+	i.flushDone = make(chan struct{})
+	go i.flushLoop()
 	return nil
 }
 
@@ -252,6 +299,10 @@ func (i *DbDumpInterceptor) ensureSession() error {
 }
 
 func (i *DbDumpInterceptor) Finalize(addr net.TCPAddr) {
+	if i.stopCh != nil {
+		close(i.stopCh)
+		<-i.flushDone
+	}
 	if i.db != nil {
 		i.db.Close()
 	}
@@ -292,8 +343,8 @@ func (i *DbDumpInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 func (i *DbDumpInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	i.mu.Lock()
 	delete(i.clientEndpoints, info.ConnID)
-	delete(i.chunkStates, chunkKey{info.ConnID, 0})
-	delete(i.chunkStates, chunkKey{info.ConnID, 1})
+	delete(i.chunkStates, chunkKey{info.ConnID, directionC2S})
+	delete(i.chunkStates, chunkKey{info.ConnID, directionS2C})
 	delete(i.streamNextSTID, info.ConnID)
 	sessionCreated := i.sessionCreated
 	if !sessionCreated {
@@ -327,24 +378,107 @@ func (i *DbDumpInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte
 	clientEndpoint := i.clientEndpoints[info.ConnID]
 	i.mu.RUnlock()
 
-	direction := 1 // server→client
+	direction := directionS2C
 	if info.SrcEndpoint == clientEndpoint {
-		direction = 0 // client→server
+		direction = directionC2S
 	}
+
+	// data is a view into the proxy's shared read buffer; copy it before the
+	// caller's next Read() can overwrite it.
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
 
 	key := chunkKey{info.ConnID, direction}
 	i.mu.Lock()
+	// Block if the buffer has hit the hard cap; flush() will broadcast when it drains.
+	for i.pendingSize >= bufMaxSize {
+		i.cond.Wait()
+	}
 	state := i.chunkStates[key]
 	sgid := i.nextSGID
 	stid := i.streamNextSTID[info.ConnID]
 	i.nextSGID++
 	i.streamNextSTID[info.ConnID]++
 	i.chunkStates[key] = chunkState{id: state.id + 1, offset: state.offset + int64(len(data))}
+	i.pendingChunks = append(i.pendingChunks, chunkRecord{
+		id:        state.id,
+		streamID:  info.ConnID,
+		sessionID: i.sessionID,
+		direction: direction,
+		offset:    state.offset,
+		timestamp: time.Now().UnixMilli(),
+		data:      dataCopy,
+		sgid:      sgid,
+		stid:      stid,
+	})
+	i.pendingSize += len(dataCopy)
+	needsFlush := i.pendingSize >= bufFlushSize
 	i.mu.Unlock()
 
-	_, err := i.db.Exec(
+	if needsFlush {
+		select {
+		case i.flushCh <- struct{}{}:
+		default:
+		}
+	}
+
+	return data, nil
+}
+
+func (i *DbDumpInterceptor) flushLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			i.flush()
+		case <-i.flushCh:
+			i.flush()
+		case <-i.stopCh:
+			i.flush()
+			close(i.flushDone)
+			return
+		}
+	}
+}
+
+// flush swaps out the pending buffer under the lock (fast), broadcasts to wake
+// any blocked Intercept callers, then writes all records in a single transaction.
+func (i *DbDumpInterceptor) flush() {
+	i.mu.Lock()
+	chunks := i.pendingChunks
+	i.pendingChunks = nil
+	i.pendingSize = 0
+	i.mu.Unlock()
+	i.cond.Broadcast()
+
+	if len(chunks) == 0 {
+		return
+	}
+
+	tx, err := i.db.Begin()
+	if err != nil {
+		i.logger.Error("dbdump: begin flush transaction: %v", err)
+		return
+	}
+	stmt, err := tx.Prepare(
 		`INSERT INTO chunks (id, stream, session, direction, offset, time, data, sgid, stid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		state.id, info.ConnID, i.sessionID, direction, state.offset, time.Now().UnixMilli(), data, sgid, stid,
 	)
-	return data, err
+	if err != nil {
+		tx.Rollback()
+		i.logger.Error("dbdump: prepare flush statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	for _, c := range chunks {
+		if _, err := stmt.Exec(c.id, c.streamID, c.sessionID, c.direction, c.offset, c.timestamp, c.data, c.sgid, c.stid); err != nil {
+			tx.Rollback()
+			i.logger.Error("dbdump: flush INSERT: %v", err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		i.logger.Error("dbdump: flush commit: %v", err)
+	}
 }

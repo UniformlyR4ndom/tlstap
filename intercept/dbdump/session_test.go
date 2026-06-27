@@ -9,7 +9,7 @@ import (
 
 func newTestInterceptor(t *testing.T) *DbDumpInterceptor {
 	t.Helper()
-	d := NewDbDumpInterceptor(":memory:", false, proxy.ResolvedProxyConfig{Name: "test"})
+	d := NewDbDumpInterceptor(":memory:", false, proxy.ResolvedProxyConfig{Name: "test"}, nil)
 	if err := d.Init(net.TCPAddr{}); err != nil {
 		t.Fatal(err)
 	}

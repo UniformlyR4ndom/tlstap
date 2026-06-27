@@ -193,6 +193,13 @@ chunks(id INTEGER, stream INTEGER, session INTEGER → sessions.id, direction IN
 - `streamNextSTID map[uint32]int64` — tracks next stid per `ConnID`; deleted in `ConnectionTerminated`.
 - `nextSGID int64` — session-global chunk counter, incremented under mutex on every `Intercept` call.
 
+**Async write buffer:** chunk INSERTs are decoupled from the forwarding path to avoid blocking on disk I/O.
+- `Intercept()` copies the chunk data (the proxy reuses its read buffer immediately after) and enqueues a `chunkRecord` into `pendingChunks []chunkRecord` under `mu`, then returns immediately.
+- A background goroutine (`flushLoop`) flushes the buffer in a single SQLite transaction either every second or when `pendingSize` crosses `bufFlushSize` (2 MB, soft trigger), whichever comes first.
+- `bufMaxSize` (16 MB) is a hard cap: `Intercept()` blocks via `cond.Wait()` if the buffer reaches this size, providing backpressure without unbounded memory growth. Both thresholds are constants at the top of `dbdump.go`.
+- `flush()` swaps `pendingChunks` for a fresh slice under the lock (fast), broadcasts on `cond` to wake any blocked callers, then commits the batch outside the lock so `Intercept()` can continue filling the new slice concurrently.
+- `Finalize()` closes `stopCh` to trigger a final flush and waits on `flushDone` before closing the DB.
+
 **Lazy session creation:** the session row is not written to the DB in `Init()`; it is deferred until the first `Intercept()` call, so idle sessions leave no row.
 - `sessionOnce sync.Once` / `sessionErr error` — `ensureSession()` runs the INSERT exactly once; error is cached.
 - `sessionCreated bool`, `sessionStart int64`, `pendingConfig string` — set in `Init()`, committed on first `Intercept()`.
