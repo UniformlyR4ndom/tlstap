@@ -1,4 +1,4 @@
-dump.sqlite
-dump.sqlite-shm
-dump.sqlite-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 .playwright-mcp/
