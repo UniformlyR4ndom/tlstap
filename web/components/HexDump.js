@@ -1,6 +1,7 @@
 import { h } from 'preact'
 import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
+import { fmtAsBase64, fmtAsHex, fmtAsAscii, fmtAsHexdump, mergeUint8Arrays } from '../format.js'
 
 const html = htm.bind(h)
 
@@ -8,19 +9,25 @@ export const ROW_HEIGHT    = 22
 const BUFFER               = 8
 const PREFETCH_FRACTION    = 0.1
 
-export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset }) {
+export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset, onSetMarker, onClearMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onViewportChange, markers }) {
     const containerRef = useRef(null)
     const [scrollTop, setScrollTop] = useState(0)
     const [height,    setHeight]    = useState(400)
     const [sel,       setSel]       = useState(null)  // null | { direction, start, end }
-    const [menu,      setMenu]      = useState(null)  // null | { x, y, bytes, baseOffset }
+    const [menu,      setMenu]      = useState(null)  // null | { x, y, bytes, baseOffset, byteInfo }
     const anchorRef   = useRef(null)                  // { direction, offset } of mousedown byte
     const draggingRef = useRef(false)
+    const vpCallbackRef = useRef(onViewportChange)
+    useEffect(() => { vpCallbackRef.current = onViewportChange }, [onViewportChange])
 
     useEffect(() => {
         const el = containerRef.current
         if (!el) return
-        const obs = new ResizeObserver(entries => setHeight(entries[0].contentRect.height))
+        const obs = new ResizeObserver(entries => {
+            const h = entries[0].contentRect.height
+            setHeight(h)
+            vpCallbackRef.current?.(el.scrollTop, h)
+        })
         obs.observe(el)
         return () => obs.disconnect()
     }, [])
@@ -103,13 +110,16 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
         if (rowIndex < 0 || rowIndex >= rows.length) return
 
         let result = null
+        let byteInfo = null
         const row = rows[rowIndex]
         if (row.type === 'header') {
             result = collectChunkBytes(rowIndex)
         } else if (row.type === 'hex') {
             const info = getByteInfo(e)
+            byteInfo = info
             if (info && sel && sel.direction === info.direction && info.offset >= sel.start && info.offset <= sel.end) {
                 result = collectSelectionBytes()
+                byteInfo = { ...info, selStart: sel.start, selEnd: sel.end }
             } else {
                 let hi = rowIndex - 1
                 while (hi >= 0 && rows[hi].type !== 'header') hi--
@@ -117,7 +127,7 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
             }
         }
         if (!result || result.bytes.length === 0) return
-        setMenu({ x: e.clientX, y: e.clientY, ...result })
+        setMenu({ x: e.clientX, y: e.clientY, byteInfo, ...result })
     }
 
     function collectChunkBytes(headerIdx) {
@@ -159,12 +169,15 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
     const topSpacer    = startIdx * ROW_HEIGHT
     const bottomSpacer = (rows.length - endIdx) * ROW_HEIGHT
 
+    const markedC2S = markers?.length ? new Set(markers.filter(m => m.direction === 0).map(m => m.offset)) : null
+    const markedS2C = markers?.length ? new Set(markers.filter(m => m.direction === 1).map(m => m.offset)) : null
+
     return html`
         <div class="hexdump-wrap">
             <div
                 class="hexdump-scroll"
                 ref=${containerRef}
-                onScroll=${e => setScrollTop(e.currentTarget.scrollTop)}
+                onScroll=${e => { const st = e.currentTarget.scrollTop; setScrollTop(st); onViewportChange?.(st, height) }}
                 onMouseDown=${onMouseDown}
                 onMouseMove=${onMouseMove}
                 onContextMenu=${onContextMenu}
@@ -173,7 +186,7 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
                 ${rows.slice(startIdx, endIdx).map((row, i) =>
                     row.type === 'header'
                         ? html`<${ChunkHeader} key=${startIdx + i} row=${row} />`
-                        : html`<${HexRow}      key=${startIdx + i} row=${row} globalOffset=${globalOffset} sel=${sel} />`
+                        : html`<${HexRow}      key=${startIdx + i} row=${row} globalOffset=${globalOffset} sel=${sel} markedC2S=${markedC2S} markedS2C=${markedS2C} />`
                 )}
                 <div style=${{ height: bottomSpacer + 'px' }} />
             </div>
@@ -184,6 +197,26 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
                     <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsAscii(menu.bytes)); setMenu(null) }}>Copy as ASCII</div>
                     <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsHexdump(menu.bytes, menu.baseOffset)); setMenu(null) }}>Copy as hexdump</div>
                     <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsBase64(menu.bytes)); setMenu(null) }}>Copy as base64</div>
+                    ${menu.byteInfo && (onSetExtractStart || onSetExtractEnd || onSetExtractRange) && html`
+                        <div class="ctx-sep" />
+                        ${menu.byteInfo.selStart != null && onSetExtractRange && html`
+                            <div class="ctx-item" onClick=${() => { onSetExtractRange(menu.byteInfo.direction, menu.byteInfo.selStart, menu.byteInfo.selEnd); setMenu(null) }}>Set selection (range)</div>
+                        `}
+                        <div class="ctx-item" onClick=${() => { onSetExtractStart?.(menu.byteInfo.direction, menu.byteInfo.offset); setMenu(null) }}>Set selection start</div>
+                        <div class="ctx-item" onClick=${() => { onSetExtractEnd?.(menu.byteInfo.direction, menu.byteInfo.offset); setMenu(null) }}>Set selection end</div>
+                    `}
+                    ${menu.byteInfo && (onSetMarker || onClearMarker) && (() => {
+                        const { direction, offset } = menu.byteInfo
+                        const markedSet = direction === 0 ? markedC2S : markedS2C
+                        const isMarked = markedSet?.has(offset)
+                        return html`
+                            <div class="ctx-sep" />
+                            ${isMarked
+                                ? html`<div class="ctx-item" onClick=${() => { onClearMarker?.(direction, offset); setMenu(null) }}>Clear marker</div>`
+                                : html`<div class="ctx-item" onClick=${() => { onSetMarker?.(direction, offset); setMenu(null) }}>Set marker</div>`
+                            }
+                        `
+                    })()}
                 </div>
             `}
         </div>
@@ -202,10 +235,11 @@ function ChunkHeader({ row }) {
     `
 }
 
-function HexRow({ row, globalOffset, sel }) {
+function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
     const { bytes, offset, localOffset, direction } = row
-    const dir    = direction === 0 ? 'c2s' : 's2c'
-    const offStr = (globalOffset ? offset : localOffset).toString(16).padStart(8, '0')
+    const dir      = direction === 0 ? 'c2s' : 's2c'
+    const offStr   = (globalOffset ? offset : localOffset).toString(16).padStart(8, '0')
+    const markedSet = direction === 0 ? markedC2S : markedS2C
 
     // Build hex section: '  ' leader + per-byte spans with spaces + padding + '  ' trailer.
     // Between group 1 (bytes 0-7) and group 2 (bytes 8-15) there is an extra space.
@@ -214,8 +248,10 @@ function HexRow({ row, globalOffset, sel }) {
         if (i === 8)    hexContent.push('  ')  // double-space group separator
         else if (i > 0) hexContent.push(' ')
         const byteOff = offset + i
-        const hl = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
-        hexContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${hl ? 'sel-hl' : undefined}>${bytes[i].toString(16).padStart(2, '0')}</span>`)
+        const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
+        const marked  = markedSet?.has(byteOff)
+        const cls     = [hl ? 'sel-hl' : null, marked ? 'hex-byte-marked' : null].filter(Boolean).join(' ') || undefined
+        hexContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${bytes[i].toString(16).padStart(2, '0')}</span>`)
     }
     // Pad to 48 chars so short rows align with full rows.
     const used = bytes.length <= 8 ? bytes.length * 3 - 1 : bytes.length * 3
@@ -226,9 +262,11 @@ function HexRow({ row, globalOffset, sel }) {
     const asciiContent = ['|']
     for (let i = 0; i < bytes.length; i++) {
         const byteOff = offset + i
-        const hl = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
+        const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
+        const marked  = markedSet?.has(byteOff)
+        const cls     = [hl ? 'sel-hl' : null, marked ? 'asc-byte-marked' : null].filter(Boolean).join(' ') || undefined
         const ch = bytes[i] >= 0x20 && bytes[i] < 0x7f ? String.fromCharCode(bytes[i]) : '.'
-        asciiContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${hl ? 'sel-hl' : undefined}>${ch}</span>`)
+        asciiContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${ch}</span>`)
     }
     asciiContent.push('|')
 
@@ -239,38 +277,4 @@ function fmtBytes(n) {
     if (n < 1024)    return `${n} B`
     if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
     return `${(n / 1048576).toFixed(1)} MB`
-}
-
-function mergeUint8Arrays(arrays) {
-    const total = arrays.reduce((n, a) => n + a.length, 0)
-    const out = new Uint8Array(total)
-    let off = 0
-    for (const a of arrays) { out.set(a, off); off += a.length }
-    return out
-}
-
-function fmtAsBase64(bytes) {
-    return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
-}
-
-function fmtAsHex(bytes) {
-    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-}
-
-function fmtAsAscii(bytes) {
-    return Array.from(bytes, b => b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.').join('')
-}
-
-function fmtAsHexdump(bytes, baseOffset) {
-    const lines = []
-    for (let i = 0; i < bytes.length; i += 16) {
-        const slice = bytes.slice(i, i + 16)
-        const off = (baseOffset + i).toString(16).padStart(8, '0')
-        const hexParts = Array.from(slice, b => b.toString(16).padStart(2, '0'))
-        const g1 = hexParts.slice(0, 8).join(' ').padEnd(23)
-        const g2 = hexParts.slice(8).join(' ').padEnd(23)
-        const asc = Array.from(slice, b => b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.').join('')
-        lines.push(`${off}  ${g1}  ${g2}  |${asc}|`)
-    }
-    return lines.join('\n')
 }

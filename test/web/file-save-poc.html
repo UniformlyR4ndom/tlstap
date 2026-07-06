@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>File Save POC</title>
+<style>
+  body { font-family: monospace; padding: 2em; background: #111; color: #eee; }
+  button { padding: 8px 16px; margin: 6px; cursor: pointer; font-size: 14px; }
+  #log  { margin-top: 1em; white-space: pre; color: #aaa; }
+  .ok  { color: #6f6; }
+  .err { color: #f66; }
+</style>
+</head>
+<body>
+<h2>File Save POC</h2>
+<p>Secure context: <strong id="sec"></strong></p>
+<p>showSaveFilePicker available: <strong id="avail"></strong></p>
+
+<button id="btn-picker">showSaveFilePicker</button>
+<button id="btn-anchor">anchor &lt;a download&gt;</button>
+
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log')
+function print(msg, cls) {
+    const s = document.createElement('span')
+    s.className = cls || ''
+    s.textContent = msg + '\n'
+    log.appendChild(s)
+}
+
+document.getElementById('sec').textContent   = window.isSecureContext
+document.getElementById('avail').textContent = typeof window.showSaveFilePicker === 'function'
+
+const CONTENT = 'hello from the POC\n'
+const BLOB    = new Blob([CONTENT], { type: 'text/plain' })
+
+document.getElementById('btn-picker').onclick = async () => {
+    print('calling showSaveFilePicker...')
+    if (typeof window.showSaveFilePicker !== 'function') {
+        print('showSaveFilePicker not available in this browser', 'err')
+        return
+    }
+    try {
+        const handle   = await window.showSaveFilePicker({ suggestedName: 'poc.txt', types: [{ description: 'Text', accept: { 'text/plain': ['.txt'] } }] })
+        print('got handle, writing...')
+        const writable = await handle.createWritable()
+        await writable.write(BLOB)
+        await writable.close()
+        print('done — file written!', 'ok')
+    } catch (e) {
+        print(`${e.name}: ${e.message}`, 'err')
+    }
+}
+
+document.getElementById('btn-anchor').onclick = () => {
+    const url = URL.createObjectURL(BLOB)
+    const a   = document.createElement('a')
+    a.href = url; a.download = 'poc.txt'
+    document.body.appendChild(a); a.click()
+    document.body.removeChild(a); URL.revokeObjectURL(url)
+    print('anchor download triggered', 'ok')
+}
+</script>
+</body>
+</html>

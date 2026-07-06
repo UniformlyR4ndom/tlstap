@@ -3,16 +3,32 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
 import htm from 'htm'
 import { openStidStream, getChunkStid, getByteStid } from '../api.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
+import MarkersPanel from './MarkersPanel.js'
+import ResizeHandle from './ResizeHandle.js'
+import { loadLayout, saveLayoutValue } from '../layout.js'
 
 const html = htm.bind(h)
 
 const BATCH = 50
 
-export default function TrafficView({ stream, globalOffset, jumpTo }) {
+function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
+
+export default function TrafficView({ stream, globalOffset, jumpTo, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
     const [display,    setDisplay]    = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading,    setLoading]    = useState(false)
     const [error,      setError]      = useState(null)
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
+    const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
+    const [markersWidth, setMarkersWidth] = useState(() => loadLayout().markersWidth)
+    const viewHeightRef = useRef(0)
+
+    function handleMarkersResize(deltaX) {
+        setMarkersWidth(w => {
+            const next = clamp(w - deltaX, 150, 500)
+            saveLayoutValue('markersWidth', next)
+            return next
+        })
+    }
 
     // nextStidRef: first stid to load on forward scroll (exclusive upper bound of buffer)
     // prevStidRef: stid of the first chunk in the buffer (for backward scroll guard + fetch)
@@ -91,6 +107,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
             try {
                 let targetStid = jumpTo.value
                 let targetByteOffset = null
+                let targetDirection = null
                 if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
                     const direction = jumpTo.unit === 'chunks-c2s' ? 0 : 1
                     const result = await getChunkStid(s.session, s.id, direction, jumpTo.value)
@@ -102,6 +119,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
                     if (generationRef.current !== gen) return
                     targetStid = result.stid
                     targetByteOffset = jumpTo.value
+                    targetDirection = direction
                 }
                 const startStid = Math.max(0, targetStid - Math.floor(BATCH / 2))
                 const chunks = await ws.fetch(s.session, s.id, startStid, BATCH)
@@ -114,7 +132,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
                 for (let i = 0; i < rows.length; i++) {
                     const row = rows[i]
                     if (targetByteOffset !== null) {
-                        if (row.type === 'hex' && row.offset <= targetByteOffset && targetByteOffset < row.offset + row.bytes.length) {
+                        if (row.type === 'hex' && row.direction === targetDirection && row.offset <= targetByteOffset && targetByteOffset < row.offset + row.bytes.length) {
                             targetRowPx = i * ROW_HEIGHT
                             break
                         }
@@ -125,7 +143,10 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
                         }
                     }
                 }
-                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, scrollTo: targetRowPx, scrollToVersion: jumpTo.version })
+                const scrollTo = jumpTo.align === 'top'
+                    ? targetRowPx
+                    : Math.max(0, targetRowPx - Math.floor(viewHeightRef.current / 2))
+                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, scrollTo, scrollToVersion: jumpTo.version })
             } catch (e) {
                 if (generationRef.current === gen) setError(e.message)
             } finally {
@@ -199,6 +220,25 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
         }
     }, [])
 
+    const handleViewportChange = useCallback((scrollTop, height) => {
+        viewHeightRef.current = height
+    }, [])
+
+    const handleSetMarker = useCallback((direction, offset) => {
+        if (!stream) return
+        onAddMarker?.({ session: stream.session, stream: stream.id, direction, offset, label: '' })
+    }, [stream, onAddMarker])
+
+    const handleClearMarker = useCallback((direction, offset) => {
+        if (!stream) return
+        const m = (markers ?? []).find(
+            mk => mk.session === stream.session && mk.stream === stream.id && mk.direction === direction && mk.offset === offset
+        )
+        if (m) onRemoveMarker?.(m.id)
+    }, [stream, markers, onRemoveMarker])
+
+    const streamMarkers = (markers ?? []).filter(m => m.session === stream?.session && m.stream === stream?.id)
+
     if (!stream) return html`<div class="placeholder">Select a stream to view traffic</div>`
 
     const { up, down } = totalBytes
@@ -213,21 +253,41 @@ export default function TrafficView({ stream, globalOffset, jumpTo }) {
                 ${loading && html`<span class="meta-loading">loading…</span>`}
             </div>
             ${error && html`<div class="error-msg">${error}</div>`}
-            <${HexDump}
-                key=${stream.id}
-                rows=${display.rows}
-                onScrollEnd=${handleScrollEnd}
-                scrollAdjust=${display.scrollAdjust}
-                adjustVersion=${display.adjustVersion}
-                scrollTo=${display.scrollTo}
-                scrollToVersion=${display.scrollToVersion}
-                globalOffset=${globalOffset}
-            />
+            <div class="traffic-body">
+                <${HexDump}
+                    key=${stream.id}
+                    rows=${display.rows}
+                    onScrollEnd=${handleScrollEnd}
+                    scrollAdjust=${display.scrollAdjust}
+                    adjustVersion=${display.adjustVersion}
+                    scrollTo=${display.scrollTo}
+                    scrollToVersion=${display.scrollToVersion}
+                    globalOffset=${globalOffset}
+                    onSetMarker=${handleSetMarker}
+                    onClearMarker=${handleClearMarker}
+                    onSetExtractStart=${onSetExtractStart}
+                    onSetExtractEnd=${onSetExtractEnd}
+                    onSetExtractRange=${onSetExtractRange}
+                    onViewportChange=${handleViewportChange}
+                    markers=${streamMarkers}
+                />
+                ${!markersPanelCollapsed && html`<${ResizeHandle} orientation="v" onResize=${handleMarkersResize} />`}
+                <${MarkersPanel}
+                    markers=${(markers ?? []).filter(m => m.session === stream.session)}
+                    onRemove=${onRemoveMarker}
+                    onUpdateLabel=${onUpdateMarkerLabel}
+                    onJump=${m => onMarkerJumpRequest?.(m)}
+                    onImport=${onImportMarkers}
+                    collapsed=${markersPanelCollapsed}
+                    onToggle=${() => setMarkersPanelCollapsed(v => !v)}
+                    width=${markersWidth}
+                />
+            </div>
         </div>
     `
 }
 
-// ── pure helpers ──────────────────────────────────────────────────────────────
+// ── pure helpers ─────────────────────────────────────────────────────────────
 
 function findChunkBoundaryNearHalf(rows, fallback) {
     const half = Math.floor(rows.length / 2)

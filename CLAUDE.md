@@ -37,16 +37,26 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   index.html        ← HTML shell, importmap, all CSS (dark theme)
   main.js           ← mounts App into #root
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
+  format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
+  markers.js        ← marker localStorage helpers (loadMarkers, saveMarkers, makeMarkerId)
+  layout.js         ← panel-size localStorage helpers (loadLayout, saveLayoutValue)
+  transforms.js     ← OPERATIONS registry + ALGORITHM_SECTIONS catalog powering the Transform panel
+  ringbuffer.js     ← ring buffer utility
   vendor/           ← vendored ES modules (preact 10.25.4, htm 3.1.1)
   components/
-    App.js          ← root; owns session/stream selection, view mode, menu bar, bottom panel, jumpTo
+    App.js          ← root; owns session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
     SessionList.js  ← sessions panel with sort toggle (asc/desc)
     StreamList.js   ← streams panel with sort toggle (resets to asc on session change)
-    TrafficView.js  ← single-stream view: metadata bar + stid-based chunk buffer + virtual scroll
+    TrafficView.js  ← single-stream view: metadata bar + stid-based chunk buffer + virtual scroll + markers-panel sizing
     CombinedView.js ← combined-stream view: sgid-based chunk buffer across all streams in a session
-    HexDump.js      ← virtual-scroll hex dump with prefetch, scroll correction, byte selection
+    HexDump.js      ← virtual-scroll hex dump with prefetch, scroll correction, byte selection, context menu (read-only, for captured traffic)
+    HexEditor.js    ← small non-virtualized editable hex/ASCII grid with an insertion cursor; used by TransformPanel (editable input, read-only output)
+    ResizeHandle.js ← generic draggable divider (vertical/horizontal) used for every resizable panel boundary
     GoToPanel.js    ← "Goto" bottom-panel tab: jump to chunk/offset by stid or direction-specific ID
     SearchPanel.js  ← "Search" bottom-panel tab: pattern search with format/direction/contiguous options
+    ExtractPanel.js ← "Extract" bottom-panel tab: fetch and save/copy a byte range in various formats
+    TransformPanel.js ← "Transform" bottom-panel tab: a step pipeline that runs input bytes through encode/decode operations into an output panel
+    MarkersPanel.js ← side panel listing session markers with inline label editing; import/export
 logging/            ← thin slog wrapper
 assert/             ← assert.Assertf — panics with message; used for "this is a bug" invariants
 examples/           ← standalone binaries showing how to write custom interceptors
@@ -296,18 +306,29 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `globalOffset` is passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` → `HexRow`.
 
 **Bottom panel (`App.js`):**
-- `bottomTab` state: `null` (collapsed) | `'goto'` | `'search'`.
+- `bottomTab` state: `null` (collapsed) | `'goto'` | `'search'` | `'extract'` | `'transform'`.
 - `selectBottomTab(name)`: sets tab; does not toggle (panel only collapses via the `▼` button at the right of the tab bar).
-- Tab bar contains: **Goto**, **Search**, and a collapse button (`▼`) on the right.
-- Content area (`.bottom-content`, 160 px) renders `GoToPanel` when `bottomTab === 'goto'`, `SearchPanel` when `bottomTab === 'search'`.
+- Tab bar contains: **Goto**, **Search**, **Extract**, **Transform**, and a collapse button (`▼`) on the right.
+- Content area (`.bottom-content`, resizable — see "Resizable panels" below) renders `GoToPanel`, `SearchPanel`, `ExtractPanel`, or `TransformPanel` based on `bottomTab`.
+- A `ResizeHandle` (`orientation="h"`) sits at the top edge of `.bottom-panel`, shown only while `bottomTab` is set (nothing to resize when collapsed).
 
 **Session/stream sort toggles:**
 - `SessionList.js` — `desc` state (default `false` = ascending/oldest first); `▼`/`▲` button in panel header.
 - `StreamList.js` — same pattern; `desc` resets to `false` when the selected session changes.
 
+**Resizable panels (`ResizeHandle.js`, `layout.js`):**
+- `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow").
+- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` — reads/writes a single `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight }`, merged with defaults on load (same pattern as `markers.js`).
+- **Sidebar** (`App.js`): `sidebarWidth` (default 280, clamped 180–600), handle between `.sidebar` and `.main`.
+- **Bottom panel** (`App.js`): `bottomHeight` (default 160, clamped 80–70% of `window.innerHeight`), handle at the top of `.bottom-panel` (only rendered while a tab is open).
+- **Markers panel** (`TrafficView.js`): `markersWidth` (default 240, clamped 150–500), handle between `HexDump`/`HexEditor` and `MarkersPanel` (only rendered while not collapsed); width passed down as a `width` prop to `MarkersPanel`, applied via inline style on `.markers-side`.
+- **Transform panel** (`TransformPanel.js`): `encdecOptionsWidth` (default 160, clamped 100–400, handle between the options column and the input/output column) and `encdecInputHeight` (default 120, clamped 30–2000, handle between the input and output areas).
+- All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins; each resize handler both updates local state and calls `saveLayoutValue`.
+
 **Virtual scroll (`HexDump.js`):**
 - Exports `ROW_HEIGHT = 22`. Constants: `BUFFER = 8` (overdraw rows), `PREFETCH_FRACTION = 0.1`.
-- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`.
+- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`, `onSetMarker`, `onClearMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onViewportChange`, `markers`.
+- Encoding helpers imported from `../format.js` (not defined locally).
 - Flattens all loaded chunks into a flat `rows[]` array: one `{type:'header'}` row + N `{type:'hex'}` rows per chunk.
 - A `ResizeObserver` tracks container height; `onScroll` tracks `scrollTop`. Visible window is `[startIdx, endIdx)`. Inner div height = `rows.length * ROW_HEIGHT`; top/bottom spacer divs fill the rest.
 - **Prefetch trigger** (`scrollend` event): fires `onScrollEnd(1)` when fewer than `rows.length * PREFETCH_FRACTION` rows remain below the viewport; `onScrollEnd(-1)` when fewer remain above.
@@ -315,9 +336,33 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - **Absolute scroll** (`useLayoutEffect([scrollToVersion])`): sets `scrollTop = scrollTo` synchronously before paint. Used by jump-to. `scrollToVersion` must change to trigger even if `scrollTo` value is the same.
 - **Global/local offset**: `HexRow` displays `row.offset` (stream-global byte offset) when `globalOffset` is true, or `row.localOffset` (offset within the chunk, resets to 0 at each chunk start) when false.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
+- **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
 - **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView).
+- **Context menu** (right-click on a hex row or chunk header):
+  - Copy as hex / ASCII / hexdump / base64 — copies chunk bytes (header click) or selection/chunk bytes (row click).
+  - Separator, then (when right-clicking a hex byte and extract props present):
+    - **Set selection (range)** — only when a selection is active; sets both From and To offsets in the Extract tab.
+    - **Set selection start** — sets the From offset in the Extract tab.
+    - **Set selection end** — sets the To offset in the Extract tab.
+  - Separator, then **Set marker** / **Clear marker** — toggles based on whether the byte is already marked.
+
+**Editable hex grid (`HexEditor.js`):**
+- Small, non-virtualized hex/ASCII editor (all rows render directly — no windowing), unlike the read-only `HexDump.js` which is built for large captured-traffic streams. Reuses `HexDump.js`'s exported `ROW_HEIGHT` constant for visual consistency only; otherwise fully independent.
+- Controlled component: `<${HexEditor} bytes=${Uint8Array} onChange=${bytes => ...} readOnly? style? />`.
+- **Cursor model**: `cursor = { index, area }` — `index` is a byte position `0..bytes.length` (an insertion point *before* that byte, like a text cursor), `area` is `'hex'` or `'ascii'`. `pendingNibble` holds a single typed hex character awaiting its pair (shown as a half-entered `hexed-pending` cell); cleared by Backspace, arrow movement, Tab, or clicking elsewhere.
+- **Typing inserts, never overwrites** (this is the "arbitrary insertion/deletion" requirement it was built for):
+  - Hex column: only `[0-9a-fA-F]` accepted (guarded against `Ctrl`/`Cmd`/`Alt` so shortcuts like Ctrl+C aren't swallowed, even though `c`/`d`/`e`/`f` are valid hex chars); two nibbles combine into one inserted byte, cursor advances by one byte.
+  - ASCII column: any single printable keystroke inserts one byte (`charCodeAt(0) & 0xFF`), same modifier guard.
+  - Backspace removes the byte before the cursor (or just cancels a pending nibble); Delete removes the byte at the cursor; both shift subsequent bytes.
+  - Arrow keys move by one byte (Up/Down by one row = 16 bytes); Home/End jump to row start/end, Ctrl+Home/End to buffer start/end; Tab toggles `area` at the same `index`; click on any byte/char cell sets the cursor directly.
+  - Paste: clipboard text is filtered per the active column's rules (hex chars paired up in the hex column; every character mapped to a byte in the ASCII column) and inserted in one `onChange` call.
+- Row layout mirrors `fmtAsHexdump`'s conventions (16 bytes/row, 8-hex-digit offset, `|ascii|` column) via `.hexed-*` CSS classes — deliberately distinct from `HexDump.js`'s `.hex-*` classes so nothing is shared/at risk between the two components.
+- A synthetic trailing cell (`byte === null`) always exists at `bufferLength` so the cursor can be positioned after the last byte, even when the buffer length is an exact multiple of 16 (including empty).
+- `readOnly` prop: every mutating path (hex/ASCII insert, Backspace, Delete, paste) becomes a no-op; navigation (arrows/Home/End/Tab) and click-to-position still work. Used for `TransformPanel`'s output panel so it can reuse the same grid without being editable.
 
 **Chunk loading and sliding buffer (`TrafficView.js`):**
+- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`.
+- `handleSetMarker` / `handleClearMarker` are local (not lifted); `onSetExtractStart/End/Range` are forwarded directly to `HexDump`.
 - `display = {rows, scrollAdjust, adjustVersion, scrollTo, scrollToVersion}` — single state object for atomic render, prevents split-render glitch.
 - `BATCH = 50` chunks fetched per request.
 - Refs: `nextStidRef` (exclusive upper bound of buffer), `prevStidRef` (stid of first chunk in buffer), `hasMoreRef`, `loadingMoreRef`, `generationRef`, `streamRef`, `wsRef` (single WS connection per stream).
@@ -325,10 +370,10 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - **Jump effect** (`useEffect([jumpTo?.version])`): closes old WS, opens fresh one, then:
   - `chunks` unit: `targetStid = jumpTo.value`
   - `chunks-c2s` / `chunks-s2c`: calls `POST /chunk-stid` to resolve per-direction `id` → `stid`
-  - `offset-c2s` / `offset-s2c`: calls `POST /byte-stid` to resolve byte offset → `stid`; also records `targetByteOffset`
+  - `offset-c2s` / `offset-s2c`: calls `POST /byte-stid` to resolve byte offset → `stid`; also records `targetByteOffset` and `targetDirection` (0/1, derived from the unit)
   - Fetches `BATCH` chunks starting at `max(0, targetStid - BATCH/2)`
-  - Scans rows: for byte-offset jumps finds the hex row where `row.offset <= targetByteOffset < row.offset + row.bytes.length`; otherwise finds the header row with `row.stid === targetStid`
-  - Sets `scrollTo` = target row pixel, `scrollToVersion = jumpTo.version`
+  - Scans rows: for byte-offset jumps finds the hex row matching **both** `row.direction === targetDirection` and `row.offset <= targetByteOffset < row.offset + row.bytes.length` (the direction check matters because c2s/s2c offsets both start at 0 independently, so byte ranges collide across directions); otherwise finds the header row with `row.stid === targetStid`
+  - Sets `scrollTo` = target row pixel, `scrollToVersion = jumpTo.version`. Default (Goto/Search jumps) centers the row in the viewport (`targetRowPx - viewHeight/2`); if `jumpTo.align === 'top'` (set only by marker jumps — see `App.js`'s `handleMarkerTabJump`/`handleStreamLoad`), the row is instead placed at the very top of the viewport (`scrollTo = targetRowPx` directly).
 - `handleScrollEnd(scrollDir)` (stable `useCallback([])`):
   - **Forward** (scrollDir=1): fetches next BATCH from `nextStidRef`, appends rows, evicts front half at nearest chunk-header boundary, updates `prevStidRef`, sets negative `scrollAdjust`.
   - **Backward** (scrollDir=-1): fetches `n = prevStidRef - start` chunks before `prevStidRef`, prepends rows, evicts back half, updates `nextStidRef`/`hasMoreRef`, sets positive `scrollAdjust`.
@@ -356,6 +401,71 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - Results list: match count header + scrollable rows showing stream id, direction (coloured), hex offset. Clicking a row calls `onJump({streamId, direction, offset})`.
 - `App.js` wires `onJump` → `handleSearchJump`: finds the stream in `streamList`, switches to it if needed (sets `stream` state), then sets `jumpTo` with unit `offset-c2s` or `offset-s2c`.
 - `streamList` state in `App.js` is populated via `StreamList`'s `onLoad` prop (called after each fetch).
+
+**`format.js` (shared encoding helpers):**
+- `fmtAsRaw(bytes)` — UTF-8 decode (non-fatal).
+- `fmtAsBase64(bytes)` — standard base64 string.
+- `fmtAsHex(bytes)` — lowercase hex string (no separators).
+- `fmtAsAscii(bytes)` — printable ASCII, `.` for non-printable.
+- `fmtAsHexdump(bytes, baseOffset)` — `xxd`-style: `OOOOOOOO  gg gg … gg  gg gg … gg  |ascii|` per 16-byte line.
+- `mergeUint8Arrays(arrays)` — concatenates an array of `Uint8Array`s into one.
+- Imported by `HexDump.js` (context menu copy), `ExtractPanel.js` (extraction encoding), and `transforms.js` (`fmtAsBase64` for the Base64 encode operation). **Must be listed in the `//go:embed` directive in `web/server.go` — any new top-level `.js` file added under `web/` must be added there explicitly.**
+
+**Extract panel (`ExtractPanel.js`):**
+- Props (all controlled from `App.js`): `session`, `stream`, `direction` (string `'0'`/`'1'`), `from` (string), `to` (string), `onDirectionChange`, `onFromChange`, `onToChange`.
+- Local state: `format` (`'raw'`|`'base64'`|`'hex'`|`'hexdump'`), `method` (`'file'`|`'clipboard'`), `working`, `status`.
+- Shows "Select a stream first" placeholder when no stream selected.
+- `parseOffset(s)`: accepts decimal or `0x`/`0X`-prefixed hex; returns `null` on invalid input.
+- `fetchRange(session, stream, dir, fromOffset, toOffset)`: resolves both offsets to stids via parallel `getByteStid` calls, fetches `endStid - startStid + 1` chunks via `openStidStream`, filters by direction, trims to exact byte boundaries.
+- **Extract button is `type="button"` with `onclick` handler** — NOT a form submit. This is required for `showSaveFilePicker` (Chrome/Edge File System Access API): the browser only grants a file-picker dialog from a direct click event, not from a form `submit` event.
+- For file method: `acquireFileHandle(format)` is called **before** `fetchRange` to preserve the transient user activation; Chrome consumes activation on the first relevant `await`.
+- Fallback for browsers without `showSaveFilePicker` (Firefox): uses an anchor-click download; status message notes "no save dialog in this browser".
+- File extensions/MIME: raw → `.bin`/`application/octet-stream`, base64 → `.b64`/`text/plain`, hex → `.hex`/`text/plain`, hexdump → `.txt`/`text/plain`.
+- `App.js` extract state: `extractDir` (useState `'0'`), `extractFrom`, `extractTo` (both useState `''`).
+  - `handleSetExtractStart(direction, offset)`: sets dir+from as `'0x'+hex`, opens extract tab.
+  - `handleSetExtractEnd(direction, offset)`: sets dir+to as `'0x'+hex`, opens extract tab.
+  - `handleSetExtractRange(direction, fromOffset, toOffset)`: sets all three, opens extract tab.
+  - Direction/from/to are always overwritten from the chunk that was right-clicked.
+
+**Transform panel (`TransformPanel.js`, `transforms.js`):**
+- Layout: resizable options column (`.encdec-options`, left) + input/output column (`.encdec-io`, right), split by `ResizeHandle`s — see "Resizable panels" above.
+- **Canonical state is `bytes: Uint8Array`**, regardless of which input view is active:
+  - Text mode: the `<textarea>`'s displayed value is *derived* each render via `new TextDecoder('utf-8', {fatal:false}).decode(bytes)` — never stored back into `bytes` except via its own `oninput` (`setBytes(new TextEncoder().encode(value))`). This means toggling "Hexdump view" off and back on without typing never loses data, even if the decoded text contains `�` (U+FFFD, from invalid UTF-8) — a warning line (`.encdec-warning`) appears near the checkbox when that's the case, since typing while it's shown *would* bake in the loss.
+  - Hexdump mode: `<${HexEditor} bytes=${bytes} onChange=${setBytes} />` operates on `bytes` directly, no text serialization involved.
+- **Steps** (`steps: [{id, op, label, params}]`), built from the `+` button's dropdown menu:
+  - The menu (`algo-menu`) is generated from `transforms.js`'s `ALGORITHM_SECTIONS`; sections can have `subsections` (rendered as a nested indent level) or a flat `algorithms` list.
+  - An algorithm entry whose `op` has no matching `OPERATIONS` registration renders with a `[TODO]` suffix (`.algo-menu-item-todo`) and isn't clickable — this is how unimplemented algorithms (Checksum, Hash, Compression, Encryption — see below) are shown without being selectable.
+  - `addStep(op, label)` seeds `params` from the op's `params` definitions' `default` values.
+  - Step rows are `draggable="true"` (HTML5 DnD) for reordering: `dragIdRef` holds the dragged id, `dragOverId` state highlights the hovered row (`.encdec-step-drag-over`), and `handleDrop` splices the dragged step to the target's index.
+  - **Per-step parameters** (`renderStepParam`): `param.type` is `'number'` (`<input type=number>`, clamped to `min`/`max` via `updateStepParam`), `'boolean'` (checkbox), or `'select'` (`<select>` populated from `param.options: [{value,label}]`) — only `'number'` values get coerced/clamped; boolean/select values pass through as-is.
+- **Execution is manual** (`handleGo`, a "Go" button — not live): runs `bytes` through `steps` in order via `OPERATIONS[step.op].run(current, step.params)`. A thrown error halts the pipeline immediately: `outputBytes = null`, `outputError = "<step label>: <message>"`, shown in red (`.encdec-output-error`) in place of any output. On success, `outputBytes` is set and `outputHexdumpView` is defaulted to `!isPrintable(outputBytes)` (printable = every byte in `0x20–0x7e` or `\t`/`\n`/`\r`) — the checkbox is a normal manual toggle after that, until the next Go.
+- **Output panel** mirrors the input's Hexdump-view checkbox, but its hex view reuses `<${HexEditor} readOnly=${true} />` on `outputBytes` (same grid as the input, not a separate plain-text rendering); its text view is a read-only `<textarea>` derived from `outputBytes` the same way the input's text mode is derived from `bytes`.
+
+**`transforms.js` (operation registry + algorithm catalog):**
+- `OPERATIONS`: a plain object keyed by op id, each entry `{ label, params?, run(bytes, params) }`. `run` returns the transformed `Uint8Array` or throws a plain `Error` with a human-readable message (caught by `TransformPanel`'s `handleGo`).
+- `ALGORITHM_SECTIONS`: catalog grouped into sections — `Basic` (subsections `Encode`/`Decode`), `Encode Number`, `Decode Number`, `Compression` (subsections `Compress`/`Uncompress`, currently empty), `Checksum`, `Encryption` (subsections `Encrypt`/`Decrypt`, currently empty), `Hash`. Each leaf is `{ label, op }`.
+- **`[E]`/`[D]` label prefixing**: `namePrefix(name)` returns `'[E] '`/`'[D] '` for any section/subsection name that **starts with** `"Encode"`/`"Decode"` — this covers both `Basic > Encode/Decode` and the flat `Encode Number`/`Decode Number` sections uniformly, while `Encrypt`/`Decrypt` and `Compress`/`Uncompress` are deliberately excluded (they don't match the `Encode`/`Decode` prefix test). The prefix is baked into the catalog entry's `label` at module-load time, so it automatically appears both in the menu and in step rows (which copy `label` verbatim from the clicked entry) — no separate logic needed in `TransformPanel.js`.
+- Algorithms within each (sub)section are sorted alphabetically by (already-prefixed) `label`.
+- **Implemented operations:**
+  - `hex-encode`/`hex-decode`: `separator` param (`select`: `0x`, `\x`, `,`, `;`, `:`, Space, `\n` — default Space). `0x`/`\x` are per-byte prefixes (`0x48 0x65 ...` / `\x48\x65...`); the rest are plain join characters between byte pairs. Decode strips the selected separator's literal characters (plus any incidental whitespace) before the existing hex-digit-pair parsing/validation.
+  - `base64-encode`/`base64-decode`: `urlSafe` boolean param (default `false`). Encode swaps `+`/`/` for `-`/`_` and strips trailing `=` padding; decode reverses the substitution and restores correct padding (based on length mod 4) before `atob`.
+  - `octal-encode`/`octal-decode`: each byte as 3-digit zero-padded octal, space-separated.
+  - `basen-encode`/`basen-decode`: `base` param (`number`, 2–64, default 64). Arbitrary-base big-integer encoding via `BigInt`; alphabet is the first *N* characters of the standard base64 char ordering (`ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/`); leading zero bytes are preserved as leading zero-symbol characters (same convention as Base58).
+  - `encnum-*`/`decnum-*` (14 types: `Int8`/`UInt8`, `Int16`/`UInt16`/`Int32`/`UInt32`/`Int64`/`UInt64` each big/little endian — see `NUMBER_TYPES`): decode requires the exact byte width for the type (throws otherwise) and outputs the decimal text representation (`-` prefix for negatives) via `DataView`; encode parses decimal text back into the fixed-width binary form, validating it's a plain integer and in range for the type. 64-bit types use `getBigInt64`/`setBigInt64`/`BigInt` throughout to avoid precision loss.
+- **Not yet implemented** (catalogued but no `OPERATIONS` entry, shown as `[TODO]`): `Checksum` (CRC16, CRC32, Adler32), `Hash` (MD2, MD4, MD5, NTLM, SHA1, SHA224, SHA256, SHA384, SHA512, Whirlpool), `Compression` and `Encryption` subsections (no named algorithms yet).
+
+**Markers panel (`MarkersPanel.js`):**
+- Props: `markers[]`, `onRemove`, `onUpdateLabel`, `onJump`, `onImport(markers[])`, `collapsed`, `onToggle`, `width` (px, applied as inline style on `.markers-side`; see "Resizable panels" above — not used when `collapsed`).
+- `collapsed` renders a vertical strip (`◀ Markers`); expanded renders the full side panel.
+- Marker rows: show `[streamId] direction  0xOFFSET` + inline editable label. Click row → `onJump`; `×` → `onRemove`.
+- **Import/export** (bottom bar of expanded panel): `[clipboard ▾] [Import] [Export]` + status line.
+  - File format: deflate-compressed JSON, base64-encoded, extension `.tlstap-markers`. Content is the raw `tlstap-markers` localStorage JSON (`{ version: 1, markers: [{id, session, stream, direction, offset, label?}] }`).
+  - `compress(str)` / `decompress(b64)`: use `CompressionStream`/`DecompressionStream` with `'deflate'` (Chrome 80+, Firefox 113+, Safari 16.4+).
+  - Export to file: `showSaveFilePicker` called **before** `compress()` to preserve user activation; falls back to anchor download.
+  - Import from file: programmatic `<input type="file" accept=".tlstap-markers,.txt">` click (no activation constraint on read).
+  - Import replaces all markers (`onImport` prop wired to `setMarkers` in `App.js`).
+  - `parseImport(text)`: validates JSON has `markers` array with required typed fields; returns `null` on invalid data.
+- `onImport` prop is threaded: `App.js (setMarkers) → TrafficView (onImportMarkers) → MarkersPanel (onImport)`.
 
 **`api.js`:**
 - `openStidStream()` → `{ fetch(sessionId, streamId, start, n), close() }`: persistent WS to `/stid-stream`.

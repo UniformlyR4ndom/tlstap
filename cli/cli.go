@@ -184,6 +184,12 @@ func resolveMuxHandlers(config *proxy.ProxyConfig, configFile *proxy.ConfigFile,
 				return nil, fmt.Errorf("Interceptor '%s' not defined.", iRef)
 			}
 
+			iArgsJson, err := json.Marshal(interceptor.Args)
+			if err != nil {
+				return nil, err
+			}
+			interceptor.ArgsJson = iArgsJson
+
 			interceptors[i] = interceptor
 		}
 

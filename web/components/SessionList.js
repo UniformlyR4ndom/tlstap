@@ -5,14 +5,14 @@ import { getSessions } from '../api.js'
 
 const html = htm.bind(h)
 
-export default function SessionList({ selected, onSelect, refreshKey }) {
+export default function SessionList({ selected, onSelect, refreshKey, onLoad }) {
     const [sessions, setSessions] = useState([])
     const [error,    setError]    = useState(null)
     const [desc,     setDesc]     = useState(false)
 
     useEffect(() => {
         getSessions()
-            .then(data => { setSessions(data); setError(null) })
+            .then(data => { setSessions(data); onLoad?.(data); setError(null) })
             .catch(e => setError(e.message))
     }, [refreshKey])
 

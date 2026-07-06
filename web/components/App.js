@@ -7,30 +7,116 @@ import TrafficView from './TrafficView.js'
 import CombinedView from './CombinedView.js'
 import GoToPanel from './GoToPanel.js'
 import SearchPanel from './SearchPanel.js'
+import ExtractPanel from './ExtractPanel.js'
+import TransformPanel from './TransformPanel.js'
+import ResizeHandle from './ResizeHandle.js'
+import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
+import { loadLayout, saveLayoutValue } from '../layout.js'
 
 const html = htm.bind(h)
+
+function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 export default function App() {
     const [session,      setSession]      = useState(null)
     const [stream,       setStream]       = useState(null)
     const [streamList,   setStreamList]   = useState([])
+    const [sessions,     setSessions]     = useState([])
     const [refreshKey,   setRefreshKey]   = useState(0)
     const [openMenu,     setOpenMenu]     = useState(null)
     const [globalOffset, setGlobalOffset] = useState(true)
     const [viewMode,     setViewMode]     = useState('single')
-    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search'
+    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
     const [jumpTo,       setJumpTo]       = useState(null)
-    const menubarRef = useRef(null)
+    const [markers,      setMarkers]      = useState(() => loadMarkers())
+    const [extractDir,   setExtractDir]   = useState('0')
+    const [extractFrom,  setExtractFrom]  = useState('')
+    const [extractTo,    setExtractTo]    = useState('')
+    const [sidebarWidth, setSidebarWidth] = useState(() => loadLayout().sidebarWidth)
+    const [bottomHeight, setBottomHeight] = useState(() => loadLayout().bottomHeight)
+    const menubarRef     = useRef(null)
+    const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
+
+    function handleSidebarResize(deltaX) {
+        setSidebarWidth(w => {
+            const next = clamp(w + deltaX, 180, 600)
+            saveLayoutValue('sidebarWidth', next)
+            return next
+        })
+    }
+
+    function handleBottomResize(deltaY) {
+        setBottomHeight(h => {
+            const next = clamp(h - deltaY, 80, Math.floor(window.innerHeight * 0.7))
+            saveLayoutValue('bottomHeight', next)
+            return next
+        })
+    }
+
+    useEffect(() => { saveMarkers(markers) }, [markers])
+
+    function addMarker(m) {
+        setMarkers(prev => [...prev, { ...m, id: makeMarkerId() }])
+    }
+    function removeMarker(id) {
+        setMarkers(prev => prev.filter(m => m.id !== id))
+    }
+    function updateMarkerLabel(id, label) {
+        setMarkers(prev => prev.map(m => m.id === id ? { ...m, label } : m))
+    }
 
     function selectBottomTab(name) { setBottomTab(name) }
+
+    function handleSetExtractStart(direction, offset) {
+        setExtractDir(String(direction))
+        setExtractFrom('0x' + offset.toString(16))
+        selectBottomTab('extract')
+    }
+    function handleSetExtractEnd(direction, offset) {
+        setExtractDir(String(direction))
+        setExtractTo('0x' + offset.toString(16))
+        selectBottomTab('extract')
+    }
+    function handleSetExtractRange(direction, fromOffset, toOffset) {
+        setExtractDir(String(direction))
+        setExtractFrom('0x' + fromOffset.toString(16))
+        setExtractTo('0x' + toOffset.toString(16))
+        selectBottomTab('extract')
+    }
     function handleGoTo(args) { setJumpTo(prev => ({ ...args, version: (prev?.version ?? 0) + 1 })) }
+
+    function jumpToOffset(streamObj, direction, offset) {
+        if (stream?.id !== streamObj.id) setStream(streamObj)
+        const unit = direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        setJumpTo(prev => ({ value: offset, unit, version: (prev?.version ?? 0) + 1 }))
+    }
 
     function handleSearchJump({ streamId, direction, offset }) {
         const target = streamList.find(s => s.id === streamId)
         if (!target) return
-        if (stream?.id !== streamId) setStream(target)
-        const unit = direction === 0 ? 'offset-c2s' : 'offset-s2c'
-        setJumpTo(prev => ({ value: offset, unit, version: (prev?.version ?? 0) + 1 }))
+        jumpToOffset(target, direction, offset)
+    }
+
+    function handleMarkerJumpRequest(marker) {
+        handleMarkerTabJump(marker)
+    }
+
+    function handleMarkerTabJump(marker) {
+        const unit = marker.direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        const doJump = (streamObj) => {
+            setStream(streamObj)
+            setJumpTo(prev => ({ value: marker.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
+        }
+        if (session?.id === marker.session) {
+            const target = streamList.find(s => s.id === marker.stream)
+            if (target) { doJump(target); return }
+        }
+        // Different session: switch and defer jump until StreamList loads.
+        const targetSession = sessions.find(s => s.id === marker.session)
+        if (!targetSession) return
+        pendingJumpRef.current = { streamId: marker.stream, direction: marker.direction, offset: marker.offset }
+        setSession(targetSession)
+        setStream(null)
     }
 
     // Close any open menu when clicking outside the menu bar.
@@ -47,8 +133,21 @@ export default function App() {
     function toggleMenu(name) { setOpenMenu(m => m === name ? null : name) }
 
     function selectSession(s) {
+        pendingJumpRef.current = null
         setSession(s)
         setStream(null)
+    }
+
+    function handleStreamLoad(ss) {
+        setStreamList(ss)
+        const pending = pendingJumpRef.current
+        if (!pending) return
+        const target = ss.find(s => s.id === pending.streamId)
+        if (!target) return
+        pendingJumpRef.current = null
+        const unit = pending.direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        setStream(target)
+        setJumpTo(prev => ({ value: pending.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
     }
 
     return html`
@@ -80,38 +179,66 @@ export default function App() {
                 </div>
             </nav>
             <div class="body">
-                <aside class="sidebar">
+                <aside class="sidebar" style=${`width: ${sidebarWidth}px`}>
                     <${SessionList}
                         selected=${session}
                         onSelect=${selectSession}
                         refreshKey=${refreshKey}
+                        onLoad=${setSessions}
                     />
                     <${StreamList}
                         session=${session}
                         selected=${stream}
                         onSelect=${setStream}
-                        onLoad=${setStreamList}
+                        onLoad=${handleStreamLoad}
                     />
                 </aside>
+                <${ResizeHandle} orientation="v" onResize=${handleSidebarResize} />
                 <main class="main">
                     ${viewMode === 'combined'
                         ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} />`
-                        : html`<${TrafficView}  stream=${stream}  globalOffset=${globalOffset} jumpTo=${jumpTo} />`
+                        : html`<${TrafficView}
+                            stream=${stream}
+                            globalOffset=${globalOffset}
+                            jumpTo=${jumpTo}
+                            markers=${markers}
+                            onAddMarker=${addMarker}
+                            onRemoveMarker=${removeMarker}
+                            onUpdateMarkerLabel=${updateMarkerLabel}
+                            onMarkerJumpRequest=${handleMarkerJumpRequest}
+                            onImportMarkers=${setMarkers}
+                            onSetExtractStart=${handleSetExtractStart}
+                            onSetExtractEnd=${handleSetExtractEnd}
+                            onSetExtractRange=${handleSetExtractRange}
+                          />`
                     }
                 </main>
             </div>
             <div class="bottom-panel">
+                ${bottomTab && html`<${ResizeHandle} orientation="h" onResize=${handleBottomResize} />`}
                 <div class="bottom-tabs">
-                    <div class=${'bottom-tab' + (bottomTab === 'goto'   ? ' active' : '')} onclick=${() => selectBottomTab('goto')}>Goto</div>
-                    <div class=${'bottom-tab' + (bottomTab === 'search' ? ' active' : '')} onclick=${() => selectBottomTab('search')}>Search</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'goto'    ? ' active' : '')} onclick=${() => selectBottomTab('goto')}>Goto</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'search'  ? ' active' : '')} onclick=${() => selectBottomTab('search')}>Search</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'extract'   ? ' active' : '')} onclick=${() => selectBottomTab('extract')}>Extract</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'transform' ? ' active' : '')} onclick=${() => selectBottomTab('transform')}>Transform</div>
                     ${bottomTab && html`<div class="bottom-collapse" onclick=${() => setBottomTab(null)} title="Collapse">▼</div>`}
                 </div>
                 ${bottomTab && html`
-                    <div class="bottom-content">
-                        ${bottomTab === 'goto'   && html`<${GoToPanel}    stream=${stream}   onGoTo=${handleGoTo} />`}
-                        ${bottomTab === 'search' && html`<${SearchPanel} session=${session} stream=${stream} onJump=${handleSearchJump} />`}
-                    </div>
-                `}
+                    <div class="bottom-content" style=${`height: ${bottomHeight}px`}>
+                        ${bottomTab === 'goto'    && html`<${GoToPanel}     stream=${stream}   onGoTo=${handleGoTo} />`}
+                        ${bottomTab === 'search'  && html`<${SearchPanel}   session=${session} stream=${stream} onJump=${handleSearchJump} />`}
+                        ${bottomTab === 'extract' && html`<${ExtractPanel}
+                            session=${session}
+                            stream=${stream}
+                            direction=${extractDir}
+                            from=${extractFrom}
+                            to=${extractTo}
+                            onDirectionChange=${setExtractDir}
+                            onFromChange=${setExtractFrom}
+                            onToChange=${setExtractTo}
+                        />`}
+                        ${bottomTab === 'transform' && html`<${TransformPanel} />`}
+                    </div>`}
             </div>
         </div>
     `
