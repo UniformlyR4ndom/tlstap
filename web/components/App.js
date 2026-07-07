@@ -25,6 +25,7 @@ export default function App() {
     const [refreshKey,   setRefreshKey]   = useState(0)
     const [openMenu,     setOpenMenu]     = useState(null)
     const [globalOffset, setGlobalOffset] = useState(true)
+    const [autoRefresh,  setAutoRefresh]  = useState(false)
     const [viewMode,     setViewMode]     = useState('single')
     const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
     const [jumpTo,       setJumpTo]       = useState(null)
@@ -54,6 +55,12 @@ export default function App() {
     }
 
     useEffect(() => { saveMarkers(markers) }, [markers])
+
+    useEffect(() => {
+        if (!autoRefresh) return
+        const id = setInterval(() => setRefreshKey(k => k + 1), 1000)
+        return () => clearInterval(id)
+    }, [autoRefresh])
 
     function addMarker(m) {
         setMarkers(prev => [...prev, { ...m, id: makeMarkerId() }])
@@ -154,7 +161,7 @@ export default function App() {
         <div class="layout">
             <header class="header">
                 <span class="title">tlstap · Traffic Analyzer</span>
-                <button class="btn" onclick=${() => setRefreshKey(k => k + 1)}>↺ Refresh</button>
+                <button class="btn btn-refresh" onclick=${() => setRefreshKey(k => k + 1)} title="Refresh">↺</button>
             </header>
             <nav class="menubar" ref=${menubarRef}>
                 <div class=${'menu' + (openMenu === 'view' ? ' open' : '')}>
@@ -174,6 +181,11 @@ export default function App() {
                                 <span class="menu-check">${viewMode === 'combined' ? '✓' : ''}</span>
                                 Combined streams
                             </div>
+                            <div class="menu-sep" />
+                            <div class="menu-item" onclick=${() => { setAutoRefresh(v => !v); setOpenMenu(null) }}>
+                                <span class="menu-check">${autoRefresh ? '✓' : ''}</span>
+                                Auto-Refresh
+                            </div>
                         </div>
                     `}
                 </div>
@@ -191,16 +203,18 @@ export default function App() {
                         selected=${stream}
                         onSelect=${setStream}
                         onLoad=${handleStreamLoad}
+                        refreshKey=${refreshKey}
                     />
                 </aside>
                 <${ResizeHandle} orientation="v" onResize=${handleSidebarResize} />
                 <main class="main">
                     ${viewMode === 'combined'
-                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} />`
+                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} />`
                         : html`<${TrafficView}
                             stream=${stream}
                             globalOffset=${globalOffset}
                             jumpTo=${jumpTo}
+                            refreshKey=${refreshKey}
                             markers=${markers}
                             onAddMarker=${addMarker}
                             onRemoveMarker=${removeMarker}

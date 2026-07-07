@@ -7,8 +7,15 @@ import HexDump, { ROW_HEIGHT } from './HexDump.js'
 const html = htm.bind(h)
 
 const BATCH = 50
+const MAX_BUFFERED_CHUNKS = BATCH * 2
 
-export default function CombinedView({ session, globalOffset }) {
+function countChunks(rows) {
+    let n = 0
+    for (const row of rows) if (row.type === 'header') n++
+    return n
+}
+
+export default function CombinedView({ session, globalOffset, refreshKey }) {
     const [display,    setDisplay] = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
     const [loading,    setLoading] = useState(false)
     const [error,      setError]   = useState(null)
@@ -20,7 +27,10 @@ export default function CombinedView({ session, globalOffset }) {
     const generationRef  = useRef(0)
     const sessionRef     = useRef(session)
     const wsRef          = useRef(null)
+    const displayRef     = useRef(display)
+    const hasMountedRef  = useRef(false)
     useEffect(() => { sessionRef.current = session }, [session])
+    useEffect(() => { displayRef.current = display }, [display])
 
     useEffect(() => {
         if (!session) {
@@ -68,6 +78,45 @@ export default function CombinedView({ session, globalOffset }) {
             wsRef.current = null
         }
     }, [session?.id])
+
+    // Refresh — tops up the buffer with newly available chunks, if there's room.
+    // Never evicts and never adjusts scroll; only appends to the tail.
+    useEffect(() => {
+        if (!hasMountedRef.current) { hasMountedRef.current = true; return }
+
+        const s = sessionRef.current
+        if (!s) return
+        if (loadingMoreRef.current) return
+
+        const room = MAX_BUFFERED_CHUNKS - countChunks(displayRef.current.rows)
+        if (room <= 0) return
+
+        const capturedGen = generationRef.current
+        const capturedWs  = wsRef.current
+        if (!capturedWs) return
+
+        loadingMoreRef.current = true
+        setLoading(true)
+
+        ;(async () => {
+            try {
+                const chunks = await capturedWs.fetch(s.id, lastSgidRef.current + 1, room)
+                if (generationRef.current !== capturedGen) return
+                if (chunks.length === 0) return
+
+                const newChunkRows = buildRows(chunks, s.start)
+                lastSgidRef.current = chunks[chunks.length - 1].sgid
+                hasMoreRef.current  = chunks.length === room
+
+                setDisplay(prev => ({ ...prev, rows: [...prev.rows, ...newChunkRows] }))
+            } catch (e) {
+                if (generationRef.current === capturedGen) setError(e.message)
+            } finally {
+                loadingMoreRef.current = false
+                if (generationRef.current === capturedGen) setLoading(false)
+            }
+        })()
+    }, [refreshKey])
 
     const handleScrollEnd = useCallback(async (scrollDir) => {
         const goingForward = scrollDir === 1

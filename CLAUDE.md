@@ -300,10 +300,15 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 **Layout:** Header bar (title + refresh button) → menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel.
 
 **Menu bar (`App.js`, `index.html`):**
-- `App.js` owns `openMenu` (null | `'view'`) and `globalOffset` (bool, default `true`).
+- `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), and `autoRefresh` (bool, default `false`).
 - A `mousedown` listener on `document` (active only while a menu is open) closes the menu when clicking outside the `.menubar` element.
-- Currently one menu: **View** → **Global offset** toggle. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
+- Currently one menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), and **Auto-Refresh** toggle, each a separate separator-delimited group. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
 - `globalOffset` is passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` → `HexRow`.
+
+**Refresh (`App.js`):**
+- The header's `↺` button (`.btn-refresh` — icon-only, ~34×30px, no label) increments `refreshKey` (a plain counter) on click.
+- `refreshKey` is threaded into `SessionList`, `StreamList`, `TrafficView`, and `CombinedView`; each re-fetches whatever it owns when the value changes (see their respective sections below).
+- **Auto-Refresh** (View menu toggle): while `autoRefresh` is true, a `setInterval` in `App.js` calls `setRefreshKey(k => k + 1)` every 1000ms — i.e. it's just a timer clicking the same button; no separate code path. Interval is cleared on toggle-off/unmount.
 
 **Bottom panel (`App.js`):**
 - `bottomTab` state: `null` (collapsed) | `'goto'` | `'search'` | `'extract'` | `'transform'`.
@@ -314,7 +319,11 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 
 **Session/stream sort toggles:**
 - `SessionList.js` — `desc` state (default `false` = ascending/oldest first); `▼`/`▲` button in panel header.
-- `StreamList.js` — same pattern; `desc` resets to `false` when the selected session changes.
+- `StreamList.js` — same pattern; `desc` resets to `false` when the selected session changes (its own effect, kept separate from the fetch effect so a refresh doesn't reset sort order).
+- Both `SessionList.js` and `StreamList.js` re-fetch (`getSessions()` / `getStreams()`) whenever `refreshKey` changes, in addition to their own natural triggers (mount / session change) — this is what makes the Refresh button pick up newly-initiated streams and updated end-times/byte-counts in the sidebar.
+
+**Duration formatting:**
+- `fmtDuration(start, end)` (duplicated in `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh/Auto-Refresh) naturally advance this since it's computed fresh each render.
 
 **Resizable panels (`ResizeHandle.js`, `layout.js`):**
 - `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow").
@@ -380,6 +389,13 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `generationRef` increments on each stream change or jump; captured at async start and checked after every `await` to abort stale fetches.
 - `findChunkBoundaryNearHalf(rows, fallback)`: scans forward from midpoint for a `header` row, falls back to scanning backward.
 - `buildRows(chunks, streamStart)`: each hex row carries both `offset` (global stream byte offset) and `localOffset` (byte offset within the chunk).
+
+**Refresh top-up (`TrafficView.js`, mirrored in `CombinedView.js`):**
+- `MAX_BUFFERED_CHUNKS = BATCH * 2` (100) is a soft cap on how many chunks the refresh path is allowed to hold in the buffer at once; `countChunks(rows)` counts `header` rows to measure current occupancy against it.
+- A `useEffect` keyed on `refreshKey` (guarded by `hasMountedRef` so the initial mount is a no-op) does the top-up: skip if no stream selected, the stream is closed (`stream.end` set — closed streams can't have new data), a scroll-triggered load is already in flight (`loadingMoreRef.current`), or the buffer has no spare room (`room = MAX_BUFFERED_CHUNKS - countChunks(...) <= 0`, checked via a `displayRef` mirror of `display` so the effect doesn't need `display` in its deps). Otherwise it fetches exactly `room` chunks from `nextStidRef.current` onward.
+- Unlike `handleScrollEnd`, this path **never evicts and never touches `scrollAdjust`/`adjustVersion`** — new rows are appended straight to the end of `display.rows`. Since virtualization only cares about total row count, appending below the viewport doesn't move anything already on screen; this is what makes Refresh/Auto-Refresh visually silent when new data isn't currently visible. Once the cap is hit, top-up goes inert until the user scrolls forward (which evicts via the normal path and frees up room).
+- Same `generationRef`/`loadingMoreRef` race-safety pattern as `handleScrollEnd`.
+- `CombinedView.js` implements the identical mechanism keyed on `session` (no `end` field, so no closed-check) and `lastSgidRef.current + 1` in place of `nextStidRef.current`.
 
 **Goto panel (`GoToPanel.js`):**
 - Text input (accepts decimal or `0x`-prefixed hex).

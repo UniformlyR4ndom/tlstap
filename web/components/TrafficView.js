@@ -10,10 +10,17 @@ import { loadLayout, saveLayoutValue } from '../layout.js'
 const html = htm.bind(h)
 
 const BATCH = 50
+const MAX_BUFFERED_CHUNKS = BATCH * 2
 
 function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
-export default function TrafficView({ stream, globalOffset, jumpTo, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
+function countChunks(rows) {
+    let n = 0
+    for (const row of rows) if (row.type === 'header') n++
+    return n
+}
+
+export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
     const [display,    setDisplay]    = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading,    setLoading]    = useState(false)
     const [error,      setError]      = useState(null)
@@ -39,7 +46,10 @@ export default function TrafficView({ stream, globalOffset, jumpTo, markers, onA
     const generationRef  = useRef(0)
     const streamRef      = useRef(stream)
     const wsRef          = useRef(null)
+    const displayRef     = useRef(display)
+    const hasMountedRef  = useRef(false)
     useEffect(() => { streamRef.current = stream }, [stream])
+    useEffect(() => { displayRef.current = display }, [display])
 
     // Initial load — runs whenever the selected stream changes.
     useEffect(() => {
@@ -154,6 +164,45 @@ export default function TrafficView({ stream, globalOffset, jumpTo, markers, onA
             }
         })()
     }, [jumpTo?.version])
+
+    // Refresh — tops up the buffer with newly available chunks, if there's room.
+    // Never evicts and never adjusts scroll; only appends to the tail.
+    useEffect(() => {
+        if (!hasMountedRef.current) { hasMountedRef.current = true; return }
+
+        const s = streamRef.current
+        if (!s || s.end) return
+        if (loadingMoreRef.current) return
+
+        const room = MAX_BUFFERED_CHUNKS - countChunks(displayRef.current.rows)
+        if (room <= 0) return
+
+        const capturedGen = generationRef.current
+        const capturedWs  = wsRef.current
+        if (!capturedWs) return
+
+        loadingMoreRef.current = true
+        setLoading(true)
+
+        ;(async () => {
+            try {
+                const chunks = await capturedWs.fetch(s.session, s.id, nextStidRef.current, room)
+                if (generationRef.current !== capturedGen) return
+                if (chunks.length === 0) return
+
+                const newChunkRows = buildRows(chunks, s.start)
+                nextStidRef.current = chunks[chunks.length - 1].stid + 1
+                hasMoreRef.current  = chunks.length === room
+
+                setDisplay(prev => ({ ...prev, rows: [...prev.rows, ...newChunkRows] }))
+            } catch (e) {
+                if (generationRef.current === capturedGen) setError(e.message)
+            } finally {
+                loadingMoreRef.current = false
+                if (generationRef.current === capturedGen) setLoading(false)
+            }
+        })()
+    }, [refreshKey])
 
     // Stable callback — reads all mutable state via refs.
     const handleScrollEnd = useCallback(async (scrollDir) => {
@@ -337,9 +386,10 @@ function fmtBytes(n) {
 }
 
 function fmtDuration(start, end) {
-    if (!end) return 'ongoing'
-    const d = end - start
-    if (d < 1000)  return `${d}ms`
-    if (d < 60000) return `${(d / 1000).toFixed(2)}s`
-    return `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+    const d = (end || Date.now()) - start
+    let s
+    if (d < 1000)       s = `${d}ms`
+    else if (d < 60000) s = `${(d / 1000).toFixed(2)}s`
+    else                s = `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+    return end ? s : `${s} (ongoing)`
 }

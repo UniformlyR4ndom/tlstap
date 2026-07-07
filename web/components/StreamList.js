@@ -5,15 +5,16 @@ import { getStreams } from '../api.js'
 
 const html = htm.bind(h)
 
-export default function StreamList({ session, selected, onSelect, onLoad }) {
+export default function StreamList({ session, selected, onSelect, onLoad, refreshKey }) {
     const [streams, setStreams] = useState([])
     const [desc,    setDesc]   = useState(false)
 
     useEffect(() => {
         if (!session) { setStreams([]); onLoad?.([]); return }
-        setDesc(false)
         getStreams(session.id).then(ss => { setStreams(ss); onLoad?.(ss) }).catch(() => { setStreams([]); onLoad?.([]) })
-    }, [session?.id])
+    }, [session?.id, refreshKey])
+
+    useEffect(() => { setDesc(false) }, [session?.id])
 
     const sorted = desc ? [...streams].reverse() : streams
 
@@ -46,9 +47,10 @@ export default function StreamList({ session, selected, onSelect, onLoad }) {
 }
 
 function fmtDuration(start, end) {
-    if (!end) return 'ongoing'
-    const d = end - start
-    if (d < 1000) return `${d}ms`
-    if (d < 60000) return `${(d / 1000).toFixed(2)}s`
-    return `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+    const d = (end || Date.now()) - start
+    let s
+    if (d < 1000) s = `${d}ms`
+    else if (d < 60000) s = `${(d / 1000).toFixed(2)}s`
+    else s = `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+    return end ? s : `${s} (ongoing)`
 }
