@@ -179,6 +179,11 @@ function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength })
     if (rowOffset + bytes.length === bufferLength && bytes.length < ROW_BYTES) {
         hexCells.push(renderHexCell(bufferLength, null, cursor, pendingNibble))
     }
+    // Pad short rows (only possible on the last row) out to a fixed cell count, so the ASCII
+    // column stays aligned across rows instead of creeping left when the hex column shrinks.
+    while (hexCells.length < ROW_BYTES) {
+        hexCells.push(renderFillerCell(hexCells.length))
+    }
 
     const asciiCells = []
     for (let i = 0; i < bytes.length; i++) {
@@ -202,6 +207,12 @@ function renderHexCell(index, byte, cursor, pendingNibble) {
     const cls = ['hexed-byte', isCursor ? 'hexed-cursor' : null, isCursor && pendingNibble !== null ? 'hexed-pending' : null]
         .filter(Boolean).join(' ')
     return html`<span key=${index} data-index=${index} data-area="hex" class=${cls}> ${display}</span>`
+}
+
+// Purely cosmetic width-matching for padded-out rows — deliberately has no data-index/data-area
+// so it's inert (not clickable, never matches the cursor), unlike a real/insertion-point cell.
+function renderFillerCell(key) {
+    return html`<span key=${'fill-' + key} class="hexed-byte">   </span>`
 }
 
 function renderAsciiCell(index, byte, cursor) {

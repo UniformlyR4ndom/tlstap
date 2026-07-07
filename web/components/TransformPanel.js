@@ -100,13 +100,15 @@ export default function TransformPanel() {
         setHexdumpView(e.target.checked)
     }
 
-    function handleGo() {
+    // Steps normally run synchronously, but a step's run() may return a Promise (e.g. the
+    // Compression operations, which are stream-based) — awaiting is a no-op for plain values.
+    async function handleGo() {
         let current = bytes
         for (const step of steps) {
             const def = OPERATIONS[step.op]
             if (!def) continue
             try {
-                current = def.run(current, step.params)
+                current = await def.run(current, step.params)
             } catch (err) {
                 setOutputBytes(null)
                 setOutputError(`${step.label}: ${err.message}`)
@@ -191,6 +193,19 @@ export default function TransformPanel() {
                 >
                     ${p.options.map(o => html`<option value=${o.value}>${o.label}</option>`)}
                 </select>
+            `
+        }
+        if (p.type === 'text') {
+            return html`
+                <input
+                    key=${p.key}
+                    type="text"
+                    class="encdec-step-param"
+                    title=${p.label}
+                    placeholder=${p.label}
+                    value=${s.params[p.key]}
+                    onInput=${e => updateStepParam(s.id, p.key, e.target.value, p)}
+                />
             `
         }
         return html`
