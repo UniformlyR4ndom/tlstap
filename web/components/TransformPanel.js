@@ -4,11 +4,25 @@ import htm from 'htm'
 import ResizeHandle from './ResizeHandle.js'
 import HexEditor from './HexEditor.js'
 import { loadLayout, saveLayoutValue } from '../layout.js'
-import { OPERATIONS, ALGORITHM_SECTIONS } from '../transforms.js'
+import { OPERATIONS, ALGORITHM_SECTIONS, sectionPrefix } from '../transforms.js'
+import { fmtAsHex } from '../format.js'
 
 const html = htm.bind(h)
 
 function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
+
+// Plain hex text -> bytes, for the Hex view. Distinct from transforms/basic.js's hex-decode
+// operation (which has a configurable separator param for the step pipeline) — this is a
+// simpler, fixed-format decode for the base view mode. Tolerates incidental whitespace so
+// pasted/pre-formatted hex still works; anything else invalid throws.
+function hexTextToBytes(text) {
+    const cleaned = text.replace(/\s+/g, '')
+    if (cleaned.length % 2 !== 0) throw new Error('odd number of hex digits')
+    if (!/^[0-9a-fA-F]*$/.test(cleaned)) throw new Error('invalid hex digit')
+    const out = new Uint8Array(cleaned.length / 2)
+    for (let i = 0; i < cleaned.length; i += 2) out[i / 2] = parseInt(cleaned.slice(i, i + 2), 16)
+    return out
+}
 
 // Bytes are "printable" (safe to default to the raw text view) if every byte is a
 // printable ASCII character or common whitespace; anything else defaults to hex view.
@@ -27,15 +41,23 @@ export default function TransformPanel() {
     // display from this (decode-on-render) rather than storing its own copy, so
     // toggling views never loses data unless the user actively edits lossy text.
     const [bytes, setBytes] = useState(() => new Uint8Array(0))
-    const [hexdumpView, setHexdumpView] = useState(false)
+    // 'raw' | 'hex' | 'hexdump'
+    const [inputView, setInputView] = useState('raw')
+    const [outputView, setOutputView] = useState('raw')
+    // Buffer for the input Hex view only: holds exactly what was typed, since hex decoding can
+    // fail on incomplete input (e.g. an odd number of digits mid-keystroke) — unlike Raw view,
+    // whose UTF-8 encode/decode always succeeds and can therefore be derived from `bytes` on
+    // every render. `bytes` is only updated from this buffer when it currently parses as valid
+    // hex; resynced from `bytes` whenever the view switches into 'hex'.
+    const [hexText, setHexText] = useState('')
     const [optionsWidth, setOptionsWidth] = useState(() => loadLayout().encdecOptionsWidth)
     const [inputHeight, setInputHeight] = useState(() => loadLayout().encdecInputHeight)
     const [steps, setSteps] = useState([])
     const [menuOpen, setMenuOpen] = useState(false)
+    const [collapsedSections, setCollapsedSections] = useState(() => new Set(ALGORITHM_SECTIONS.map(s => s.name)))
     const [dragOverId, setDragOverId] = useState(null)
     const [outputBytes, setOutputBytes] = useState(null)
     const [outputError, setOutputError] = useState(null)
-    const [outputHexdumpView, setOutputHexdumpView] = useState(false)
     const toolbarRef = useRef(null)
     const dragIdRef = useRef(null)
 
@@ -96,14 +118,48 @@ export default function TransformPanel() {
         setMenuOpen(v => !v)
     }
 
-    function handleHexdumpViewToggle(e) {
-        setHexdumpView(e.target.checked)
+    function toggleSection(name) {
+        setCollapsedSections(prev => {
+            const next = new Set(prev)
+            if (next.has(name)) next.delete(name)
+            else next.add(name)
+            return next
+        })
+    }
+
+    // Resync the Hex-view buffer from the canonical bytes only when entering the view — this
+    // is what makes leaving-and-returning discard any stale/invalid uncommitted text rather
+    // than trying to preserve it.
+    function handleInputViewChange(e) {
+        const next = e.target.value
+        if (next === 'hex' && inputView !== 'hex') setHexText(fmtAsHex(bytes))
+        setInputView(next)
+    }
+
+    function handleHexInput(e) {
+        const text = e.target.value
+        setHexText(text)
+        try {
+            setBytes(hexTextToBytes(text))
+        } catch {
+            // Left as typed; not yet valid hex. No live warning (would fire on every other
+            // keystroke) — handleGo() re-validates and surfaces an error there instead.
+        }
     }
 
     // Steps normally run synchronously, but a step's run() may return a Promise (e.g. the
     // Compression operations, which are stream-based) — awaiting is a no-op for plain values.
     async function handleGo() {
         let current = bytes
+        if (inputView === 'hex') {
+            try {
+                current = hexTextToBytes(hexText)
+            } catch (err) {
+                setOutputBytes(null)
+                setOutputError(`Input (Hex view): ${err.message}`)
+                return
+            }
+        }
         for (const step of steps) {
             const def = OPERATIONS[step.op]
             if (!def) continue
@@ -117,7 +173,7 @@ export default function TransformPanel() {
         }
         setOutputError(null)
         setOutputBytes(current)
-        setOutputHexdumpView(!isPrintable(current))
+        setOutputView(isPrintable(current) ? 'raw' : 'hexdump')
     }
 
     // Decoding is non-fatal (invalid UTF-8 becomes U+FFFD) and only used for display/typing
@@ -161,12 +217,17 @@ export default function TransformPanel() {
         })
     }
 
-    function renderAlgoItem(entry) {
+    // `prefix` (from sectionPrefix(), based on the enclosing section/subsection name) is
+    // applied only to the step's stored label, not to what's shown here in the menu itself —
+    // the [E]/[D] marking is meant to disambiguate steps once they're in the chain, not to
+    // clutter the selection list where the Encode/Decode grouping is already visible from
+    // the section headers.
+    function renderAlgoItem(entry, prefix) {
         const def = OPERATIONS[entry.op]
         if (!def) {
             return html`<div class="algo-menu-item algo-menu-item-todo" key=${entry.label}>${entry.label} [TODO]</div>`
         }
-        return html`<div class="algo-menu-item" key=${entry.label} onClick=${() => { addStep(entry.op, entry.label); setMenuOpen(false) }}>${entry.label}</div>`
+        return html`<div class="algo-menu-item" key=${entry.label} onClick=${() => { addStep(entry.op, (prefix ?? '') + entry.label); setMenuOpen(false) }}>${entry.label}</div>`
     }
 
     function renderStepParam(s, p) {
@@ -229,20 +290,25 @@ export default function TransformPanel() {
                     <button class="btn" onclick=${handleAddClick} title="Add transform step">+</button>
                     ${menuOpen && html`
                         <div class="algo-menu">
-                            ${ALGORITHM_SECTIONS.map(section => html`
-                                <div class="algo-menu-section" key=${section.name}>
-                                    <div class="algo-menu-section-label">${section.name}</div>
-                                    ${section.subsections
-                                        ? section.subsections.map(sub => html`
-                                            <div class="algo-menu-subsection" key=${sub.name}>
-                                                <div class="algo-menu-subsection-label">${sub.name}</div>
-                                                ${sub.algorithms.map(renderAlgoItem)}
-                                            </div>
-                                        `)
-                                        : section.algorithms.map(renderAlgoItem)
-                                    }
-                                </div>
-                            `)}
+                            ${ALGORITHM_SECTIONS.map(section => {
+                                const collapsed = collapsedSections.has(section.name)
+                                return html`
+                                    <div class="algo-menu-section" key=${section.name}>
+                                        <div class="algo-menu-section-label" onClick=${() => toggleSection(section.name)}>
+                                            <span class="algo-menu-triangle">${collapsed ? '▶' : '▼'}</span>${section.name}
+                                        </div>
+                                        ${!collapsed && (section.subsections
+                                            ? section.subsections.map(sub => html`
+                                                <div class="algo-menu-subsection" key=${sub.name}>
+                                                    <div class="algo-menu-subsection-label">${sub.name}</div>
+                                                    ${sub.algorithms.map(a => renderAlgoItem(a, sectionPrefix(sub.name)))}
+                                                </div>
+                                            `)
+                                            : section.algorithms.map(a => renderAlgoItem(a, sectionPrefix(section.name)))
+                                        )}
+                                    </div>
+                                `
+                            })}
                         </div>
                     `}
                 </div>
@@ -269,45 +335,62 @@ export default function TransformPanel() {
             <${ResizeHandle} orientation="v" onResize=${handleOptionsResize} />
             <div class="encdec-io">
                 <div class="encdec-input-toolbar">
-                    <label class="encdec-checkbox-label">
-                        <input type="checkbox" checked=${hexdumpView} onchange=${handleHexdumpViewToggle} />
-                        Hexdump view
+                    <label class="encdec-view-label">
+                        View
+                        <select class="encdec-view-select" value=${inputView} onChange=${handleInputViewChange}>
+                            <option value="raw">Raw</option>
+                            <option value="hex">Hex</option>
+                            <option value="hexdump">Hexdump</option>
+                        </select>
                     </label>
-                    ${!hexdumpView && hasReplacementChars && html`
-                        <span class="encdec-warning" title="Some bytes aren't valid UTF-8 and are shown as �. Editing this text will bake that in when switching back to Hexdump view.">
+                    ${inputView === 'raw' && hasReplacementChars && html`
+                        <span class="encdec-warning" title="Some bytes aren't valid UTF-8 and are shown as �. Editing this text will bake that in when switching to Hex or Hexdump view.">
                             ⚠ contains replacement characters
                         </span>
                     `}
                 </div>
-                ${hexdumpView
+                ${inputView === 'hexdump'
                     ? html`<${HexEditor} bytes=${bytes} onChange=${setBytes} style=${`flex: 0 1 ${inputHeight}px`} />`
-                    : html`<textarea
-                        class="encdec-textarea encdec-input"
-                        placeholder="Input…"
-                        spellcheck="false"
-                        value=${decodedText}
-                        oninput=${e => setBytes(new TextEncoder().encode(e.target.value))}
-                        style=${`flex: 0 1 ${inputHeight}px`}
-                    />`
+                    : inputView === 'hex'
+                        ? html`<textarea
+                            class="encdec-textarea encdec-input"
+                            placeholder="Input…"
+                            spellcheck="false"
+                            value=${hexText}
+                            oninput=${handleHexInput}
+                            style=${`flex: 0 1 ${inputHeight}px`}
+                        />`
+                        : html`<textarea
+                            class="encdec-textarea encdec-input"
+                            placeholder="Input…"
+                            spellcheck="false"
+                            value=${decodedText}
+                            oninput=${e => setBytes(new TextEncoder().encode(e.target.value))}
+                            style=${`flex: 0 1 ${inputHeight}px`}
+                        />`
                 }
                 <${ResizeHandle} orientation="h" onResize=${handleInputResize} />
                 <div class="encdec-output-toolbar">
-                    <label class="encdec-checkbox-label">
-                        <input type="checkbox" checked=${outputHexdumpView} onchange=${e => setOutputHexdumpView(e.target.checked)} />
-                        Hexdump view
+                    <label class="encdec-view-label">
+                        View
+                        <select class="encdec-view-select" value=${outputView} onChange=${e => setOutputView(e.target.value)}>
+                            <option value="raw">Raw</option>
+                            <option value="hex">Hex</option>
+                            <option value="hexdump">Hexdump</option>
+                        </select>
                     </label>
                     <button class="btn encdec-go-btn" onclick=${handleGo}>Go</button>
                 </div>
                 ${outputError
                     ? html`<div class="encdec-output-error">${outputError}</div>`
-                    : outputHexdumpView
+                    : outputView === 'hexdump'
                         ? html`<${HexEditor} bytes=${outputBytes ?? new Uint8Array(0)} onChange=${() => {}} readOnly=${true} />`
                         : html`<textarea
                             class="encdec-textarea encdec-output"
                             placeholder="Output"
                             spellcheck="false"
                             readonly
-                            value=${decodedOutputText}
+                            value=${outputView === 'hex' ? fmtAsHex(outputBytes ?? new Uint8Array(0)) : decodedOutputText}
                         />`
                 }
             </div>

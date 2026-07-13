@@ -2,6 +2,7 @@ import * as basic from './transforms/basic.js'
 import * as numbers from './transforms/numbers.js'
 import * as compression from './transforms/compression.js'
 import * as zip from './transforms/zip.js'
+import * as hash from './transforms/hash.js'
 
 // Registry of implemented transform operations, keyed by the op id referenced from
 // ALGORITHM_SECTIONS below. An algorithm catalog entry with no matching registry entry
@@ -11,22 +12,26 @@ export const OPERATIONS = {
     ...numbers.OPERATIONS,
     ...compression.OPERATIONS,
     ...zip.OPERATIONS,
+    ...hash.OPERATIONS,
 }
 
-// Sections/subsections whose name starts with "Encode"/"Decode" get a label prefix (this
-// covers both the Basic > Encode/Decode subsections and the flat "Encode Number"/"Decode
-// Number" sections) — Encrypt/Decrypt and Compress/Uncompress are conceptually similar but
-// weren't asked to be marked, so they're deliberately excluded by not matching the prefix.
-function namePrefix(name) {
+// Sections/subsections whose name starts with "Encode"/"Decode" get a label prefix once an
+// algorithm is added to the step chain (this covers both the Basic > Encode/Decode
+// subsections and the flat "Encode Number"/"Decode Number" sections) — Encrypt/Decrypt and
+// Compress/Uncompress are conceptually similar but weren't asked to be marked, so they're
+// deliberately excluded by not matching the prefix. Exported so TransformPanel.js can apply
+// it only to step labels, not to this selection menu's catalog entries.
+export function sectionPrefix(name) {
     if (name.startsWith('Encode')) return '[E] '
     if (name.startsWith('Decode')) return '[D] '
     return null
 }
 
-function prefixAndSort(name, algorithms) {
-    const prefix = namePrefix(name)
-    const prefixed = prefix ? algorithms.map(a => ({ ...a, label: prefix + a.label })) : algorithms
-    return [...prefixed].sort((a, b) => a.label.localeCompare(b.label))
+// Sorting only needs the plain label: every entry in a given (sub)section would receive the
+// same prefix (if any) once added as a step, so applying one never changes their relative
+// order — no need to prefix before sorting.
+function sortAlgorithms(algorithms) {
+    return [...algorithms].sort((a, b) => a.label.localeCompare(b.label))
 }
 
 // Catalog of selectable algorithms, grouped by UI section. This grouping is purely a
@@ -53,15 +58,10 @@ export const ALGORITHM_SECTIONS = [
         { name: 'Encrypt', algorithms: [] },
         { name: 'Decrypt', algorithms: [] },
     ]},
-    { name: 'Hash', algorithms: [
-        { label: 'MD5', op: 'md5' }, { label: 'MD2', op: 'md2' }, { label: 'MD4', op: 'md4' },
-        { label: 'NTLM', op: 'ntlm' }, { label: 'SHA1', op: 'sha1' }, { label: 'SHA224', op: 'sha224' },
-        { label: 'SHA256', op: 'sha256' }, { label: 'SHA384', op: 'sha384' }, { label: 'SHA512', op: 'sha512' },
-        { label: 'Whirlpool', op: 'whirlpool' },
-    ]},
+    { name: 'Hash', algorithms: hash.HASH_ALGORITHMS },
 ].map(section => {
     if (section.subsections) {
-        return { ...section, subsections: section.subsections.map(sub => ({ ...sub, algorithms: prefixAndSort(sub.name, sub.algorithms) })) }
+        return { ...section, subsections: section.subsections.map(sub => ({ ...sub, algorithms: sortAlgorithms(sub.algorithms) })) }
     }
-    return { ...section, algorithms: prefixAndSort(section.name, section.algorithms) }
+    return { ...section, algorithms: sortAlgorithms(section.algorithms) }
 })

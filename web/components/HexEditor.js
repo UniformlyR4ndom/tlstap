@@ -139,9 +139,13 @@ export default function HexEditor({ bytes, onChange, style, readOnly }) {
 
     const rows = []
     for (let i = 0; i < bytes.length; i += ROW_BYTES) rows.push(i)
-    // Always have a row to hold the trailing insertion point, even when the buffer
-    // length is an exact multiple of ROW_BYTES (including empty).
-    if (bytes.length % ROW_BYTES === 0) rows.push(bytes.length)
+    // An empty buffer has no rows at all from the loop above, but still needs one to hold the
+    // insertion cursor. A non-empty buffer never needs an extra row for this: whenever the
+    // last row isn't completely full, it already renders its own trailing insertion cell (see
+    // HexEditorRow below); when the last row IS exactly full (an exact multiple of ROW_BYTES),
+    // deliberately don't add a further row just to hold the cursor — that would be an empty
+    // hexdump line with no bytes on it.
+    if (bytes.length === 0) rows.push(0)
 
     return html`
         <div
