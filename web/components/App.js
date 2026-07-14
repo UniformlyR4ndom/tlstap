@@ -9,6 +9,7 @@ import GoToPanel from './GoToPanel.js'
 import SearchPanel from './SearchPanel.js'
 import ExtractPanel from './ExtractPanel.js'
 import TransformPanel from './TransformPanel.js'
+import TamperView from './TamperView.js'
 import ResizeHandle from './ResizeHandle.js'
 import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
 import { loadLayout, saveLayoutValue } from '../layout.js'
@@ -18,6 +19,7 @@ const html = htm.bind(h)
 function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 export default function App() {
+    const [view,         setView]         = useState('analysis') // 'analysis' | 'tamper'
     const [session,      setSession]      = useState(null)
     const [stream,       setStream]       = useState(null)
     const [streamList,   setStreamList]   = useState([])
@@ -163,6 +165,12 @@ export default function App() {
                 <span class="title">tlstap · Traffic Analyzer</span>
                 <button class="btn btn-refresh" onclick=${() => setRefreshKey(k => k + 1)} title="Refresh">↺</button>
             </header>
+            <div class="top-tabs">
+                <div class=${'top-tab' + (view === 'analysis' ? ' active' : '')} onclick=${() => setView('analysis')}>Analysis</div>
+                <div class=${'top-tab' + (view === 'tamper'   ? ' active' : '')} onclick=${() => setView('tamper')}>Tamper</div>
+            </div>
+            ${view === 'tamper' && html`<${TamperView} />`}
+            ${view === 'analysis' && html`
             <nav class="menubar" ref=${menubarRef}>
                 <div class=${'menu' + (openMenu === 'view' ? ' open' : '')}>
                     <div class="menu-label" onclick=${() => toggleMenu('view')}>View</div>
@@ -254,6 +262,7 @@ export default function App() {
                         ${bottomTab === 'transform' && html`<${TransformPanel} />`}
                     </div>`}
             </div>
+            `}
         </div>
     `
 }

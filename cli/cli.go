@@ -20,6 +20,7 @@ import (
 	"tlstap/intercept/hexdump"
 	replace "tlstap/intercept/match_replace"
 	"tlstap/intercept/pcapdump"
+	"tlstap/intercept/tamper"
 	"tlstap/logging"
 	"tlstap/proxy"
 	tlstapweb "tlstap/web"
@@ -33,6 +34,7 @@ const (
 	InterceptorBridge       = "bridge"
 	InterceptorDropTls      = "droptls"
 	InterceptorDbDump       = "dbdump"
+	InterceptorTamper       = "tamper"
 )
 
 type InterceptorCallback func(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
@@ -357,6 +359,13 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 
 		i := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, *pConfig, logger)
 		interceptor = &i
+	case InterceptorTamper:
+		var tamperConf tamper.TamperConfig
+		if err := json.Unmarshal(iConfig.ArgsJson, &tamperConf); err != nil {
+			return nil, err
+		}
+
+		interceptor = tamper.NewTamperInterceptor(&tamperConf, logger)
 	default:
 		var err error
 		if cb != nil {

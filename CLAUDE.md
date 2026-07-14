@@ -32,11 +32,16 @@ intercept/          ← built-in interceptor implementations
     dbdump.go       ← interceptor lifecycle, DB schema, data capture
     api.go          ← REST API handlers (RegisterRoutes + endpoints + WebSocket)
     search.go       ← /search-text handler; literal and regex search across chunks
+  tamper/           ← live hold/edit/drop/forward of traffic; control + watch WebSocket API
+    tamper.go       ← interceptor lifecycle, hold/resolve logic, direction detection
+    api.go          ← WebSocket handlers (control: commands/acks/events; watch: mirror + peek)
+    protocol.go     ← wire message types for both WebSockets
 web/                ← embedded web frontend (Preact + htm, no build step)
   server.go         ← //go:embed; exports FS (embedded into binary)
   index.html        ← HTML shell, importmap, all CSS (dark theme)
   main.js           ← mounts App into #root
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
+  tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekChunk)
   format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
   markers.js        ← marker localStorage helpers (loadMarkers, saveMarkers, makeMarkerId)
   layout.js         ← panel-size localStorage helpers (loadLayout, saveLayoutValue)
@@ -46,23 +51,28 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   ringbuffer.js     ← ring buffer utility
   vendor/           ← vendored ES modules (preact 10.25.4, htm 3.1.1, fflate 0.8.3)
   components/
-    App.js          ← root; owns session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
+    App.js          ← root; owns top-level view (Analysis/Tamper), session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
     SessionList.js  ← sessions panel with sort toggle (asc/desc)
     StreamList.js   ← streams panel with sort toggle (resets to asc on session change)
     TrafficView.js  ← single-stream view: metadata bar + stid-based chunk buffer + virtual scroll + markers-panel sizing
     CombinedView.js ← combined-stream view: sgid-based chunk buffer across all streams in a session
     HexDump.js      ← virtual-scroll hex dump with prefetch, scroll correction, byte selection, context menu (read-only, for captured traffic)
-    HexEditor.js    ← small non-virtualized editable hex/ASCII grid with an insertion cursor; used by TransformPanel (editable input, read-only output)
+    HexEditor.js    ← small non-virtualized editable hex/ASCII grid with an insertion cursor; used by TransformPanel and the Tamper tab (editable input, read-only output)
     ResizeHandle.js ← generic draggable divider (vertical/horizontal) used for every resizable panel boundary
     GoToPanel.js    ← "Goto" bottom-panel tab: jump to chunk/offset by stid or direction-specific ID
     SearchPanel.js  ← "Search" bottom-panel tab: pattern search with format/direction/contiguous options
     ExtractPanel.js ← "Extract" bottom-panel tab: fetch and save/copy a byte range in various formats
     TransformPanel.js ← "Transform" bottom-panel tab: a step pipeline that runs input bytes through encode/decode operations into an output panel
     MarkersPanel.js ← side panel listing session markers with inline label editing; import/export
+    TamperView.js   ← Tamper tab root: control connection lifecycle, live queue state, layout
+    TamperStreamsList.js ← Tamper tab: per-stream list with intercept/watch toggle
+    TamperQueueList.js   ← Tamper tab: flat list of currently-held chunks across all streams
+    TamperDetailPanel.js ← Tamper tab: selected chunk's bytes (via peek) + forward/drop/drop-connection
 logging/            ← thin slog wrapper
 assert/             ← assert.Assertf — panics with message; used for "this is a bug" invariants
 examples/           ← standalone binaries showing how to write custom interceptors
-test/               ← echo server/client helpers and CLI wrappers for manual testing
+test/               ← echo server/client helpers, CLI wrappers for manual testing, and tapctl/
+                      (one-shot test client for the tamper/dbdump WebSocket + REST APIs)
 ```
 
 ## Proxy Modes
@@ -153,6 +163,7 @@ Three strategies (configured on the server side):
 | `bridge` | `BridgeInterceptor` | `connect` (endpoint); streams data to a TCP server using a custom binary framing protocol |
 | `droptls` | `DropTlsInterceptor` | none; aborts on `ConnectionUpgraded` to attempt TLS downgrade |
 | `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool); logs all traffic to SQLite; exposes REST API |
+| `tamper` | `TamperInterceptor` | `hold-timeout-ms` (int, `<=0` = infinite), `hold-until-connected` (bool); lets a connected control client actively pause, inspect, edit, drop, or forward live chunks, or just live-watch them; exposes a WebSocket API |
 
 ## REST API
 
@@ -283,11 +294,171 @@ Done signal: `{"done":true}`
 - Non-contiguous mode: each chunk searched independently; cross-chunk matches not found.
 - Contiguous mode (literal): chunks accumulated into 1 MB batches; `len(pattern)-1` byte overlap between batches catches cross-batch splits. Implemented in `search.go` via `matchFinder` abstraction (`literalFinder` / `regexFinder`).
 
+## tamper Interceptor (`intercept/tamper/`)
+
+Lets a connected control client actively pause, inspect, edit, drop, or forward
+individual chunks of live traffic, or just live-watch it without holding anything up.
+Deliberately **not merged with `dbdump`** — see below.
+
+**Relationship to dbdump:** `tamper` and `dbdump` are separate, single-responsibility
+interceptors composed via a proxy's `interceptors` list, not merged. Ordering controls
+what gets recorded: `dbdump` before `tamper` in the chain records untouched originals;
+after `tamper` it records whatever actually got forwarded. Both share the same `ConnID`
+numbering (the proxy's own per-run counter) and the same `/<proxy-name>/api/i/<name>`
+URL convention, so a dbdump-recorded stream (Analysis tab) and its live `tamper` state
+(Tamper tab) can be correlated purely by `ConnID`, with no backend coupling between the
+two — the two tabs don't currently cross-link to each other, but nothing prevents it.
+
+**Per-stream modes:**
+- **watch** (default) — chunks pass straight through immediately (never blocked) and are
+  best-effort mirrored to any attached `/watch` clients for that stream.
+- **intercept** — chunks are held until a decision arrives on the control connection (or
+  the hold timeout / a control disconnect releases them). A stream starts in this mode
+  only if `auto-intercept` was enabled before it was established; otherwise it can be
+  switched into intercept mode at any time via `set-mode`.
+- With no control client connected at all, every stream behaves as if in watch mode with
+  no watchers attached — i.e. pure pass-through, zero overhead — **unless**
+  `hold-until-connected` is set (see below).
+
+**`hold-until-connected`** (config): when true, every chunk is held while no control
+client is connected, instead of the default pass-through, still bounded by
+`hold-timeout-ms`. Guards against a test/debug client attaching after traffic has
+already started flowing — the chunk just sits in `pending` until someone connects and
+calls `list-streams` to discover it (see "Held-chunk lifecycle" below), or the timeout
+releases it. Implemented as an additional OR-branch in `Intercept()`'s hold decision:
+`holdNow := (intercepting && hasControl) || (holdUntilConnected && !hasControl)`.
+
+**In-memory state** (guarded by a single `mu sync.Mutex`, except `controlWriteMu`):
+- `control *websocket.Conn` / `controlDone chan struct{}` — the one control client (only
+  one allowed at a time); `controlDone` is closed on disconnect so every goroutine
+  currently blocked holding a chunk wakes up immediately, without iterating streams.
+- `controlWriteMu sync.Mutex` — serializes writes to `control`; **never held at the same
+  time as `mu`** — state is gathered under `mu`, released, and only then is a WebSocket
+  write attempted, mirroring the "no I/O while holding the state lock" discipline dbdump
+  uses for its DB writes.
+- `autoInterceptNew bool` — mode newly-established connections start in.
+- `streams map[uint32]*streamState` keyed by `ConnID`, each with its own `watchers` and
+  `pending` (held chunks awaiting a decision) maps.
+- `nextChunkID atomic.Int64` — global monotonic id correlating held chunks with their
+  eventual `resolve` command.
+
+**Direction detection** reuses dbdump's exact technique: `ConnectionEstablished` is
+called once per direction for `direction: any` interceptors (the first call has
+`src=client`); the client endpoint is recorded on first sight of a `ConnID`, and
+`Intercept` classifies c2s vs s2c by comparing `info.SrcEndpoint` against it.
+
+**Watcher mirroring never adds latency to the hot path:** each attached `/watch` client
+gets its own goroutine draining a small buffered channel (depth 8); `Intercept()` does a
+non-blocking send per watcher, dropping the frame on overflow rather than blocking the
+proxy. Detaching a watcher (browser closes the tab, or the stream terminates) closes a
+dedicated `stop` channel rather than the data channel itself, specifically to avoid a
+"send on closed channel" panic if a mirror send from a still-live `Intercept()` call
+races the teardown — see `detachWatcher`. Every write to a watch connection — both
+`watcherWriteLoop`'s mirror frames and `handlePeek`'s replies (see below) — goes through
+a per-watcher `writeMu`, since gorilla websocket doesn't support concurrent writers and
+those two now write to the same connection from different goroutines (`writeMu` plays
+the same role for a `/watch` connection that `controlWriteMu` plays for control).
+
+**Held-chunk lifecycle:** `Intercept()` registers a `pendingChunk{ch, data, direction,
+time}` under `mu`, sends a **metadata-only** `held` notification (no binary frame — see
+below), then blocks in a `select` on: the resolution channel, the hold-timeout timer (if
+finite), or `controlDone`. Resolution maps `forward`/`drop`/`drop-connection` to
+returning (possibly edited) bytes, `(nil, nil)`, or `(nil, proxy.ErrAbort)` respectively;
+timeout and control-disconnect both forward the original bytes unmodified. Switching a
+stream from intercept back to watch mode (`set-mode`) immediately force-resolves
+(forwards, unmodified) every chunk currently held for it, rather than leaving it to time
+out.
+
+**A held chunk's bytes are never pushed inline** — `held` and `stream-list` are pure
+metadata, specifically so that (re)connecting to control at any time is enough to
+discover and act on everything outstanding, without having had to be connected at the
+exact moment a chunk was held. To actually read the bytes, connect to that stream's
+`/watch` socket and send `peek` (see below); this is *only* a way to read pending-chunk
+bytes and only ever reads, never resolves — decisions still exclusively happen over
+control (this was floated the other way during design and deliberately reverted).
+
+**Known limitation:** a stream with an unresolved, infinite-timeout hold whose peer has
+already disconnected keeps that one goroutine (and this interceptor's bookkeeping for
+it) parked until a decision, timeout, or control-disconnect — mirroring how Burp holds a
+paused request indefinitely. This is unrelated to the `wg.Done()` quirk noted below;
+`ConnectionTerminated` can in fact fire concurrently with a still-blocked `Intercept()`
+call on another direction of the same connection (see next section), which is why
+watcher teardown is written to tolerate that race rather than assume it can't happen.
+
+**Control WebSocket** (`/api/i/tamper/control`; only one connection at a time; all
+forward/edit/drop/drop-connection decisions happen here, never on `/watch`):
+
+Proxy → browser (JSON text frame only — no chunk bytes ever flow over control):
+- `{"type":"stream-created","conn":N,"src":"...","dst":"..."}`
+- `{"type":"stream-terminated","conn":N}`
+- `{"type":"held","conn":N,"id":N,"direction":0|1,"time":N,"length":N}` (metadata only;
+  fetch bytes via `peek` on that stream's `/watch` connection)
+- `{"type":"stream-list","streams":[{"conn":N,"src":"..","dst":"..","intercepting":bool,"pending":[{"id":N,"direction":0|1,"time":N,"length":N},...]}]}`
+  (reply to `list-streams`; `pending` lists every currently-held chunk for that stream —
+  at most one per direction — which is what makes reconnecting to control at any time a
+  full resync, not just a feed of future events)
+- `{"type":"ok","command":"set-auto-intercept"|"set-mode"|"resolve"}` — acknowledges one
+  of those three commands succeeded; each of them gets exactly one `ok` or `error` reply
+  (never both, never neither). `set-mode` errors on an unknown stream; `resolve` errors
+  on an unknown or already-resolved chunk id; both (and `set-auto-intercept`) error on
+  missing required fields.
+- `{"type":"error","message":"..."}` — either the above per-command failure, or an
+  unrecognized command type entirely.
+
+Browser → proxy (JSON text frame; `resolve` with `"edited":true` must be immediately
+followed by a binary frame with the replacement bytes):
+- `{"type":"set-auto-intercept","enabled":bool}`
+- `{"type":"set-mode","conn":N,"intercepting":bool}`
+- `{"type":"resolve","conn":N,"id":N,"action":"forward"|"drop"|"drop-connection","edited":bool}`
+- `{"type":"list-streams"}`
+
+**Watch WebSocket** (`/api/i/tamper/watch?conn=N`; any number of clients per stream):
+- **Live mirror** (proxy → client, unsolicited): `{"direction":0|1,"time":N,"length":N}`
+  followed by a binary frame, for every chunk actually forwarded on that stream
+  (best-effort — see watcher mirroring above).
+- **`peek`** (client → proxy): `{"type":"peek","id":N,"offset":N,"length":N}` — the only
+  way to read a held (not-yet-forwarded) chunk's bytes. `id` omitted returns every
+  currently-pending chunk for the stream in full (at most one per direction); `id` given
+  targets just that one chunk, optionally sliced by `offset`/`length` (`length` 0 or
+  omitted = to the end). Reply is zero or more
+  `{"type":"pending","id":N,"direction":0|1,"time":N,"offset":N,"length":N,"total_length":N}`
+  + binary-slice pairs (`offset`/`length` describe the *returned* slice; `total_length`
+  is the full chunk size), terminated by `{"type":"peek-done"}` — or a single
+  `{"type":"error","message":"..."}` if `id` was given but isn't currently pending.
+  `peek` never resolves anything; it's read-only, same as the mirror.
+
+## Testing interceptor APIs (`test/tapctl/`)
+
+`tapctl` is a one-shot Go CLI for driving interceptor APIs by hand, organized as
+`tapctl <group> <command> [flags]` — one group per interceptor, so the flat command
+list doesn't get confusing as more interceptors gain commands. Every command opens a
+fresh connection, performs one action, prints JSON to stdout, and exits — no persistent
+connection needed for anything, by design. Run `go build -o tapctl ./test/tapctl &&
+./tapctl help` (or `tapctl <group> help`) for usage. Source split by concern, mirroring
+the interceptor packages themselves: `main.go` (dispatch + shared HTTP/WS/flag/output
+helpers), `tamper.go`, `dbdump.go`.
+
+- **`tapctl tamper ...`**: `streams`, `peek`, `resolve`, `set-mode`,
+  `set-auto-intercept` — see the protocol notes above on why reconnecting to control at
+  any time is always enough (no FIFO/persistent-process trick needed even for the
+  hold→resolve workflow).
+- **`tapctl dbdump ...`**: `status`, `sessions`, `streams`, `chunklist`, `chunk`,
+  `chunk-stid`, `byte-stid`, `search`, `stid-stream`, `sgid-stream` — thin wrappers over
+  the REST/WS endpoints documented in full under "dbdump Interceptor" above; no
+  protocol documentation duplicated here. `chunk` (a `multipart/form-data` response) and
+  `stid-stream`/`sgid-stream` (WebSocket, chunk-metadata-then-binary-frame pairs) are
+  each collected into a single `{"chunks":[...]}` JSON object with each chunk's bytes as
+  a `data_base64` field — the same convention `tamper peek` uses, for consistency
+  across the tool. `stid-stream`/`sgid-stream` default `--n` to 50 (the web frontend's
+  own `BATCH` constant) rather than the protocol's `0`/unlimited, since an unbounded
+  reply would be buffered whole into memory before printing; pass `--n 0` explicitly to
+  actually get everything.
+
 ## Key Implementation Details
 
 - **`ConnHandler.intercept()`** (`conn_handler.go:399`): runs the interceptor chain; on non-abort errors, logs a warning and forwards original data unchanged.
 - **`forwardDetectTls`**: uses `BufferedConn.Peek()` to look for a TLS Client Hello without consuming bytes. On detection it sets a deadline on the upstream conn, signals via `upgradeChan`, drains outstanding data, then upgrades both sides.
-- **`terminate()`** uses `sync.Once` to set deadlines on both conns — this is the shutdown mechanism; errors in `forwardOneWay` trigger it.
+- **`terminate()`** uses `sync.Once` to set deadlines on both conns — this is the shutdown mechanism; errors in `forwardOneWay` trigger it. Note: `terminate()` calls `wg.Done()` unconditionally (once, via the `sync.Once`) regardless of which direction's goroutine called it — so `ConnHandler.forwardGeneric()`'s `wg.Wait()` can return, and `ConnectionTerminated` can fire, *before* the other direction's `forwardOneWay` goroutine has actually returned (e.g. while it's still blocked inside an interceptor's `Intercept()` call, as `tamper` can do). Interceptor code that reacts to `ConnectionTerminated` must not assume no other goroutine for the same `ConnID` can still be mid-`Intercept()`.
 - **`Prober`**: makes a real TLS dial with a `VerifyConnection` hook that captures the negotiated protocol then returns an error to abort immediately. Failures are counted; after `maxFailures=5` the cache gives up.
 - Package name in `proxy/` is `proxy`, matching the directory name. Import as `"tlstap/proxy"`.
 - `bufSize = 1<<16` (64 KB) — single shared read buffer per direction per connection.
@@ -299,7 +470,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 
 **Technology:** Preact 10.25.4 + htm 3.1.1, vendored under `web/vendor/`. The importmap in `index.html` maps bare specifiers (`preact`, `preact/hooks`, `htm`) to the vendored files so the Preact hooks module (which imports bare `"preact"`) resolves correctly.
 
-**Layout:** Header bar (title + refresh button) → menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel.
+**Layout:** Header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
 
 **Menu bar (`App.js`, `index.html`):**
 - `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), and `autoRefresh` (bool, default `false`).
@@ -329,11 +500,12 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 
 **Resizable panels (`ResizeHandle.js`, `layout.js`):**
 - `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow").
-- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` — reads/writes a single `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight }`, merged with defaults on load (same pattern as `markers.js`).
+- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` — reads/writes a single `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight }`, merged with defaults on load (same pattern as `markers.js`).
 - **Sidebar** (`App.js`): `sidebarWidth` (default 280, clamped 180–600), handle between `.sidebar` and `.main`.
 - **Bottom panel** (`App.js`): `bottomHeight` (default 160, clamped 80–70% of `window.innerHeight`), handle at the top of `.bottom-panel` (only rendered while a tab is open).
 - **Markers panel** (`TrafficView.js`): `markersWidth` (default 240, clamped 150–500), handle between `HexDump`/`HexEditor` and `MarkersPanel` (only rendered while not collapsed); width passed down as a `width` prop to `MarkersPanel`, applied via inline style on `.markers-side`.
 - **Transform panel** (`TransformPanel.js`): `encdecOptionsWidth` (default 160, clamped 100–400, handle between the options column and the input/output column) and `encdecInputHeight` (default 120, clamped 30–2000, handle between the input and output areas).
+- **Tamper detail panel** (`TamperView.js`): `tamperDetailHeight` (default 300, clamped 120–70% of `window.innerHeight`), handle above `.tamper-detail-wrap`, same `h - deltaY` sign convention as the bottom panel's handle (also placed before the sized element).
 - All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins; each resize handler both updates local state and calls `saveLayoutValue`.
 
 **Virtual scroll (`HexDump.js`):**
@@ -513,6 +685,76 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - `getByteStid(sessionId, streamId, direction, offset)`: POST `/byte-stid`.
 - `searchText(req)`: POST `/search-text`; `req` is the full request object.
 
+**Tamper tab (`TamperView.js`, `TamperStreamsList.js`, `TamperQueueList.js`, `TamperDetailPanel.js`, `tamperApi.js`):**
+
+Deliberately a separate top-level tab from Analysis rather than integrated into
+`TrafficView`/`HexDump.js` — the two have fundamentally different shapes (Analysis is a
+virtualized browse of a long, mostly-static history; Tamper is a small,
+constantly-draining live decision queue), and dbdump should normally sit *before*
+`tamper` in a proxy's interceptor chain to record untouched originals, so "edit" has no
+natural place inside the history-browsing view anyway. Scoped to a single proxy's
+`tamper` instance (canonical `/api/i/tamper/...`), same simplification `tapctl` makes.
+
+- **Layout** (`TamperView.js`, top to bottom): toolbar (connection status, manual
+  Reconnect button — no auto-retry, to avoid hammering the one-control-connection-at-
+  a-time limit — "Auto-intercept new connections" checkbox, manual Refresh button) →
+  body (`TamperStreamsList` fixed-width left panel + `TamperQueueList` flex:1 right
+  panel) → `ResizeHandle` (orientation `h`) → `TamperDetailPanel` (bottom, resizable
+  height via `layout.js`'s `tamperDetailHeight`, same pattern as `bottomHeight`).
+- **State model — full resync on every push event, not incremental patching.**
+  `TamperView` holds `streams` (the array from the latest `stream-list`) as the single
+  source of truth; `stream-created`/`stream-terminated`/`held` all just trigger a fresh
+  `listStreams()` call rather than hand-patching local state, since `list-streams`'s
+  `pending` array is already a complete, correct snapshot — simpler and far less
+  bug-prone than incremental diffing, at the cost of one small extra round-trip per
+  event (irrelevant at debug-tool traffic volumes). `handleResolve` **also** resyncs
+  after its own successful `resolve()` call, not just on server-pushed events — a
+  `drop` produces no further traffic and therefore no push event at all, so without this
+  the queue would keep showing an already-resolved chunk until something unrelated
+  happened to trigger a resync (found via the Playwright verification pass; fixed by
+  chaining `.then(res => { resync(); return res })` onto the resolve call).
+- `queue` is derived (`useMemo`) from `streams`:
+  `streams.flatMap(s => s.pending.map(p => ({...p, conn: s.conn, src: s.src, dst: s.dst})))`,
+  sorted by `time` ascending (oldest first). `selectedKey` (`{conn, id}` or `null`) is
+  kept valid by an effect keyed on `queue`: if the selected chunk fell out of the queue
+  (resolved, timed out, stream gone) or nothing is selected yet, it auto-selects the
+  new first item — this is both the initial selection and the Burp-style post-resolve
+  auto-advance the tab is meant to provide, with no separate "advance" code path needed.
+- **`tamperApi.js`**: `openTamperControl(handlers)` wraps the single control
+  WebSocket. Replies are matched **by `type`, not by "the next message in"** — the
+  server can interleave a push event (`held`, etc.) with the `ok`/`error`/`stream-list`
+  reply to whatever command was just sent, since pushes originate from a different
+  goroutine than command replies (`intercept/tamper/api.go`'s `controlWriteMu`
+  serializes writes but not their relative order). `ok`/`error` resolve or reject the
+  one in-flight command promise (`sendCommand` only ever allows one at a time);
+  `held`/`stream-created`/`stream-terminated` always route to their handler regardless
+  of an in-flight command; `stream-list` does both — updates `onStreamList` *and*
+  resolves a pending promise, since every `stream-list` is inherently a reply to
+  `list-streams` (never pushed unsolicited). Returns
+  `{ setAutoIntercept, setMode, listStreams, resolve, close }`; `resolve(conn, id,
+  action, editedBytes?)` sends the JSON command then the binary frame immediately after
+  when `editedBytes` is given, mirroring `tapctl`'s `cmdTamperResolve` exactly.
+- **`peekChunk(conn, id)`**: a held chunk's bytes are fetched via a **short-lived**
+  `/watch` connection per selection (open → `peek` → collect reply → close), not a
+  persistent per-stream socket — matches the point-in-time nature of inspecting
+  whatever's currently selected in `TamperDetailPanel`, and avoids managing idle
+  sockets for streams the user isn't looking at.
+- **`TamperStreamsList.js`**: one row per stream (conn/src/dst) with an intercept/watch
+  checkbox calling `setMode` — the only place a watched stream can be escalated into
+  intercept mode; the queue alone only ever shows streams that already have something
+  held.
+- **`TamperQueueList.js`**: one row per pending chunk (conn, direction, length,
+  relative "Xs ago" time computed at render time, no ticking timer). Click sets
+  `selectedKey`.
+- **`TamperDetailPanel.js`**: placeholder when nothing selected; otherwise fetches
+  bytes via `peekChunk` in an effect keyed on `selectedKey`, then
+  `<${HexEditor} bytes=${bytes} onChange=${setBytes} />` (the same editable component
+  `TransformPanel` uses) plus **Forward** / **Drop** / **Drop Connection**. A single
+  Forward button (no separate edited/unedited buttons) byte-compares the current editor
+  buffer against the originally-fetched bytes to decide whether to send `edited: true`.
+  Buttons disable while a resolve is in flight; a rejection is shown inline rather than
+  silently doing nothing.
+
 ## Documentation
 
 - `doc/openapi.yaml` — OpenAPI 3.1.0 specification for all REST and WebSocket endpoints
@@ -522,7 +764,9 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - `github.com/google/gopacket` — pcap writing in `intercept/pcapdump/`
 - `github.com/smallnest/ringbuffer` — used in `proxy/buf_conn.go`
 - `modernc.org/sqlite` — pure-Go SQLite driver (no CGO) used by `intercept/dbdump/`
-- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go`
+- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go` and
+  `intercept/tamper/api.go`; also used client-side by `test/tapctl` (the web frontend
+  uses the browser's native `WebSocket` instead, via `api.js`/`tamperApi.js`)
 - `fflate` 0.8.3 (JS, vendored under `web/vendor/fflate.module.js`) — zip archive support in `web/transforms/zip.js`. Vendored as a whole-library minify (`esbuild --minify`, no bundling/tree-shaking) so future code can pull in more of its exports (gzip/deflate/zlib) without re-vendoring; imported by relative path (not the importmap) since `transforms/*.js` must also run under the Node test suite, which has no importmap support.
 - `crypto-js` 4.2.0 (JS, vendored under `web/vendor/crypto-js.module.js`) — MD5/SHA1/SHA224/SHA256/SHA384/SHA512 support in `web/transforms/hash.js`. Upstream ships CommonJS/UMD modules with bare `require(...)` calls (not valid syntax for a native browser ES module import), so this is a real `esbuild --bundle --format=esm` build covering just `core.js`, `lib-typedarrays.js` (patches `WordArray.init` to accept a `Uint8Array` directly), `x64-core.js` (needed for SHA384/512), `enc-hex.js`, and the five hash algorithm modules — deliberately **not minified** (unlike `fflate.module.js`) so the bundled source stays readable/debuggable; the file's header comment has the exact entry-file contents needed to rebuild it after upgrading crypto-js.
 - `hash-wasm` 4.12.0 (JS+WASM, vendored under `web/vendor/hash-wasm-whirlpool.module.js`) — Whirlpool support in `web/transforms/hash.js` (the one hash algorithm `crypto-js` doesn't cover, and risky to hand-roll correctly given its S-box/MDS-matrix complexity). Only `dist/whirlpool.umd.min.js` is vendored — a single self-contained, dependency-free per-algorithm bundle (the WASM binary is inlined as base64, no separate `.wasm` fetch) — reformatted from UMD to a real ES module via `esbuild --bundle --format=esm`. Left minified as vendored upstream: unlike crypto-js, there's no more-readable JS form to preserve since the actual hashing logic is compiled WASM, not JS.

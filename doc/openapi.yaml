@@ -5,14 +5,24 @@ info:
   version: 0.3.0
   description: |
     REST API exposed by the tlstap TLS intercepting proxy when the `dbdump`
-    interceptor is active and `"api": {"listen": "..."}` is set in `config.json`.
+    and/or `tamper` interceptors are active and `"api": {"listen": "..."}` is
+    set in `config.json`.
 
-    **Base path:** All `dbdump` endpoints are reachable at the canonical path
-    `/api/i/dbdump/<endpoint>` as well as the proxy-scoped path
-    `/<proxyName>/api/i/dbdump/<endpoint>`.
+    **Base path:** All endpoints are reachable at the canonical path
+    `/api/i/<interceptor-name>/<endpoint>` as well as the proxy-scoped path
+    `/<proxyName>/api/i/<interceptor-name>/<endpoint>`.
 
     **Errors:** All error responses use `Content-Type: application/json` and the
     body `{"error": "<message>"}` with an appropriate HTTP status code.
+
+    **dbdump vs. tamper:** `dbdump` passively records traffic to SQLite and
+    exposes a pull/replay history API. `tamper` is a separate, live-only
+    interceptor that lets a connected control client pause, edit, drop, or
+    forward individual chunks (or just watch them), with no persistence of its
+    own. The two are composed via a proxy's `interceptors` list, not merged —
+    see CLAUDE.md's "tamper Interceptor" section for the full rationale. Both
+    share a proxy's `ConnID` numbering, so a `dbdump` stream and its live
+    `tamper` state can be correlated by `conn` alone.
 
 servers:
   - url: http://127.0.0.1:9090
@@ -29,6 +39,8 @@ tags:
     description: Raw traffic chunks within a stream
   - name: search
     description: Pattern search across captured traffic
+  - name: tamper
+    description: Live traffic interception (hold, edit, drop, forward, or watch)
   - name: ui
     description: Embedded web frontend
 
@@ -516,6 +528,179 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /api/i/tamper/control:
+    get:
+      tags: [tamper]
+      summary: Single control connection for live traffic interception
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). Only one
+        control connection is allowed at a time; a second attempt is rejected
+        with an `error` frame and the connection is closed. All commands and
+        notifications for every stream flow through this one connection —
+        per-stream mode toggles and held-chunk resolution included, not just
+        lifecycle events.
+
+        With no control connection active, every stream on this interceptor
+        behaves as pure pass-through (watch mode, no watchers, zero overhead)
+        — unless the interceptor is configured with `hold-until-connected`,
+        in which case every chunk is held (bounded by `hold-timeout-ms`)
+        until a control client connects, so traffic is never silently missed
+        while nothing is attached yet.
+
+        No chunk bytes ever flow over this connection — `held` and
+        `stream-list` are metadata only. To read a held chunk's bytes,
+        connect to that stream's `/api/i/tamper/watch` connection and send a
+        `peek` command.
+
+        **Proxy → client** (JSON text frame):
+        - ```json
+          {"type": "stream-created", "conn": N, "src": "...", "dst": "..."}
+          ```
+        - ```json
+          {"type": "stream-terminated", "conn": N}
+          ```
+        - ```json
+          {"type": "held", "conn": N, "id": N, "direction": N, "time": N, "length": N}
+          ```
+          Sent when a stream in intercept mode produces a chunk. `id` is a
+          global monotonically increasing id used to resolve this specific
+          chunk. `direction`: `0` = client→server, `1` = server→client. `time`
+          is milliseconds since the Unix epoch. `length` is the full chunk
+          size; fetch the bytes via `peek` on `/watch`.
+        - ```json
+          {"type": "stream-list", "streams": [{"conn": N, "src": "...", "dst": "...", "intercepting": bool, "pending": [{"id": N, "direction": N, "time": N, "length": N}]}]}
+          ```
+          Reply to a `list-streams` command. `pending` lists every
+          currently-held chunk for that stream (at most one per direction) —
+          this is what makes reconnecting to control at any time a full
+          resync rather than just a feed of future events, e.g. after
+          `hold-until-connected` held traffic before anyone was connected to
+          see the original `held` push.
+        - ```json
+          {"type": "ok", "command": "set-auto-intercept" | "set-mode" | "resolve"}
+          ```
+          Acknowledges that command succeeded. Each of those three commands
+          gets exactly one `ok` or `error` reply — never both, never neither.
+        - ```json
+          {"type": "error", "message": "..."}
+          ```
+          Sent for: an unrecognized command type; missing required fields on
+          `set-auto-intercept`/`set-mode`/`resolve`; `set-mode` against an
+          unknown stream; or `resolve` against a chunk id that isn't
+          currently pending (unknown, already resolved, or timed out). The
+          connection is not closed.
+
+        **Client → proxy** (JSON text frame; `resolve` with `"edited": true`
+        must be immediately followed by a binary frame with the replacement
+        bytes):
+        - ```json
+          {"type": "set-auto-intercept", "enabled": bool}
+          ```
+          Sets the mode newly-established connections start in. Does not
+          affect streams that already exist.
+        - ```json
+          {"type": "set-mode", "conn": N, "intercepting": bool}
+          ```
+          Switches one stream between watch and intercept mode. Switching to
+          `false` immediately force-resolves (forwards, unmodified) every
+          chunk currently held for that stream, rather than leaving it to
+          time out.
+        - ```json
+          {"type": "resolve", "conn": N, "id": N, "action": "forward" | "drop" | "drop-connection", "edited": bool}
+          ```
+          Resolves one held chunk. `forward` releases it (edited bytes if
+          `edited` is `true`, otherwise the original bytes); `drop` releases
+          the connection without sending that chunk; `drop-connection`
+          terminates the connection entirely. Unresolved held chunks are also
+          auto-released, unmodified, after the configured `hold-timeout-ms`
+          (or immediately, if this control connection disconnects).
+        - ```json
+          {"type": "list-streams"}
+          ```
+          Requests a `stream-list` snapshot of every currently active stream.
+      operationId: tamperControl
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/i/tamper/watch:
+    get:
+      tags: [tamper]
+      summary: Live mirror of one stream's traffic, plus on-demand reads of held chunks
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). Any
+        number of clients may attach to the same stream at once. This
+        connection is never a decision-maker — forward/edit/drop/
+        drop-connection decisions only ever happen on
+        `/api/i/tamper/control`; this connection only ever reads.
+
+        **Live mirror** (server → client, unsolicited, best-effort — a client
+        that can't keep up simply misses frames rather than slowing down the
+        proxy): every chunk actually forwarded on the stream (both watch-mode
+        pass-through and released/resolved held chunks), as two frames:
+        1. Text frame (JSON metadata):
+           ```json
+           {"direction": N, "time": N, "length": N}
+           ```
+        2. Binary frame: raw chunk bytes
+
+        **`peek`** (client → server): the only way to read a currently-held
+        (not-yet-forwarded) chunk's bytes.
+        ```json
+        {"type": "peek", "id": N, "offset": N, "length": N}
+        ```
+        - `id` — omit to return every currently-pending chunk for this stream
+          (at most one per direction) in full. Give it to target one specific
+          chunk instead.
+        - `offset`, `length` — only applied when `id` is given: read just
+          that byte range of the chunk (`length` `0` or omitted means "to the
+          end"). Ignored when peeking all pending chunks, since slicing only
+          makes sense against one target.
+
+        Reply is zero or more of the following pairs, one per matched chunk,
+        terminated by a `peek-done` frame:
+        1. Text frame (JSON metadata):
+           ```json
+           {"type": "pending", "id": N, "direction": N, "time": N, "offset": N, "length": N, "total_length": N}
+           ```
+           `offset`/`length` describe the slice actually returned;
+           `total_length` is the full chunk's size, so the caller always
+           knows whether it got a partial read.
+        2. Binary frame: the (possibly sliced) chunk bytes
+
+        Then:
+        ```json
+        {"type": "peek-done"}
+        ```
+
+        If `id` was given but doesn't match a currently-pending chunk, the
+        reply is a single error frame instead:
+        ```json
+        {"type": "error", "message": "..."}
+        ```
+      operationId: tamperWatch
+      parameters:
+        - name: conn
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: ConnID of the stream to mirror
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No stream with the given conn id is currently active
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /ui:
     get:

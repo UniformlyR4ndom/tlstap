@@ -27,7 +27,7 @@ function rowStart(index) { return index - (index % ROW_BYTES) }
 // A small, non-virtualized hex/ASCII editor for typed or pasted input. Distinct from the
 // read-only, virtualized HexDump.js (built for large captured traffic) — this widget only
 // needs to handle modest, user-entered buffers, with a real insertion cursor.
-export default function HexEditor({ bytes, onChange, style, readOnly }) {
+export default function HexEditor({ bytes, onChange, style, readOnly, direction }) {
     const [cursor, setCursor] = useState({ index: 0, area: 'hex' })
     const [pendingNibble, setPendingNibble] = useState(null)
     const containerRef = useRef(null)
@@ -147,9 +147,13 @@ export default function HexEditor({ bytes, onChange, style, readOnly }) {
     // hexdump line with no bytes on it.
     if (bytes.length === 0) rows.push(0)
 
+    // Direction is optional (e.g. TransformPanel has no notion of c2s/s2c); only the Tamper
+    // detail panel passes it, to get the same green/blue direction tint HexDump.js uses.
+    const dirClass = direction === 0 ? 'c2s' : direction === 1 ? 's2c' : ''
+
     return html`
         <div
-            class="hexed-container"
+            class=${'hexed-container' + (dirClass ? ' ' + dirClass : '')}
             ref=${containerRef}
             tabIndex="0"
             onClick=${handleClick}
@@ -165,13 +169,14 @@ export default function HexEditor({ bytes, onChange, style, readOnly }) {
                     cursor=${cursor}
                     pendingNibble=${pendingNibble}
                     bufferLength=${bytes.length}
+                    dirClass=${dirClass}
                 />
             `)}
         </div>
     `
 }
 
-function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength }) {
+function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength, dirClass }) {
     const offStr = rowOffset.toString(16).padStart(8, '0')
 
     const hexCells = []
@@ -188,6 +193,8 @@ function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength })
     while (hexCells.length < ROW_BYTES) {
         hexCells.push(renderFillerCell(hexCells.length))
     }
+    // Group separator between the two 8-byte halves, matching HexDump.js's hex column.
+    hexCells.splice(8, 0, html`<span key="gap" class="hexed-gap"></span>`)
 
     const asciiCells = []
     for (let i = 0; i < bytes.length; i++) {
@@ -196,7 +203,7 @@ function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength })
     }
 
     return html`
-        <div class="hexed-row">
+        <div class=${'hexed-row' + (dirClass ? ' ' + dirClass : '')}>
             <span class="hexed-off">${offStr}</span>
             <span class="hexed-hex">${hexCells}</span>
             <span class="hexed-ascii">|${asciiCells}|</span>

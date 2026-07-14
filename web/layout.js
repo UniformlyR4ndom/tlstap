@@ -1,5 +1,5 @@
 const STORAGE_KEY = 'tlstap-layout'
-const DEFAULTS = { sidebarWidth: 280, markersWidth: 240, bottomHeight: 160, encdecOptionsWidth: 160, encdecInputHeight: 120 }
+const DEFAULTS = { sidebarWidth: 280, markersWidth: 240, bottomHeight: 160, encdecOptionsWidth: 160, encdecInputHeight: 120, tamperDetailHeight: 300 }
 
 export function loadLayout() {
     try {
