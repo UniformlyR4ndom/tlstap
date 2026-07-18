@@ -206,7 +206,8 @@
       "name": "tamper",
       "args": {
         "hold-timeout-ms": 0,
-        "hold-until-connected": false
+        "hold-until-connected": false,
+        "scripts-dir": "tamper-scripts"
       }
     },
     "match-replace-demo": {

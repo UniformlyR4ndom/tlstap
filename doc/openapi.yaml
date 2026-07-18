@@ -41,6 +41,11 @@ tags:
     description: Pattern search across captured traffic
   - name: tamper
     description: Live traffic interception (hold, edit, drop, forward, or watch)
+  - name: scripts
+    description: >-
+      Storage for scripts driving programmatic tamper interception. Execution is
+      client-side only (a browser Web Worker via the "Scripts" sub-tab of the Tamper
+      view) — these endpoints are just the REST CRUD backing that store.
   - name: ui
     description: Embedded web frontend
 
@@ -548,10 +553,11 @@ paths:
         until a control client connects, so traffic is never silently missed
         while nothing is attached yet.
 
-        No chunk bytes ever flow over this connection — `held` and
-        `stream-list` are metadata only. To read a held chunk's bytes,
-        connect to that stream's `/api/i/tamper/watch` connection and send a
-        `peek` command.
+        A held chunk is appended to a growing, editable byte buffer kept per
+        `(conn, direction)` — not addressed by its own id. No bytes ever flow
+        over this connection — `held` and `stream-list` are metadata only. To
+        read a direction's currently-held bytes, connect to that stream's
+        `/api/i/tamper/watch` connection and send a `peek` command.
 
         **Proxy → client** (JSON text frame):
         - ```json
@@ -561,39 +567,46 @@ paths:
           {"type": "stream-terminated", "conn": N}
           ```
         - ```json
-          {"type": "held", "conn": N, "id": N, "direction": N, "time": N, "length": N}
+          {"type": "held", "conn": N, "direction": N, "offset": N, "length": N, "time": N}
           ```
-          Sent when a stream in intercept mode produces a chunk. `id` is a
-          global monotonically increasing id used to resolve this specific
-          chunk. `direction`: `0` = client→server, `1` = server→client. `time`
-          is milliseconds since the Unix epoch. `length` is the full chunk
-          size; fetch the bytes via `peek` on `/watch`.
+          Sent when a stream in intercept mode appends a new chunk to a
+          direction's held buffer. `direction`: `0` = client→server, `1` =
+          server→client. `offset`/`length` describe just this new chunk
+          (where it starts within the buffer, and its size) — not the
+          buffer's total size — so a client can extend its own
+          locally-tracked view of the buffer incrementally rather than
+          re-`peek`ing on every arrival; `offset` also doubles as a
+          consistency check against that local view. `time` is milliseconds
+          since the Unix epoch. Fetch the actual bytes via `peek` on
+          `/watch`.
         - ```json
-          {"type": "stream-list", "streams": [{"conn": N, "src": "...", "dst": "...", "intercepting": bool, "pending": [{"id": N, "direction": N, "time": N, "length": N}]}]}
+          {"type": "stream-list", "streams": [{"conn": N, "src": "...", "dst": "...", "intercepting": bool, "pending": [{"direction": N, "chunks": N, "length": N}]}]}
           ```
-          Reply to a `list-streams` command. `pending` lists every
-          currently-held chunk for that stream (at most one per direction) —
-          this is what makes reconnecting to control at any time a full
-          resync rather than just a feed of future events, e.g. after
-          `hold-until-connected` held traffic before anyone was connected to
-          see the original `held` push.
+          Reply to a `list-streams` command. `pending` has 0-2 entries — one
+          per direction with something currently held, summarized as chunk
+          count + total byte length (not itemized per chunk) — this is what
+          makes reconnecting to control at any time a full resync rather than
+          just a feed of future events, e.g. after `hold-until-connected`
+          held traffic before anyone was connected to see the original
+          `held` push.
         - ```json
-          {"type": "ok", "command": "set-auto-intercept" | "set-mode" | "resolve"}
+          {"type": "ok", "command": "set-auto-intercept" | "set-mode" | "release" | "drop-connection"}
           ```
-          Acknowledges that command succeeded. Each of those three commands
+          Acknowledges that command succeeded. Each of those four commands
           gets exactly one `ok` or `error` reply — never both, never neither.
         - ```json
           {"type": "error", "message": "..."}
           ```
-          Sent for: an unrecognized command type; missing required fields on
-          `set-auto-intercept`/`set-mode`/`resolve`; `set-mode` against an
-          unknown stream; or `resolve` against a chunk id that isn't
-          currently pending (unknown, already resolved, or timed out). The
-          connection is not closed.
+          Sent for: an unrecognized command type; missing required fields;
+          `set-mode`/`release`/`drop-connection` against an unknown stream;
+          or `release` whose `prefix_length` exceeds the buffer's actual
+          current length (e.g. a hold-timeout already flushed it) or whose
+          `release_chunks` exceeds the resulting chunk count. The connection
+          is not closed.
 
-        **Client → proxy** (JSON text frame; `resolve` with `"edited": true`
+        **Client → proxy** (JSON text frame; `release` with `"edited": true`
         must be immediately followed by a binary frame with the replacement
-        bytes):
+        bytes for `prefix_length`):
         - ```json
           {"type": "set-auto-intercept", "enabled": bool}
           ```
@@ -603,18 +616,39 @@ paths:
           {"type": "set-mode", "conn": N, "intercepting": bool}
           ```
           Switches one stream between watch and intercept mode. Switching to
-          `false` immediately force-resolves (forwards, unmodified) every
-          chunk currently held for that stream, rather than leaving it to
-          time out.
+          `false` immediately force-releases (forwards, unmodified)
+          everything currently held for that stream, rather than leaving it
+          to time out.
         - ```json
-          {"type": "resolve", "conn": N, "id": N, "action": "forward" | "drop" | "drop-connection", "edited": bool}
+          {"type": "release", "conn": N, "direction": N, "edited": bool, "prefix_length": N, "bounds": [N, ...], "release_chunks": N, "action": "forward" | "drop"}
           ```
-          Resolves one held chunk. `forward` releases it (edited bytes if
-          `edited` is `true`, otherwise the original bytes); `drop` releases
-          the connection without sending that chunk; `drop-connection`
-          terminates the connection entirely. Unresolved held chunks are also
-          auto-released, unmodified, after the configured `hold-timeout-ms`
-          (or immediately, if this control connection disconnects).
+          Combines an optional edit with an optional release of one
+          direction's held buffer, in one atomic step. `edited: false` means
+          "release `release_chunks` chunks of the buffer exactly as it
+          stands" (`prefix_length`/`bounds` are ignored). `edited: true`
+          replaces the buffer's first `prefix_length` bytes — as the client
+          last knew them — with the bytes in the following binary frame,
+          whose internal chunk boundaries are given by `bounds` (a list of
+          byte offsets, `bounds[0]` always `0`), before releasing.
+          `prefix_length` anchors the edit against the buffer's actual
+          current length: a stale value (e.g. a hold-timeout flushed the
+          buffer in the meantime) is rejected rather than silently
+          misapplied. `release_chunks` `0` means "edit only, release
+          nothing" (a real supported mode, not just a corner case).
+          `action: "forward"` releases the real bytes; `action: "drop"`
+          removes the released chunks from the buffer without forwarding
+          them. Unresolved held buffers are also auto-released, unmodified,
+          after the configured `hold-timeout-ms` (or immediately, if this
+          control connection disconnects).
+        - ```json
+          {"type": "drop-connection", "conn": N, "direction": N}
+          ```
+          Terminates the connection outright, independent of `release` —
+          dropping the connection isn't parameterized by buffer content the
+          way an edit/release is, so it's its own command rather than a
+          third `release` action value. `direction` just identifies which
+          buffer the client was looking at; either direction's buffer kills
+          the whole connection.
         - ```json
           {"type": "list-streams"}
           ```
@@ -629,7 +663,7 @@ paths:
   /api/i/tamper/watch:
     get:
       tags: [tamper]
-      summary: Live mirror of one stream's traffic, plus on-demand reads of held chunks
+      summary: Live mirror of one stream's traffic, plus on-demand reads of held buffers
       description: |
         Upgrades the connection to WebSocket (`Upgrade: websocket`). Any
         number of clients may attach to the same stream at once. This
@@ -640,44 +674,43 @@ paths:
         **Live mirror** (server → client, unsolicited, best-effort — a client
         that can't keep up simply misses frames rather than slowing down the
         proxy): every chunk actually forwarded on the stream (both watch-mode
-        pass-through and released/resolved held chunks), as two frames:
+        pass-through and released held buffers), as two frames:
         1. Text frame (JSON metadata):
            ```json
            {"direction": N, "time": N, "length": N}
            ```
         2. Binary frame: raw chunk bytes
 
-        **`peek`** (client → server): the only way to read a currently-held
-        (not-yet-forwarded) chunk's bytes.
+        **`peek`** (client → server): the only way to read a direction's
+        currently-held (not-yet-released) bytes. Fetches the *whole* buffer
+        for that direction, optionally sliced.
         ```json
-        {"type": "peek", "id": N, "offset": N, "length": N}
+        {"type": "peek", "direction": N, "offset": N, "length": N}
         ```
-        - `id` — omit to return every currently-pending chunk for this stream
-          (at most one per direction) in full. Give it to target one specific
-          chunk instead.
-        - `offset`, `length` — only applied when `id` is given: read just
-          that byte range of the chunk (`length` `0` or omitted means "to the
-          end"). Ignored when peeking all pending chunks, since slicing only
-          makes sense against one target.
+        - `direction` — required, `0` or `1`.
+        - `offset`, `length` — optional byte-range slice of the buffer
+          (`length` `0` or omitted means "to the end").
 
-        Reply is zero or more of the following pairs, one per matched chunk,
-        terminated by a `peek-done` frame:
+        Reply is exactly one of the following pairs, terminated by a
+        `peek-done` frame:
         1. Text frame (JSON metadata):
            ```json
-           {"type": "pending", "id": N, "direction": N, "time": N, "offset": N, "length": N, "total_length": N}
+           {"type": "pending", "direction": N, "time": N, "offset": N, "length": N, "total_length": N, "bounds": [N, ...]}
            ```
            `offset`/`length` describe the slice actually returned;
-           `total_length` is the full chunk's size, so the caller always
-           knows whether it got a partial read.
-        2. Binary frame: the (possibly sliced) chunk bytes
+           `total_length` and `bounds` always describe the *whole* buffer
+           regardless of what was sliced, since a resync always wants the
+           complete picture and both are cheap. A direction with nothing
+           currently held is a normal zero-length reply here, not an error.
+        2. Binary frame: the (possibly sliced) buffer bytes
 
         Then:
         ```json
         {"type": "peek-done"}
         ```
 
-        If `id` was given but doesn't match a currently-pending chunk, the
-        reply is a single error frame instead:
+        If `direction` was invalid, the reply is a single error frame
+        instead:
         ```json
         {"type": "error", "message": "..."}
         ```
@@ -701,6 +734,95 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /api/i/tamper/scripts:
+    get:
+      tags: [scripts]
+      summary: List stored scripts
+      description: |
+        Storage layer for a planned programmatic, callback-driven alternative to
+        manual control-client decisions (JavaScript run in a browser Web
+        Worker — see CLAUDE.md's "Script storage" section). Metadata only, no
+        script bodies, so listing stays cheap. Returns `501` if the `tamper`
+        interceptor wasn't configured with `scripts-dir`.
+      operationId: listScripts
+      responses:
+        '200':
+          description: All stored scripts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScriptInfo'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/tamper/scripts/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_-][A-Za-z0-9_. -]*[A-Za-z0-9_-]$|^[A-Za-z0-9_-]$'
+        description: |
+          Script name, without the `.js` extension. Letters, digits, `_`, `-`,
+          `.`, and spaces only; must not start/end with `.` or a space, and
+          must not be exactly `.` or `..`.
+    get:
+      tags: [scripts]
+      summary: Fetch a script's content
+      operationId: getScript
+      responses:
+        '200':
+          description: Raw script source
+          content:
+            application/javascript:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      tags: [scripts]
+      summary: Create or overwrite a script
+      description: |
+        Writes the request body verbatim as `<name>.js` (atomically — never
+        observable as a partial write) and pushes a `script-updated` event on
+        the control WebSocket so a connected browser can react without
+        polling.
+      operationId: putScript
+      requestBody:
+        required: true
+        content:
+          application/javascript:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Script written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [scripts]
+      summary: Delete a script
+      description: Also pushes a `script-updated` event on the control WebSocket.
+      operationId: deleteScript
+      responses:
+        '204':
+          description: Script deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
 
   /ui:
     get:
@@ -854,6 +976,18 @@ components:
           type: string
           description: Human-readable error message
 
+    ScriptInfo:
+      type: object
+      required: [name, size]
+      properties:
+        name:
+          type: string
+          description: Script name, without the `.js` extension
+        size:
+          type: integer
+          format: int64
+          description: Size of the script's content in bytes
+
   responses:
 
     BadRequest:
@@ -872,6 +1006,13 @@ components:
 
     NotFound:
       description: The requested resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotImplemented:
+      description: The feature isn't configured/enabled on this interceptor instance
       content:
         application/json:
           schema:

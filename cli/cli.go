@@ -365,7 +365,11 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 			return nil, err
 		}
 
-		interceptor = tamper.NewTamperInterceptor(&tamperConf, logger)
+		ti, err := tamper.NewTamperInterceptor(&tamperConf, logger)
+		if err != nil {
+			return nil, err
+		}
+		interceptor = ti
 	default:
 		var err error
 		if cb != nil {

@@ -3,26 +3,43 @@ package tamper
 import (
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"tlstap/assert"
 	"tlstap/logging"
 	"tlstap/proxy"
 )
 
+// direction identifies which side of a connection a chunk or held buffer belongs to.
+type direction int
+
 const (
-	directionC2S = 0 // client -> server direction
-	directionS2C = 1 // server -> client direction
+	directionC2S direction = 0 // client -> server
+	directionS2C direction = 1 // server -> client
 )
 
+// valid reports whether d is one of the two legal direction values — every place a
+// direction arrives off the wire (release/drop-connection/peek) needs this same check.
+func (d direction) valid() bool {
+	return d == directionC2S || d == directionS2C
+}
+
+// action is the "action" field of a "release" command — what to do with the bytes being
+// released. Unlike the old per-chunk protocol, dropping the connection is its own command
+// (see "drop-connection" in protocol.go), not a value of this type, since it isn't
+// parameterized by a buffer prefix the way forward/drop are.
+//
+// Deliberately a separate type from buffer.go's releaseAct, which is iota-based and used
+// internally by heldBuffer: buffer.go is protocol-agnostic and independently unit-tested,
+// so it never sees these wire string values directly — handleRelease is what translates
+// one into the other.
 type action string
 
 const (
-	actionForward        action = "forward"
-	actionDrop           action = "drop"
-	actionDropConnection action = "drop-connection"
+	actionForward action = "forward"
+	actionDrop    action = "drop"
 )
 
 // TamperConfig is the JSON args for the "tamper" interceptor.
@@ -36,26 +53,17 @@ type TamperConfig struct {
 	// passing straight through), still bounded by HoldTimeoutMs. Guards against a
 	// client attaching after traffic has already started flowing.
 	HoldUntilConnected bool `json:"hold-until-connected"`
-}
 
-// resolution is delivered to a blocked Intercept() call once a held chunk's fate is
-// decided (or synthesized on timeout/disconnect/mode-change).
-type resolution struct {
-	action action
-	data   []byte
-}
-
-// pendingChunk is a chunk currently held awaiting a decision.
-type pendingChunk struct {
-	ch        chan resolution // buffered(1); never closed, only ever sent to once
-	data      []byte          // original bytes, used if resolved without an edit or peeked
-	direction int
-	time      int64 // UnixMilli when it was registered
+	// Directory user-editable/CLI-pushed scripts are stored in and served from (see
+	// scripts.go). Empty disables the scripts feature entirely — the REST endpoints
+	// still exist but reject every request with 501, rather than silently defaulting to
+	// some implicit directory.
+	ScriptsDir string `json:"scripts-dir"`
 }
 
 // mirrorFrame is one chunk queued for delivery to a /watch client.
 type mirrorFrame struct {
-	direction int
+	direction direction
 	timestamp int64
 	data      []byte
 }
@@ -91,7 +99,16 @@ type streamState struct {
 	clientEndpoint string // the (proxy-local) client endpoint, for direction detection
 	intercepting   bool
 	watchers       map[*websocket.Conn]*watcher
-	pending        map[int64]*pendingChunk
+	held           [2]*heldBuffer // indexed by directionC2S/directionS2C
+}
+
+// directionOf classifies which direction info belongs to, by comparing against the client
+// endpoint recorded on first sight of the stream — same technique dbdump uses.
+func directionOf(st *streamState, info *proxy.ConnInfo) direction {
+	if info.SrcEndpoint == st.clientEndpoint {
+		return directionC2S
+	}
+	return directionS2C
 }
 
 // TamperInterceptor lets a connected control client actively pause, inspect, edit,
@@ -107,30 +124,43 @@ type TamperInterceptor struct {
 	holdTimeout        time.Duration
 	holdUntilConnected bool
 	logger             *logging.Logger
+	scripts            *scriptStore // nil if ScriptsDir wasn't configured
 
 	mu               sync.Mutex
 	control          *websocket.Conn
-	controlDone      chan struct{} // closed when the control connection drops
 	autoInterceptNew bool
 	streams          map[uint32]*streamState
 
 	controlWriteMu sync.Mutex
-
-	nextChunkID atomic.Int64
 }
 
-func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) *TamperInterceptor {
+// NewTamperInterceptor creates the interceptor and, if config.ScriptsDir is set, the
+// scripts directory (returning an error if it can't be created). This has to happen here
+// rather than in Init: RegisterRoutes is called synchronously while building the proxy,
+// before Init runs asynchronously in the proxy's own start goroutine, so the scripts REST
+// handlers must find i.scripts already usable the moment they're registered.
+func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*TamperInterceptor, error) {
 	var holdTimeout time.Duration
 	if config.HoldTimeoutMs > 0 {
 		holdTimeout = time.Duration(config.HoldTimeoutMs) * time.Millisecond
+	}
+
+	var scripts *scriptStore
+	if config.ScriptsDir != "" {
+		var err error
+		scripts, err = newScriptStore(config.ScriptsDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &TamperInterceptor{
 		holdTimeout:        holdTimeout,
 		holdUntilConnected: config.HoldUntilConnected,
 		logger:             logger,
+		scripts:            scripts,
 		streams:            make(map[uint32]*streamState),
-	}
+	}, nil
 }
 
 func (i *TamperInterceptor) Init(addr net.TCPAddr) error {
@@ -158,13 +188,16 @@ func (i *TamperInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 			clientEndpoint: info.SrcEndpoint,
 			intercepting:   i.autoInterceptNew,
 			watchers:       make(map[*websocket.Conn]*watcher),
-			pending:        make(map[int64]*pendingChunk),
+			held: [2]*heldBuffer{
+				directionC2S: newHeldBuffer(i.holdTimeout),
+				directionS2C: newHeldBuffer(i.holdTimeout),
+			},
 		}
 	}
 	i.mu.Unlock()
 
 	if !exists {
-		i.sendEvent(streamCreatedMsg{Type: "stream-created", Conn: info.ConnID, Src: info.SrcEndpoint, Dst: info.DstEndpoint})
+		i.sendEvent(streamCreatedMsg{Type: msgStreamCreated, Conn: info.ConnID, Src: info.SrcEndpoint, Dst: info.DstEndpoint})
 	}
 
 	return nil
@@ -191,15 +224,26 @@ func (i *TamperInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 		return nil
 	}
 
+	st.held[directionC2S].close()
+	st.held[directionS2C].close()
+
 	for _, w := range watchersSnapshot {
 		i.detachWatcher(st, w.conn)
 	}
 
-	i.sendEvent(streamTerminatedMsg{Type: "stream-terminated", Conn: info.ConnID})
+	i.sendEvent(streamTerminatedMsg{Type: msgStreamTerminated, Conn: info.ConnID})
 	return nil
 }
 
+// Intercept never blocks: when a chunk needs to be held, it's appended to that direction's
+// heldBuffer and Intercept returns immediately with (nil, nil). Release — forwarding, dropping,
+// or aborting the connection — happens later, asynchronously, via ConnHandler reading
+// ReleaseChannel (see proxy.BufferingInterceptor and HasPending/ReleaseChannel below).
 func (i *TamperInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
+	// data is a view into the proxy's shared read buffer; copy it before the caller's
+	// next Read() can overwrite it (both for mirroring and for a potential hold).
+	dataCopy := append([]byte(nil), data...)
+
 	i.mu.Lock()
 	st := i.streams[info.ConnID]
 	if st == nil {
@@ -208,90 +252,65 @@ func (i *TamperInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte
 		return data, nil
 	}
 
-	direction := directionS2C
-	if info.SrcEndpoint == st.clientEndpoint {
-		direction = directionC2S
-	}
+	dir := directionOf(st, info)
+	hasControl := i.control != nil
+	// Hold if the stream is explicitly in intercept mode and someone's connected to decide,
+	// OR if holdUntilConnected is set and nobody's connected at all (so traffic is never
+	// silently missed while no client has attached yet).
+	holdNow := (st.intercepting && hasControl) || (i.holdUntilConnected && !hasControl)
 
-	// data is a view into the proxy's shared read buffer; copy it before the caller's
-	// next Read() can overwrite it (both for mirroring and for a potential hold).
-	dataCopy := append([]byte(nil), data...)
+	var offset int
+	if holdNow {
+		// Deciding holdNow and appending happen under the same i.mu critical section, so a
+		// concurrent setMode/control-disconnect sweep (which also takes i.mu) can never
+		// interleave between the two — it either runs entirely before this append (and so
+		// correctly doesn't release a chunk that isn't there yet) or entirely after (and so
+		// correctly does release it).
+		offset = st.held[dir].appendChunk(dataCopy)
+	}
 
 	watchers := make([]*watcher, 0, len(st.watchers))
 	for _, w := range st.watchers {
 		watchers = append(watchers, w)
 	}
-
-	intercepting := st.intercepting
-	hasControl := i.control != nil
-	controlDone := i.controlDone
 	i.mu.Unlock()
 
-	mirror(watchers, direction, dataCopy)
+	mirror(watchers, dir, dataCopy)
 
-	// Hold if the stream is explicitly in intercept mode and someone's connected to
-	// decide, OR if holdUntilConnected is set and nobody's connected at all (so traffic
-	// is never silently missed while no client has attached yet).
-	holdNow := (intercepting && hasControl) || (i.holdUntilConnected && !hasControl)
 	if !holdNow {
 		return data, nil
 	}
 
-	id := i.nextChunkID.Add(1)
-	ch := make(chan resolution, 1)
-	now := time.Now().UnixMilli()
+	i.sendHeld(info.ConnID, dir, offset, len(dataCopy))
+	return nil, nil
+}
 
+// HasPending implements proxy.BufferingInterceptor.
+func (i *TamperInterceptor) HasPending(info *proxy.ConnInfo) bool {
 	i.mu.Lock()
-	// Re-check: state may have changed between the unlock above and here (e.g. the
-	// control client (dis)connected, or the stream was switched back to watch mode).
-	hasControlNow := i.control != nil
-	if !((st.intercepting && hasControlNow) || (i.holdUntilConnected && !hasControlNow)) {
-		i.mu.Unlock()
-		return data, nil
-	}
-	st.pending[id] = &pendingChunk{ch: ch, data: dataCopy, direction: direction, time: now}
+	st := i.streams[info.ConnID]
 	i.mu.Unlock()
+	assert.Assertf(st != nil, "tamper: HasPending called for unknown stream %d", info.ConnID)
+	return st.held[directionOf(st, info)].hasPending()
+}
 
-	defer func() {
-		i.mu.Lock()
-		delete(st.pending, id)
-		i.mu.Unlock()
-	}()
-
-	i.sendHeld(info.ConnID, id, direction, len(dataCopy))
-
-	var timeoutC <-chan time.Time
-	if i.holdTimeout > 0 {
-		timer := time.NewTimer(i.holdTimeout)
-		defer timer.Stop()
-		timeoutC = timer.C
-	}
-
-	select {
-	case res := <-ch:
-		switch res.action {
-		case actionDrop:
-			return nil, nil
-		case actionDropConnection:
-			return nil, proxy.ErrAbort
-		default: // forward
-			return res.data, nil
-		}
-	case <-timeoutC:
-		return data, nil
-	case <-controlDone:
-		return data, nil
-	}
+// ReleaseChannel implements proxy.BufferingInterceptor.
+func (i *TamperInterceptor) ReleaseChannel(info *proxy.ConnInfo) <-chan proxy.ReleasedData {
+	i.mu.Lock()
+	st := i.streams[info.ConnID]
+	i.mu.Unlock()
+	assert.Assertf(st != nil, "tamper: ReleaseChannel called for unknown stream %d", info.ConnID)
+	return st.held[directionOf(st, info)].relCh
 }
 
 // mirror best-effort forwards a chunk to every attached watcher. It never blocks: a
 // watcher whose channel is full (too slow to keep up) simply misses the frame.
-func mirror(watchers []*watcher, direction int, data []byte) {
+func mirror(watchers []*watcher, dir direction, data []byte) {
 	if len(watchers) == 0 {
 		return
 	}
 
-	frame := mirrorFrame{direction: direction, timestamp: time.Now().UnixMilli(), data: data}
+	frame := mirrorFrame{direction: dir, timestamp: time.Now().UnixMilli(), data: data}
 	for _, w := range watchers {
 		select {
 		case w.ch <- frame:
@@ -301,8 +320,8 @@ func mirror(watchers []*watcher, direction int, data []byte) {
 }
 
 // setMode switches a stream between watch and intercept mode. Turning interception off
-// immediately force-resolves (forwards, unmodified) every chunk currently held for that
-// stream, rather than leaving them to time out. Reports whether the stream existed, so
+// immediately force-releases (forwards, unmodified) everything currently held for that
+// stream, rather than leaving it to time out. Reports whether the stream existed, so
 // the caller can ack or error the command that triggered it.
 func (i *TamperInterceptor) setMode(connID uint32, intercepting bool) bool {
 	i.mu.Lock()
@@ -312,21 +331,11 @@ func (i *TamperInterceptor) setMode(connID uint32, intercepting bool) bool {
 		return false
 	}
 	st.intercepting = intercepting
-
-	var toRelease []*pendingChunk
-	if !intercepting {
-		for id, pc := range st.pending {
-			toRelease = append(toRelease, pc)
-			delete(st.pending, id)
-		}
-	}
 	i.mu.Unlock()
 
-	for _, pc := range toRelease {
-		select {
-		case pc.ch <- resolution{action: actionForward, data: pc.data}:
-		default:
-		}
+	if !intercepting {
+		st.held[directionC2S].releaseAll()
+		st.held[directionS2C].releaseAll()
 	}
 
 	return true

@@ -28,6 +28,9 @@ type ConnHandler struct {
 	InterceptorsUp   []Interceptor
 	InterceptorsDown []Interceptor
 
+	bufferingUp   []bufferingEntry
+	bufferingDown []bufferingEntry
+
 	ConnUp   net.Conn
 	ConnDown net.Conn
 
@@ -237,7 +240,7 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 
 		// signal completion of TLS upgrade
 		h.upgradeChan <- true
-		return h.forwardOneWay(tlsConnDown, tlsConnUp, buf, h.InterceptorsUp, &connInfo)
+		return h.forwardOneWay(tlsConnDown, tlsConnUp, buf, h.InterceptorsUp, &connInfo, h.bufferingUp)
 	}
 }
 
@@ -313,8 +316,8 @@ func (h *ConnHandler) forwardGeneric() error {
 	}
 
 	h.wg.Add(1)
-	go h.forwardOneWay(h.ConnDown, h.ConnUp, bufUp, h.InterceptorsUp, &connInfoUp)
-	h.forwardOneWay(h.ConnUp, h.ConnDown, bufDown, h.InterceptorsDown, &connInfoDown)
+	go h.forwardOneWay(h.ConnDown, h.ConnUp, bufUp, h.InterceptorsUp, &connInfoUp, h.bufferingUp)
+	h.forwardOneWay(h.ConnUp, h.ConnDown, bufDown, h.InterceptorsDown, &connInfoDown, h.bufferingDown)
 
 	h.wg.Wait()
 	h.notifyConnTerminated()
@@ -364,7 +367,14 @@ func (h *ConnHandler) notifyConnTerminated() error {
 	return nil
 }
 
-func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, interceptors []Interceptor, info *ConnInfo) error {
+// forwardOneWay is phase 1 (synchronous) of one direction's forwarding loop: a direct blocking
+// read, run the interceptor chain, write. Behavior and cost are unchanged from before buffering
+// interceptors existed as long as buffering is empty (the common case for every interceptor in
+// the codebase today) or none of them ever actually holds anything for this connection. The one
+// exception is the lazy, one-way transition into forwardOneWayAsync (phase 2), taken the first
+// time a buffering interceptor reports it's holding something — from that point on this goroutine
+// never calls srcConn.Read directly again for the remainder of the connection.
+func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, interceptors []Interceptor, info *ConnInfo, buffering []bufferingEntry) error {
 	for {
 		r, err := srcConn.Read(buf)
 		switch {
@@ -386,24 +396,230 @@ func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, inter
 			continue
 		}
 
-		switch data, err := h.intercept(interceptors, buf[:r], info); {
-		case err != nil:
+		data, err := h.intercept(interceptors, buf[:r], info)
+		if err != nil {
 			h.terminate()
 			return err
-		case len(data) > 0:
+		}
+		if len(data) > 0 {
 			dstConn.Write(data)
+		}
+		// Deliberately not exclusive with the write above: a buffering interceptor may forward
+		// part of what it received and still be holding the rest (see the contract note on
+		// BufferingInterceptor), so both a write and a transition can be warranted for the same
+		// chunk. len(buffering) > 0 short-circuits anyPending away entirely whenever this
+		// direction's chain has no buffering interceptor at all.
+		if len(buffering) > 0 && anyPending(buffering, info) {
+			return h.forwardOneWayAsync(srcConn, dstConn, interceptors, info, buffering)
 		}
 	}
 }
 
+type pumpMsg struct {
+	data []byte
+	err  error
+}
+
+// readPump owns all further srcConn.Read calls for this direction once forwardOneWayAsync starts
+// it, so the outer select loop can wait on a channel instead of a blocking Read. Keeps its own
+// scratch buffer, never shared with the consumer, and copies out a right-sized slice per read
+// before sending — the consumer's slice is then safe to hold onto while the pump loops back to
+// Read again, which is what lets the pump read ahead instead of lockstep-waiting on the consumer.
+// Reuses the exact same EOF/deadline/other-error classification forwardOneWay uses, relayed to the
+// consumer via pumpMsg instead of a direct return, so shutdown behavior doesn't diverge between
+// the pre- and post-transition phases.
+//
+// Every send to out races against stop, closed by forwardOneWayAsync right before it returns —
+// without this, a pump whose consumer already exited via the release-channel arm of the select
+// would block forever handing off its next (or final, error) message to nobody, leaking the
+// goroutine. Same discipline tamper's watcher teardown already uses for the same reason: close a
+// dedicated stop channel, don't rely on the data channel itself or on buffering to save you.
+func (h *ConnHandler) readPump(srcConn net.Conn, info *ConnInfo, out chan<- pumpMsg, stop <-chan struct{}) {
+	scratch := make([]byte, bufSize)
+	for {
+		r, err := srcConn.Read(scratch)
+		switch {
+		case err == nil:
+			if r > 0 {
+				data := make([]byte, r)
+				copy(data, scratch[:r])
+				select {
+				case out <- pumpMsg{data: data}:
+				case <-stop:
+					return
+				}
+			}
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			if !h.eofEncounterd.Load() {
+				h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
+			}
+			select {
+			case out <- pumpMsg{err: err}:
+			case <-stop:
+			}
+			return
+		default:
+			h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
+			h.eofEncounterd.Store(true)
+			h.terminate()
+			select {
+			case out <- pumpMsg{err: err}:
+			case <-stop:
+			}
+			return
+		}
+	}
+}
+
+type releaseMsg struct {
+	chainIdx int
+	data     []byte
+	err      error
+}
+
+// fanInReleases merges every buffering interceptor's release channel for this direction into one,
+// tagging each message with its originating chain index so the consumer knows where to resume the
+// interceptor chain (see interceptFrom). Closes the returned channel only once every source
+// channel has closed — i.e. once every buffering interceptor has torn down for this ConnID+info,
+// per the BufferingInterceptor contract that it must close its channel on ConnectionTerminated.
+//
+// Both the receive from each source channel and the send to out race against stop for the same
+// reason readPump does: once forwardOneWayAsync has returned via some other arm, nothing may be
+// left trying to hand data to it.
+func fanInReleases(buffering []bufferingEntry, info *ConnInfo, stop <-chan struct{}) <-chan releaseMsg {
+	out := make(chan releaseMsg)
+	var wg sync.WaitGroup
+	wg.Add(len(buffering))
+	for _, e := range buffering {
+		idx, ch := e.idx, e.bi.ReleaseChannel(info)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case rd, ok := <-ch:
+					if !ok {
+						return
+					}
+					select {
+					case out <- releaseMsg{chainIdx: idx, data: rd.Data, err: rd.Err}:
+					case <-stop:
+						return
+					}
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+// forwardOneWayAsync is phase 2 of one direction's forwarding loop, entered exactly once (see
+// forwardOneWay) and never left: a select between the read pump (new inbound data) and the
+// buffering interceptors' merged release channel (previously-held data ready to continue through
+// the rest of the chain). Terminates and logs identically to forwardOneWay regardless of which
+// arm triggers it, so shutdown behavior is the same whether or not a direction ever buffered
+// anything.
+func (h *ConnHandler) forwardOneWayAsync(srcConn, dstConn net.Conn, interceptors []Interceptor, info *ConnInfo, buffering []bufferingEntry) error {
+	stop := make(chan struct{})
+	defer close(stop) // lets readPump and fanInReleases's relay goroutines exit however they're
+	// currently blocked, the moment this function returns via either select arm below.
+
+	pumpCh := make(chan pumpMsg) // unbuffered: pump blocks handing off, preserving the same
+	// backpressure the direct blocking-read loop provides today.
+	go h.readPump(srcConn, info, pumpCh, stop)
+	releaseCh := fanInReleases(buffering, info, stop)
+
+	for {
+		select {
+		case msg := <-pumpCh:
+			if msg.err != nil {
+				return msg.err
+			}
+			data, err := h.intercept(interceptors, msg.data, info)
+			if err != nil {
+				h.terminate()
+				return err
+			}
+			if len(data) > 0 {
+				dstConn.Write(data)
+			}
+
+		case rel, ok := <-releaseCh:
+			if !ok {
+				// Every buffering interceptor for this (ConnID, direction) has torn down —
+				// treat as connection-terminated, not as an empty release. Must be handled via
+				// the two-value receive specifically: a closed channel is always ready to
+				// receive, so failing to check ok here would busy-loop this select arm forever.
+				h.terminate()
+				return nil
+			}
+			if rel.err != nil {
+				h.terminate()
+				return rel.err
+			}
+			data, err := h.interceptFrom(rel.chainIdx+1, interceptors, rel.data, info)
+			if err != nil {
+				h.terminate()
+				return err
+			}
+			if len(data) > 0 {
+				dstConn.Write(data)
+			}
+		}
+	}
+}
+
+// bufferingEntry records a BufferingInterceptor's position in an interceptor chain, resolved
+// once per connection (see scanBuffering) so ConnHandler never needs to re-assert interceptor
+// types on the hot path.
+type bufferingEntry struct {
+	idx int
+	bi  BufferingInterceptor
+}
+
+// scanBuffering finds every BufferingInterceptor in interceptors, in chain order. Called once per
+// connection (in newHandler, proxy.go) — interceptors chains are short, so this is negligible.
+func scanBuffering(interceptors []Interceptor) []bufferingEntry {
+	var out []bufferingEntry
+	for idx, i := range interceptors {
+		if bi, ok := i.(BufferingInterceptor); ok {
+			out = append(out, bufferingEntry{idx, bi})
+		}
+	}
+	return out
+}
+
+// anyPending reports whether any of the given buffering interceptors currently holds anything
+// for info's (ConnID, direction).
+func anyPending(buffering []bufferingEntry, info *ConnInfo) bool {
+	for _, e := range buffering {
+		if e.bi.HasPending(info) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *ConnHandler) intercept(interceptors []Interceptor, data []byte, info *ConnInfo) ([]byte, error) {
+	return h.interceptFrom(0, interceptors, data, info)
+}
+
+// interceptFrom runs interceptors[startIdx:] over data in order, exactly like intercept but
+// windowed — used both for a normal full pass (startIdx 0, via intercept) and to resume the chain
+// right after a buffering interceptor releases data (startIdx = that interceptor's index + 1).
+func (h *ConnHandler) interceptFrom(startIdx int, interceptors []Interceptor, data []byte, info *ConnInfo) ([]byte, error) {
 	if interceptors == nil {
 		return data, nil
 	}
 
 	var err error
 	var tmp []byte
-	for _, i := range interceptors {
+	for _, i := range interceptors[startIdx:] {
 		if len(data) == 0 {
 			break
 		}

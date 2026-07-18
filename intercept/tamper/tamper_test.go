@@ -20,7 +20,10 @@ func newTestServer(t *testing.T, holdTimeoutMs int) (*TamperInterceptor, string)
 
 func newTestServerWithConfig(t *testing.T, config TamperConfig) (*TamperInterceptor, string) {
 	t.Helper()
-	ti := NewTamperInterceptor(&config, nil)
+	ti, err := NewTamperInterceptor(&config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
 	ti.RegisterRoutes(mux, "/api/i/tamper")
 	server := httptest.NewServer(mux)
@@ -103,9 +106,9 @@ func readBinary(t *testing.T, conn *websocket.Conn) []byte {
 	return data
 }
 
-func boolPtr(b bool) *bool    { return &b }
-func u32Ptr(u uint32) *uint32 { return &u }
-func i64Ptr(i int64) *int64   { return &i }
+func boolPtr(b bool) *bool                { return &b }
+func u32Ptr(u uint32) *uint32             { return &u }
+func directionPtr(d direction) *direction { return &d }
 
 // replyMsg is a superset of okMsg/errorMsg's fields, decoded generically since which
 // one arrived is read from Type.
@@ -116,7 +119,8 @@ type replyMsg struct {
 }
 
 // readAck reads one control-channel reply and requires it to be an "ok" or "error"
-// acknowledgment — every set-mode/resolve/set-auto-intercept command sends exactly one.
+// acknowledgment — every set-mode/release/drop-connection/set-auto-intercept command
+// sends exactly one.
 func readAck(t *testing.T, control *websocket.Conn) replyMsg {
 	t.Helper()
 	var r replyMsg
@@ -135,8 +139,9 @@ func requireOK(t *testing.T, r replyMsg) {
 }
 
 // sendCommandOK writes msg to control and asserts the reply acknowledges success. Used
-// for set-mode/resolve commands that carry no trailing binary frame; commands that do
-// (an edited resolve) write the binary frame themselves and call readAck directly.
+// for set-mode/release/drop-connection commands that carry no trailing binary frame;
+// commands that do (an edited release) write the binary frame themselves and call
+// readAck directly.
 func sendCommandOK(t *testing.T, control *websocket.Conn, msg inboundMsg) {
 	t.Helper()
 	writeJSON(t, control, msg)
@@ -165,25 +170,21 @@ func waitForWatcherAttached(t *testing.T, ti *TamperInterceptor, connID uint32) 
 	t.Fatalf("watcher for conn %d never attached", connID)
 }
 
-// waitForPendingCount polls internal state until a stream's pending-chunk count
-// reaches want, avoiding a race between registering a hold and observing it.
-func waitForPendingCount(t *testing.T, ti *TamperInterceptor, connID uint32, want int) {
+// waitForHeldChunks polls internal state until a stream direction's held-buffer chunk
+// count reaches want, avoiding a race between registering a hold and observing it.
+func waitForHeldChunks(t *testing.T, ti *TamperInterceptor, connID uint32, dir direction, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		ti.mu.Lock()
 		st := ti.streams[connID]
-		n := 0
-		if st != nil {
-			n = len(st.pending)
-		}
 		ti.mu.Unlock()
-		if n == want {
+		if st != nil && st.held[dir].numChunks() == want {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("stream %d never reached %d pending chunk(s)", connID, want)
+	t.Fatalf("stream %d direction %d never reached %d held chunk(s)", connID, dir, want)
 }
 
 func findStreamInfo(list *streamListMsg, connID uint32) *streamInfo {
@@ -199,17 +200,19 @@ func findStreamInfo(list *streamListMsg, connID uint32) *streamInfo {
 // decode target can handle any reply a "peek" command produces.
 type peekReply struct {
 	Type        string `json:"type"`
-	ID          int64  `json:"id"`
 	Direction   int    `json:"direction"`
 	Time        int64  `json:"time"`
 	Offset      int64  `json:"offset"`
 	Length      int    `json:"length"`
 	TotalLength int    `json:"total_length"`
+	Bounds      []int  `json:"bounds"`
 	Message     string `json:"message"`
 }
 
 // collectPeekReplies reads "pending" (+ its binary frame) messages until "peek-done" or
-// "error", returning whichever terminated the sequence.
+// "error", returning whichever terminated the sequence. The new per-direction "peek"
+// always produces at most one "pending" entry (never a loop over several chunk ids, the
+// way the old per-chunk protocol did), but this stays generic over that count.
 func collectPeekReplies(t *testing.T, watch *websocket.Conn) ([]peekReply, [][]byte, *peekReply) {
 	t.Helper()
 	var replies []peekReply
@@ -231,35 +234,27 @@ func collectPeekReplies(t *testing.T, watch *websocket.Conn) ([]peekReply, [][]b
 	}
 }
 
-type interceptResult struct {
-	data []byte
-	err  error
-}
-
-func interceptAsync(ti *TamperInterceptor, info *proxy.ConnInfo, data []byte) <-chan interceptResult {
-	ch := make(chan interceptResult, 1)
-	go func() {
-		out, err := ti.Intercept(info, data)
-		ch <- interceptResult{data: out, err: err}
-	}()
-	return ch
-}
-
-func recvResult(t *testing.T, ch <-chan interceptResult) interceptResult {
+// recvRelease reads exactly one value off a heldBuffer's release channel (as exposed via
+// ReleaseChannel), the async replacement for what interceptAsync/recvResult used to
+// synthesize around a blocking Intercept() call — Intercept() itself never blocks now.
+func recvRelease(t *testing.T, ch <-chan proxy.ReleasedData) proxy.ReleasedData {
 	t.Helper()
 	select {
-	case r := <-ch:
-		return r
+	case rd := <-ch:
+		return rd
 	case <-time.After(2 * time.Second):
-		t.Fatal("Intercept did not return in time")
-		return interceptResult{}
+		t.Fatal("timed out waiting for a release")
+		return proxy.ReleasedData{}
 	}
 }
 
 // No control client connected at all: traffic must pass straight through, and
 // Intercept must never block waiting for anything.
 func TestNoControl_PassThrough(t *testing.T) {
-	ti := NewTamperInterceptor(&TamperConfig{}, nil)
+	ti, err := NewTamperInterceptor(&TamperConfig{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	info := fakeConnInfo(1)
 	if err := ti.ConnectionEstablished(info); err != nil {
 		t.Fatal(err)
@@ -286,7 +281,7 @@ func TestWatchMode_NonBlockingAndMirrored(t *testing.T) {
 	}
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	if created.Type != "stream-created" {
+	if created.Type != msgStreamCreated {
 		t.Fatalf("expected stream-created, got %+v", created)
 	}
 
@@ -311,8 +306,8 @@ func TestWatchMode_NonBlockingAndMirrored(t *testing.T) {
 	}
 }
 
-// A held chunk resolved with "forward" + edited bytes returns the edited bytes.
-func TestHold_ResolveForwardEdited(t *testing.T) {
+// A held chunk released with "forward" + edited bytes releases the edited bytes.
+func TestHold_ReleaseForwardEdited(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 
@@ -321,33 +316,39 @@ func TestHold_ResolveForwardEdited(t *testing.T) {
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
 
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
-	if held.Type != "held" || held.Direction != directionC2S || held.Length != len("original") {
+	if held.Type != msgHeld || held.Direction != directionC2S || held.Length != len("original") || held.Offset != 0 {
 		t.Fatalf("unexpected held message: %+v", held)
 	}
 
-	writeJSON(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(held.ID), Action: "forward", Edited: boolPtr(true)})
+	writeJSON(t, control, inboundMsg{
+		Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S),
+		Edited: boolPtr(true), PrefixLength: len("original"), Bounds: []int{0}, ReleaseChunks: 1, Action: actionForward,
+	})
 	if err := control.WriteMessage(websocket.BinaryMessage, []byte("edited")); err != nil {
 		t.Fatal(err)
 	}
 	requireOK(t, readAck(t, control))
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "edited" {
-		t.Fatalf("expected edited bytes, got %q", r.data)
+	if string(rd.Data) != "edited" {
+		t.Fatalf("expected edited bytes, got %q", rd.Data)
 	}
 }
 
-// A held chunk resolved with "forward" and no edit forwards the original bytes.
-func TestHold_ResolveForwardUnedited(t *testing.T) {
+// A held chunk released with "forward" and no edit releases the original bytes.
+func TestHold_ReleaseForwardUnedited(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 
@@ -355,26 +356,29 @@ func TestHold_ResolveForwardUnedited(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(held.ID), Action: "forward", Edited: boolPtr(false)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "original" {
-		t.Fatalf("expected original bytes, got %q", r.data)
+	if string(rd.Data) != "original" {
+		t.Fatalf("expected original bytes, got %q", rd.Data)
 	}
 }
 
-// A held chunk resolved with "drop" forwards nothing and does not error.
-func TestHold_ResolveDrop(t *testing.T) {
+// A held chunk released with "drop" forwards nothing and does not error.
+func TestHold_ReleaseDrop(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 
@@ -382,26 +386,29 @@ func TestHold_ResolveDrop(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(held.ID), Action: "drop"})
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionDrop, ReleaseChunks: 1})
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if len(r.data) != 0 {
-		t.Fatalf("expected no data forwarded on drop, got %q", r.data)
+	if len(rd.Data) != 0 {
+		t.Fatalf("expected no data forwarded on drop, got %q", rd.Data)
 	}
 }
 
-// A held chunk resolved with "drop-connection" returns proxy.ErrAbort.
-func TestHold_ResolveDropConnection(t *testing.T) {
+// "drop-connection" aborts the connection outright, independent of "release".
+func TestHold_DropConnection(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 
@@ -409,22 +416,25 @@ func TestHold_ResolveDropConnection(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(held.ID), Action: "drop-connection"})
+	sendCommandOK(t, control, inboundMsg{Type: cmdDropConnection, Conn: u32Ptr(1), Direction: directionPtr(directionC2S)})
 
-	r := recvResult(t, resCh)
-	if r.err != proxy.ErrAbort {
-		t.Fatalf("expected proxy.ErrAbort, got %v", r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != proxy.ErrAbort {
+		t.Fatalf("expected proxy.ErrAbort, got %v", rd.Err)
 	}
 }
 
-// If nobody resolves a held chunk before the configured timeout, it is auto-forwarded
+// If nobody releases a held chunk before the configured timeout, it is auto-forwarded
 // unmodified.
 func TestHold_Timeout(t *testing.T) {
 	ti, wsURL := newTestServer(t, 50)
@@ -434,24 +444,27 @@ func TestHold_Timeout(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
-	// Deliberately never resolve.
+	// Deliberately never release.
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "original" {
-		t.Fatalf("expected original bytes on timeout, got %q", r.data)
+	if string(rd.Data) != "original" {
+		t.Fatalf("expected original bytes on timeout, got %q", rd.Data)
 	}
 }
 
-// Disconnecting the control client immediately releases every chunk currently held,
+// Disconnecting the control client immediately releases everything currently held,
 // forwarding the original bytes, rather than waiting for individual timeouts.
 func TestHold_ControlDisconnectReleases(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0) // infinite timeout: only disconnect can release this
@@ -461,26 +474,29 @@ func TestHold_ControlDisconnectReleases(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
 	control.Close()
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "original" {
-		t.Fatalf("expected original bytes on control disconnect, got %q", r.data)
+	if string(rd.Data) != "original" {
+		t.Fatalf("expected original bytes on control disconnect, got %q", rd.Data)
 	}
 }
 
-// Switching a stream back to watch mode force-resolves any chunk currently held for
-// it, rather than leaving it to time out.
+// Switching a stream back to watch mode force-releases anything currently held for it,
+// rather than leaving it to time out.
 func TestSetMode_ForceReleasesPending(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0) // infinite timeout: only the mode switch can release this
 	info := fakeConnInfo(1)
@@ -489,21 +505,24 @@ func TestSetMode_ForceReleasesPending(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("original"))
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(false)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(false)})
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "original" {
-		t.Fatalf("expected original bytes forced-released, got %q", r.data)
+	if string(rd.Data) != "original" {
+		t.Fatalf("expected original bytes forced-released, got %q", rd.Data)
 	}
 }
 
@@ -520,30 +539,36 @@ func TestDirectionDetection(t *testing.T) {
 	readJSON(t, control, &created)
 	ti.ConnectionEstablished(down) // second call for the same ConnID: no-op, no event
 
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	c2sCh := interceptAsync(ti, up, []byte("c2s"))
+	out, err := ti.Intercept(up, []byte("c2s"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 	var c2sHeld heldMsg
 	readJSON(t, control, &c2sHeld)
 	if c2sHeld.Direction != directionC2S {
 		t.Fatalf("expected c2s direction for up info, got %d", c2sHeld.Direction)
 	}
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(c2sHeld.ID), Action: "forward"})
-	recvResult(t, c2sCh)
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(up))
 
-	s2cCh := interceptAsync(ti, down, []byte("s2c"))
+	out, err = ti.Intercept(down, []byte("s2c"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 	var s2cHeld heldMsg
 	readJSON(t, control, &s2cHeld)
 	if s2cHeld.Direction != directionS2C {
 		t.Fatalf("expected s2c direction for down info, got %d", s2cHeld.Direction)
 	}
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(s2cHeld.ID), Action: "forward"})
-	recvResult(t, s2cCh)
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionS2C), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(down))
 }
 
-// stream-list reports currently-held chunks inline, so reconnecting to control at any
-// time (not just being connected at the moment a chunk was held) is enough to discover
-// and act on everything outstanding.
+// stream-list reports each direction's held buffer inline as a chunks/length summary, so
+// reconnecting to control at any time (not just being connected at the moment a chunk
+// was held) is enough to discover and act on everything outstanding.
 func TestStreamList_PendingInfo(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
@@ -552,14 +577,17 @@ func TestStreamList_PendingInfo(t *testing.T) {
 	ti.ConnectionEstablished(info)
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
-	sendCommandOK(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
 
-	resCh := interceptAsync(ti, info, []byte("pending-data"))
+	out, err := ti.Intercept(info, []byte("pending-data"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	var held heldMsg
 	readJSON(t, control, &held)
 
-	writeJSON(t, control, inboundMsg{Type: "list-streams"})
+	writeJSON(t, control, inboundMsg{Type: cmdListStreams})
 	var list streamListMsg
 	readJSON(t, control, &list)
 
@@ -568,125 +596,121 @@ func TestStreamList_PendingInfo(t *testing.T) {
 		t.Fatal("stream 1 not found in stream-list")
 	}
 	if len(stream.Pending) != 1 {
-		t.Fatalf("expected exactly 1 pending chunk, got %d", len(stream.Pending))
+		t.Fatalf("expected exactly 1 pending direction, got %d", len(stream.Pending))
 	}
 	p := stream.Pending[0]
-	if p.ID != held.ID || p.Direction != directionC2S || p.Length != len("pending-data") {
+	if p.Direction != directionC2S || p.Chunks != 1 || p.Length != len("pending-data") {
 		t.Fatalf("unexpected pending info: %+v", p)
 	}
 
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(held.ID), Action: "forward"})
-	recvResult(t, resCh)
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(info))
 }
 
-// With no id given, /watch's "peek" command returns every currently-pending chunk for
-// the stream (at most one per direction, since a single direction's forwarding loop
-// only ever has one Intercept() call in flight at a time). Uses HoldUntilConnected so
-// chunks get held without needing a control connection at all, isolating this test to
-// just the watch/peek interaction.
-func TestWatchPeek_AllPending(t *testing.T) {
+// A direction's held buffer can hold more than one chunk at once — the core capability
+// this conversion enables (the old per-chunk protocol could only ever hold one chunk per
+// direction, since a second couldn't even be read off the socket while the first was
+// blocking Intercept()). Releasing both chunks together forwards them as one contiguous
+// blob, and peek's bounds reflect both original chunk boundaries.
+func TestHold_MultipleChunksSameDirection(t *testing.T) {
 	ti, wsURL := newTestServerWithConfig(t, TamperConfig{HoldUntilConnected: true})
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
-	c2sCh := interceptAsync(ti, info, []byte("c2s-data"))
-	s2cInfo := &proxy.ConnInfo{ConnID: 1, SrcEndpoint: info.DstEndpoint, DstEndpoint: info.SrcEndpoint}
-	s2cCh := interceptAsync(ti, s2cInfo, []byte("s2c-data"))
-	waitForPendingCount(t, ti, 1, 2)
+	out, err := ti.Intercept(info, []byte("abc"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	out, err = ti.Intercept(info, []byte("de"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	waitForHeldChunks(t, ti, 1, directionC2S, 2)
 
 	watch := dialWatch(t, wsURL, 1)
-	writeJSON(t, watch, watchInboundMsg{Type: "peek"})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
 	}
-	if len(replies) != 2 {
-		t.Fatalf("expected 2 pending chunks, got %d", len(replies))
+	if len(replies) != 1 {
+		t.Fatalf("expected 1 pending reply, got %d", len(replies))
 	}
-
-	seen := map[int]string{}
-	for i, r := range replies {
-		if r.Offset != 0 || r.Length != r.TotalLength {
-			t.Fatalf("expected full chunk with offset 0, got %+v", r)
-		}
-		seen[r.Direction] = string(datas[i])
+	r := replies[0]
+	if string(datas[0]) != "abcde" || r.TotalLength != 5 {
+		t.Fatalf("expected merged buffer %q, got %+v data=%q", "abcde", r, datas[0])
 	}
-	if seen[directionC2S] != "c2s-data" || seen[directionS2C] != "s2c-data" {
-		t.Fatalf("unexpected pending contents: %+v", seen)
+	if len(r.Bounds) != 2 || r.Bounds[0] != 0 || r.Bounds[1] != 3 {
+		t.Fatalf("expected bounds [0 3], got %v", r.Bounds)
 	}
 
 	control := dialControl(t, ti, wsURL)
-	writeJSON(t, control, inboundMsg{Type: "list-streams"})
-	var list streamListMsg
-	readJSON(t, control, &list)
-	for _, p := range findStreamInfo(&list, 1).Pending {
-		sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(p.ID), Action: "forward"})
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 2})
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if string(rd.Data) != "abcde" {
+		t.Fatalf("expected both chunks forwarded together, got %q", rd.Data)
 	}
-	recvResult(t, c2sCh)
-	recvResult(t, s2cCh)
 }
 
-// Peeking with an explicit id returns just that one chunk.
-func TestWatchPeek_ById(t *testing.T) {
+// peek returns both currently-held directions' buffers independently.
+func TestWatchPeek_Direction(t *testing.T) {
 	ti, wsURL := newTestServerWithConfig(t, TamperConfig{HoldUntilConnected: true})
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
-	c2sCh := interceptAsync(ti, info, []byte("c2s-data"))
-	s2cInfo := &proxy.ConnInfo{ConnID: 1, SrcEndpoint: info.DstEndpoint, DstEndpoint: info.SrcEndpoint}
-	s2cCh := interceptAsync(ti, s2cInfo, []byte("s2c-data"))
-	waitForPendingCount(t, ti, 1, 2)
-
-	ti.mu.Lock()
-	var c2sID int64
-	for id, pc := range ti.streams[1].pending {
-		if pc.direction == directionC2S {
-			c2sID = id
-		}
+	out, err := ti.Intercept(info, []byte("c2s-data"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
 	}
-	ti.mu.Unlock()
+	s2cInfo := &proxy.ConnInfo{ConnID: 1, SrcEndpoint: info.DstEndpoint, DstEndpoint: info.SrcEndpoint}
+	out, err = ti.Intercept(s2cInfo, []byte("s2c-data"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
 
 	watch := dialWatch(t, wsURL, 1)
-	writeJSON(t, watch, watchInboundMsg{Type: "peek", ID: &c2sID})
+
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
 	}
-	if len(replies) != 1 || replies[0].ID != c2sID || string(datas[0]) != "c2s-data" {
-		t.Fatalf("unexpected peek-by-id result: replies=%+v datas=%q", replies, datas)
+	if len(replies) != 1 || replies[0].Offset != 0 || replies[0].Length != replies[0].TotalLength || string(datas[0]) != "c2s-data" {
+		t.Fatalf("unexpected c2s peek result: replies=%+v datas=%q", replies, datas)
+	}
+
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionS2C})
+	replies, datas, errReply = collectPeekReplies(t, watch)
+	if errReply != nil {
+		t.Fatalf("unexpected error reply: %+v", errReply)
+	}
+	if len(replies) != 1 || string(datas[0]) != "s2c-data" {
+		t.Fatalf("unexpected s2c peek result: replies=%+v datas=%q", replies, datas)
 	}
 
 	control := dialControl(t, ti, wsURL)
-	writeJSON(t, control, inboundMsg{Type: "list-streams"})
-	var list streamListMsg
-	readJSON(t, control, &list)
-	for _, p := range findStreamInfo(&list, 1).Pending {
-		sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(p.ID), Action: "forward"})
-	}
-	recvResult(t, c2sCh)
-	recvResult(t, s2cCh)
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(info))
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionS2C), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(s2cInfo))
 }
 
-// Peeking with id + offset/length returns only that slice, echoing back the actual
-// offset/length served alongside the full chunk's total_length.
+// Peeking with offset/length returns only that slice, echoing back the actual
+// offset/length served alongside the full buffer's total_length.
 func TestWatchPeek_OffsetLength(t *testing.T) {
 	ti, wsURL := newTestServerWithConfig(t, TamperConfig{HoldUntilConnected: true})
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
-	resCh := interceptAsync(ti, info, []byte("0123456789"))
-	waitForPendingCount(t, ti, 1, 1)
-
-	ti.mu.Lock()
-	var id int64
-	for chunkID := range ti.streams[1].pending {
-		id = chunkID
+	out, err := ti.Intercept(info, []byte("0123456789"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
 	}
-	ti.mu.Unlock()
+	waitForHeldChunks(t, ti, 1, directionC2S, 1)
 
 	watch := dialWatch(t, wsURL, 1)
 
-	writeJSON(t, watch, watchInboundMsg{Type: "peek", ID: &id, Offset: 3, Length: 4})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S, Offset: 3, Length: 4})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -698,8 +722,8 @@ func TestWatchPeek_OffsetLength(t *testing.T) {
 		t.Fatalf("unexpected sliced peek result: %+v data=%q", r, datas[0])
 	}
 
-	// Length omitted (0) means "to the end of the chunk".
-	writeJSON(t, watch, watchInboundMsg{Type: "peek", ID: &id, Offset: 8})
+	// Length omitted (0) means "to the end of the buffer".
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S, Offset: 8})
 	replies, datas, errReply = collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -709,61 +733,89 @@ func TestWatchPeek_OffsetLength(t *testing.T) {
 	}
 
 	control := dialControl(t, ti, wsURL)
-	sendCommandOK(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(id), Action: "forward"})
-	recvResult(t, resCh)
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(info))
 }
 
-// Peeking a specific id that isn't currently pending returns an error reply instead of
-// silently returning nothing.
-func TestWatchPeek_UnknownId(t *testing.T) {
+// Peeking an invalid direction value returns an error reply.
+func TestWatchPeek_InvalidDirection(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
 	watch := dialWatch(t, wsURL, 1)
-	unknown := int64(999999)
-	writeJSON(t, watch, watchInboundMsg{Type: "peek", ID: &unknown})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: 99})
 	replies, _, errReply := collectPeekReplies(t, watch)
 	if errReply == nil {
 		t.Fatalf("expected an error reply, got replies=%+v", replies)
 	}
 }
 
-// With HoldUntilConnected, a chunk is held even though no control client has ever
-// connected, and remains bounded by hold-timeout-ms.
-func TestHoldUntilConnected_TimeoutWithoutControl(t *testing.T) {
-	ti := NewTamperInterceptor(&TamperConfig{HoldTimeoutMs: 50, HoldUntilConnected: true}, nil)
+// Peeking a valid direction with nothing currently held returns a zero-length reply, not
+// an error — unlike the old per-chunk protocol, where an unknown/absent id was always an
+// error, an empty direction is a perfectly normal state (e.g. a watch-mode stream).
+func TestWatchPeek_EmptyDirection(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
-	resCh := interceptAsync(ti, info, []byte("original"))
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	watch := dialWatch(t, wsURL, 1)
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
+	replies, datas, errReply := collectPeekReplies(t, watch)
+	if errReply != nil {
+		t.Fatalf("unexpected error reply: %+v", errReply)
 	}
-	if string(r.data) != "original" {
-		t.Fatalf("expected original bytes after timeout, got %q", r.data)
+	if len(replies) != 1 || replies[0].TotalLength != 0 || len(datas[0]) != 0 {
+		t.Fatalf("expected a single zero-length reply, got replies=%+v datas=%q", replies, datas)
+	}
+}
+
+// With HoldUntilConnected, a chunk is held even though no control client has ever
+// connected, and remains bounded by hold-timeout-ms.
+func TestHoldUntilConnected_TimeoutWithoutControl(t *testing.T) {
+	ti, err := NewTamperInterceptor(&TamperConfig{HoldTimeoutMs: 50, HoldUntilConnected: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := fakeConnInfo(1)
+	ti.ConnectionEstablished(info)
+
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
+	}
+	if string(rd.Data) != "original" {
+		t.Fatalf("expected original bytes after timeout, got %q", rd.Data)
 	}
 }
 
 // A chunk held before any control client connected is discoverable (via stream-list)
-// and resolvable once one finally does.
+// and releasable once one finally does.
 func TestHoldUntilConnected_VisibleAndResolvableOnceConnected(t *testing.T) {
 	ti, wsURL := newTestServerWithConfig(t, TamperConfig{HoldUntilConnected: true}) // infinite timeout
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
-	resCh := interceptAsync(ti, info, []byte("original"))
-	waitForPendingCount(t, ti, 1, 1)
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	waitForHeldChunks(t, ti, 1, directionC2S, 1)
 
+	relCh := ti.ReleaseChannel(info)
 	select {
-	case r := <-resCh:
-		t.Fatalf("Intercept returned before any control client connected: %+v", r)
+	case rd := <-relCh:
+		t.Fatalf("released before any control client connected: %+v", rd)
 	case <-time.After(50 * time.Millisecond):
 	}
 
 	control := dialControl(t, ti, wsURL)
-	writeJSON(t, control, inboundMsg{Type: "list-streams"})
+	writeJSON(t, control, inboundMsg{Type: cmdListStreams})
 	var list streamListMsg
 	readJSON(t, control, &list)
 	stream := findStreamInfo(&list, 1)
@@ -771,18 +823,21 @@ func TestHoldUntilConnected_VisibleAndResolvableOnceConnected(t *testing.T) {
 		t.Fatalf("expected the pre-held chunk to be visible after connecting, got %+v", stream)
 	}
 
-	writeJSON(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(stream.Pending[0].ID), Action: "forward", Edited: boolPtr(true)})
+	writeJSON(t, control, inboundMsg{
+		Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S),
+		Edited: boolPtr(true), PrefixLength: len("original"), Bounds: []int{0}, ReleaseChunks: 1, Action: actionForward,
+	})
 	if err := control.WriteMessage(websocket.BinaryMessage, []byte("edited")); err != nil {
 		t.Fatal(err)
 	}
 	requireOK(t, readAck(t, control))
 
-	r := recvResult(t, resCh)
-	if r.err != nil {
-		t.Fatal(r.err)
+	rd := recvRelease(t, relCh)
+	if rd.Err != nil {
+		t.Fatal(rd.Err)
 	}
-	if string(r.data) != "edited" {
-		t.Fatalf("expected edited bytes, got %q", r.data)
+	if string(rd.Data) != "edited" {
+		t.Fatalf("expected edited bytes, got %q", rd.Data)
 	}
 }
 
@@ -791,15 +846,26 @@ func TestSetMode_UnknownStream_ReturnsError(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	control := dialControl(t, ti, wsURL)
 
-	writeJSON(t, control, inboundMsg{Type: "set-mode", Conn: u32Ptr(999), Intercepting: boolPtr(true)})
+	writeJSON(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(999), Intercepting: boolPtr(true)})
 	if r := readAck(t, control); r.Type != "error" {
 		t.Fatalf("expected an error reply for an unknown stream, got %+v", r)
 	}
 }
 
-// resolve against an unknown/already-resolved chunk id returns an error instead of
+// release against an unknown stream returns an error instead of silently no-op'ing.
+func TestRelease_UnknownStream_ReturnsError(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	control := dialControl(t, ti, wsURL)
+
+	writeJSON(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(999), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	if r := readAck(t, control); r.Type != "error" {
+		t.Fatalf("expected an error reply for an unknown stream, got %+v", r)
+	}
+}
+
+// release asking for more chunks than are currently held returns an error instead of
 // silently no-op'ing.
-func TestResolve_UnknownChunk_ReturnsError(t *testing.T) {
+func TestRelease_TooManyChunks_ReturnsError(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 
@@ -808,8 +874,94 @@ func TestResolve_UnknownChunk_ReturnsError(t *testing.T) {
 	var created streamCreatedMsg
 	readJSON(t, control, &created)
 
-	writeJSON(t, control, inboundMsg{Type: "resolve", Conn: u32Ptr(1), ID: i64Ptr(999), Action: "forward"})
+	writeJSON(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
 	if r := readAck(t, control); r.Type != "error" {
-		t.Fatalf("expected an error reply for an unknown chunk id, got %+v", r)
+		t.Fatalf("expected an error reply when releasing more than is held, got %+v", r)
+	}
+}
+
+// A "release" with prefix_length exceeding the buffer's current length (e.g. a
+// hold-timeout already flushed it in the meantime) is rejected rather than silently
+// corrupting or misapplying the edit — the concurrency-safety mechanism performAction
+// relies on in place of a synthetic version counter.
+func TestRelease_StalePrefixLength_ReturnsError(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	info := fakeConnInfo(1)
+
+	control := dialControl(t, ti, wsURL)
+	ti.ConnectionEstablished(info)
+	var created streamCreatedMsg
+	readJSON(t, control, &created)
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+
+	out, err := ti.Intercept(info, []byte("abc"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	var held heldMsg
+	readJSON(t, control, &held)
+
+	writeJSON(t, control, inboundMsg{
+		Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S),
+		Edited: boolPtr(true), PrefixLength: 100, Bounds: []int{0}, ReleaseChunks: 1, Action: actionForward,
+	})
+	if err := control.WriteMessage(websocket.BinaryMessage, []byte("edited")); err != nil {
+		t.Fatal(err)
+	}
+	if r := readAck(t, control); r.Type != "error" {
+		t.Fatalf("expected an error reply for an out-of-range prefix_length, got %+v", r)
+	}
+
+	// The rejected release must leave the buffer untouched.
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	rd := recvRelease(t, ti.ReleaseChannel(info))
+	if string(rd.Data) != "abc" {
+		t.Fatalf("expected untouched original data after the rejected edit, got %q", rd.Data)
+	}
+}
+
+// drop-connection against an unknown stream returns an error instead of silently
+// no-op'ing.
+func TestDropConnection_UnknownStream_ReturnsError(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	control := dialControl(t, ti, wsURL)
+
+	writeJSON(t, control, inboundMsg{Type: cmdDropConnection, Conn: u32Ptr(999), Direction: directionPtr(directionC2S)})
+	if r := readAck(t, control); r.Type != "error" {
+		t.Fatalf("expected an error reply for an unknown stream, got %+v", r)
+	}
+}
+
+// HasPending/ReleaseChannel (the proxy.BufferingInterceptor methods) reflect a
+// direction's held state directly, independent of the control-channel protocol built on
+// top of them.
+func TestHasPending(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	info := fakeConnInfo(1)
+
+	control := dialControl(t, ti, wsURL)
+	ti.ConnectionEstablished(info)
+	var created streamCreatedMsg
+	readJSON(t, control, &created)
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+
+	if ti.HasPending(info) {
+		t.Fatal("expected HasPending false before any hold")
+	}
+
+	out, err := ti.Intercept(info, []byte("x"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	var held heldMsg
+	readJSON(t, control, &held)
+	if !ti.HasPending(info) {
+		t.Fatal("expected HasPending true after a hold")
+	}
+
+	sendCommandOK(t, control, inboundMsg{Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S), Action: actionForward, ReleaseChunks: 1})
+	recvRelease(t, ti.ReleaseChannel(info))
+	if ti.HasPending(info) {
+		t.Fatal("expected HasPending false after release")
 	}
 }

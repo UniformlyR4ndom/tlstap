@@ -16,12 +16,17 @@ var wsUpgrader = websocket.Upgrader{
 func (i *TamperInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) {
 	mux.HandleFunc(basePath+"/control", i.handleControl)
 	mux.HandleFunc(basePath+"/watch", i.handleWatch)
+
+	mux.HandleFunc("GET "+basePath+"/scripts", i.handleScriptsList)
+	mux.HandleFunc("GET "+basePath+"/scripts/{name}", i.handleScriptGet)
+	mux.HandleFunc("PUT "+basePath+"/scripts/{name}", i.handleScriptPut)
+	mux.HandleFunc("DELETE "+basePath+"/scripts/{name}", i.handleScriptDelete)
 }
 
 // handleControl accepts the single control WebSocket connection: stream lifecycle
-// events and held-chunk notifications flow out, and every command (auto-intercept
-// toggle, per-stream mode, chunk resolution, stream listing) flows in. Only one control
-// connection is allowed at a time; a second connection attempt is rejected.
+// events and held-buffer notifications flow out, and every command (auto-intercept
+// toggle, per-stream mode, release, drop-connection, stream listing) flows in. Only one
+// control connection is allowed at a time; a second connection attempt is rejected.
 func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request) {
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -31,22 +36,30 @@ func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request
 	i.mu.Lock()
 	if i.control != nil {
 		i.mu.Unlock()
-		conn.WriteJSON(errorMsg{Type: "error", Message: "a control connection is already active"})
+		conn.WriteJSON(errorMsg{Type: msgError, Message: "a control connection is already active"})
 		conn.Close()
 		return
 	}
-
-	done := make(chan struct{})
 	i.control = conn
-	i.controlDone = done
 	i.mu.Unlock()
 
 	defer func() {
 		i.mu.Lock()
 		i.control = nil
-		i.controlDone = nil
+		streams := make([]*streamState, 0, len(i.streams))
+		for _, st := range i.streams {
+			streams = append(streams, st)
+		}
 		i.mu.Unlock()
-		close(done)
+
+		// Nothing blocks waiting for the control connection anymore (Intercept never blocks),
+		// so unlike before, releasing everything on disconnect has to be done explicitly here
+		// rather than falling out of every held call waking on a closed controlDone channel.
+		for _, st := range streams {
+			st.held[directionC2S].releaseAll()
+			st.held[directionS2C].releaseAll()
+		}
+
 		conn.Close()
 	}()
 
@@ -57,90 +70,131 @@ func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request
 		}
 
 		switch msg.Type {
-		case "set-auto-intercept":
+		case cmdSetAutoIntercept:
 			if msg.Enabled == nil {
-				i.sendEventTo(conn, errorMsg{Type: "error", Message: "set-auto-intercept requires enabled"})
+				i.sendEventTo(conn, errorMsg{Type: msgError, Message: "set-auto-intercept requires enabled"})
 				break
 			}
 			i.mu.Lock()
 			i.autoInterceptNew = *msg.Enabled
 			i.mu.Unlock()
-			i.sendEventTo(conn, okMsg{Type: "ok", Command: "set-auto-intercept"})
-		case "set-mode":
+			i.sendEventTo(conn, okMsg{Type: msgOk, Command: cmdSetAutoIntercept})
+		case cmdSetMode:
 			if msg.Conn == nil || msg.Intercepting == nil {
-				i.sendEventTo(conn, errorMsg{Type: "error", Message: "set-mode requires conn and intercepting"})
+				i.sendEventTo(conn, errorMsg{Type: msgError, Message: "set-mode requires conn and intercepting"})
 				break
 			}
 			if !i.setMode(*msg.Conn, *msg.Intercepting) {
-				i.sendEventTo(conn, errorMsg{Type: "error", Message: "unknown stream"})
+				i.sendEventTo(conn, errorMsg{Type: msgError, Message: "unknown stream"})
 				break
 			}
-			i.sendEventTo(conn, okMsg{Type: "ok", Command: "set-mode"})
-		case "resolve":
-			i.handleResolve(conn, msg)
-		case "list-streams":
+			i.sendEventTo(conn, okMsg{Type: msgOk, Command: cmdSetMode})
+		case cmdRelease:
+			i.handleRelease(conn, msg)
+		case cmdDropConnection:
+			i.handleDropConnection(conn, msg)
+		case cmdListStreams:
 			i.sendStreamList()
 		default:
-			i.sendEventTo(conn, errorMsg{Type: "error", Message: "unknown message type: " + msg.Type})
+			i.sendEventTo(conn, errorMsg{Type: msgError, Message: "unknown message type: " + string(msg.Type)})
 		}
 	}
 }
 
-func (i *TamperInterceptor) handleResolve(conn *websocket.Conn, msg inboundMsg) {
-	if msg.Conn == nil || msg.ID == nil {
-		i.sendEventTo(conn, errorMsg{Type: "error", Message: "resolve requires conn and id"})
+// lookupHeld resolves (conn, direction) from an inboundMsg to a *heldBuffer, sending conn the
+// appropriate error and returning nil if either field is missing/invalid or the stream is unknown.
+// Shared by handleRelease and handleDropConnection, which both need exactly this lookup.
+func (i *TamperInterceptor) lookupHeld(conn *websocket.Conn, msg inboundMsg, command string) *heldBuffer {
+	if msg.Conn == nil || msg.Direction == nil {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: command + " requires conn and direction"})
+		return nil
+	}
+	dir := *msg.Direction
+	if !dir.valid() {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "invalid direction"})
+		return nil
+	}
+
+	i.mu.Lock()
+	st := i.streams[*msg.Conn]
+	i.mu.Unlock()
+	if st == nil {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "unknown stream"})
+		return nil
+	}
+
+	return st.held[dir]
+}
+
+// handleRelease implements the "release" command: an optional edit (Edited=true) of the buffer's
+// first PrefixLength bytes, combined with releasing the resulting buffer's first ReleaseChunks
+// chunks — see performAction and inboundMsg's doc comment for the exact semantics.
+func (i *TamperInterceptor) handleRelease(conn *websocket.Conn, msg inboundMsg) {
+	if msg.Action == "" {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "release requires action"})
+		return
+	}
+	var act releaseAct
+	switch msg.Action {
+	case actionForward:
+		act = actForward
+	case actionDrop:
+		act = actDrop
+	default:
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "invalid action"})
 		return
 	}
 
-	var editedData []byte
-	if msg.Edited != nil && *msg.Edited {
+	edited := msg.Edited != nil && *msg.Edited
+	var newData []byte
+	prefixLen := 0
+	var newBounds []int
+	if edited {
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
 		if mt != websocket.BinaryMessage {
-			i.sendEventTo(conn, errorMsg{Type: "error", Message: "expected a binary frame with the edited data"})
+			i.sendEventTo(conn, errorMsg{Type: msgError, Message: "expected a binary frame with the edited data"})
 			return
 		}
-		editedData = data
+		newData = data
+		prefixLen = msg.PrefixLength
+		newBounds = msg.Bounds
 	}
 
-	i.mu.Lock()
-	st := i.streams[*msg.Conn]
-	var pc *pendingChunk
-	if st != nil {
-		pc = st.pending[*msg.ID]
-	}
-	i.mu.Unlock()
-	if pc == nil {
-		i.sendEventTo(conn, errorMsg{Type: "error", Message: "chunk not found or already resolved"})
+	buf := i.lookupHeld(conn, msg, "release")
+	if buf == nil {
 		return
 	}
 
-	var res resolution
-	switch action(msg.Action) {
-	case actionDrop:
-		res = resolution{action: actionDrop}
-	case actionDropConnection:
-		res = resolution{action: actionDropConnection}
-	default:
-		res = resolution{action: actionForward, data: pc.data}
-		if editedData != nil {
-			res.data = editedData
-		}
+	if !buf.performAction(prefixLen, newData, newBounds, msg.ReleaseChunks, act) {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "release rejected: the buffer has changed, peek to resync"})
+		return
 	}
 
-	select {
-	case pc.ch <- res:
-	default:
+	i.sendEventTo(conn, okMsg{Type: msgOk, Command: cmdRelease})
+}
+
+// handleDropConnection implements the "drop-connection" command — terminates the connection
+// outright via the given direction's heldBuffer.abort(), independent of whatever's currently held.
+func (i *TamperInterceptor) handleDropConnection(conn *websocket.Conn, msg inboundMsg) {
+	buf := i.lookupHeld(conn, msg, "drop-connection")
+	if buf == nil {
+		return
 	}
 
-	i.sendEventTo(conn, okMsg{Type: "ok", Command: "resolve"})
+	if !buf.abort() {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "stream already terminated"})
+		return
+	}
+
+	i.sendEventTo(conn, okMsg{Type: msgOk, Command: cmdDropConnection})
 }
 
 // handleWatch attaches a read-only, best-effort live mirror of one stream's traffic.
-// No commands flow through this connection; any inbound frame is discarded and used
-// only to detect the client closing the tab.
+// The only inbound command is "peek"; any other frame is discarded and used only to
+// detect the client closing the tab.
 func (i *TamperInterceptor) handleWatch(w http.ResponseWriter, r *http.Request) {
 	connID64, err := strconv.ParseUint(r.URL.Query().Get("conn"), 10, 32)
 	if err != nil {
@@ -178,14 +232,12 @@ func (i *TamperInterceptor) handleWatch(w http.ResponseWriter, r *http.Request) 
 
 	go watcherWriteLoop(wch)
 
-	// The only inbound command is "peek"; anything else (or a read error, meaning the
-	// client closed the connection) just falls through / ends the loop.
 	for {
 		var msg watchInboundMsg
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
-		if msg.Type == "peek" {
+		if msg.Type == cmdPeek {
 			i.handlePeek(st, wch, msg)
 		}
 	}
@@ -211,70 +263,49 @@ func watcherWriteLoop(w *watcher) {
 	}
 }
 
-// handlePeek replies to a "peek" command with the bytes of one (msg.ID given) or all
-// (msg.ID omitted) currently-held chunks for st, terminated by a peekDoneMsg. This is
-// the only way to read a held chunk's bytes — "held" on the control channel is
-// metadata-only.
+// handlePeek replies to a "peek" command with a (possibly sliced) snapshot of one direction's
+// held buffer, terminated by a peekDoneMsg. This is the only way to read held bytes — "held" on
+// the control channel is metadata-only. Unlike the old per-chunk protocol, an empty buffer isn't
+// an error: a direction can legitimately have nothing held (e.g. the stream is in watch mode), so
+// the reply is just a zero-length one.
 func (i *TamperInterceptor) handlePeek(st *streamState, w *watcher, msg watchInboundMsg) {
-	type target struct {
-		id int64
-		pc *pendingChunk
-	}
-
-	i.mu.Lock()
-	var targets []target
-	if msg.ID != nil {
-		if pc, ok := st.pending[*msg.ID]; ok {
-			targets = append(targets, target{*msg.ID, pc})
-		}
-	} else {
-		for id, pc := range st.pending {
-			targets = append(targets, target{id, pc})
-		}
-	}
-	i.mu.Unlock()
-
-	if msg.ID != nil && len(targets) == 0 {
-		w.writeJSON(errorMsg{Type: "error", Message: "chunk not found or no longer pending"})
+	if !msg.Direction.valid() {
+		w.writeJSON(errorMsg{Type: msgError, Message: "invalid direction"})
 		return
 	}
 
-	for _, t := range targets {
-		data := t.pc.data
-		offset := int64(0)
-		if msg.ID != nil {
-			offset = msg.Offset
-			if offset < 0 {
-				offset = 0
-			}
-			if offset > int64(len(data)) {
-				offset = int64(len(data))
-			}
-			end := int64(len(data))
-			if msg.Length > 0 && offset+msg.Length < end {
-				end = offset + msg.Length
-			}
-			data = data[offset:end]
-		}
+	data, bounds, lastActivity := st.held[msg.Direction].snapshot()
 
-		meta := pendingChunkMsg{
-			Type:        "pending",
-			ID:          t.id,
-			Direction:   t.pc.direction,
-			Time:        t.pc.time,
-			Offset:      offset,
-			Length:      len(data),
-			TotalLength: len(t.pc.data),
-		}
-		if err := w.writeJSON(meta); err != nil {
-			return
-		}
-		if err := w.writeBinary(data); err != nil {
-			return
-		}
+	offset := msg.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > int64(len(data)) {
+		offset = int64(len(data))
+	}
+	end := int64(len(data))
+	if msg.Length > 0 && offset+msg.Length < end {
+		end = offset + msg.Length
+	}
+	slice := data[offset:end]
+
+	meta := pendingChunkMsg{
+		Type:        msgPending,
+		Direction:   msg.Direction,
+		Time:        lastActivity,
+		Offset:      offset,
+		Length:      len(slice),
+		TotalLength: len(data),
+		Bounds:      bounds,
+	}
+	if err := w.writeJSON(meta); err != nil {
+		return
+	}
+	if err := w.writeBinary(slice); err != nil {
+		return
 	}
 
-	w.writeJSON(peekDoneMsg{Type: "peek-done"})
+	w.writeJSON(peekDoneMsg{Type: msgPeekDone})
 }
 
 func (i *TamperInterceptor) sendEvent(msg any) {
@@ -293,10 +324,10 @@ func (i *TamperInterceptor) sendEventTo(conn *websocket.Conn, msg any) {
 	conn.WriteJSON(msg)
 }
 
-// sendHeld announces that a chunk is now held, awaiting a decision. It carries only
-// metadata — the chunk's bytes are fetched on demand via "peek" on that stream's
-// /watch connection (see protocol.go).
-func (i *TamperInterceptor) sendHeld(connID uint32, id int64, direction int, length int) {
+// sendHeld announces that a new chunk was appended to one direction's held buffer. It carries only
+// that chunk's own metadata — the bytes are fetched on demand via "peek" on that stream's /watch
+// connection (see protocol.go).
+func (i *TamperInterceptor) sendHeld(connID uint32, dir direction, offset int, length int) {
 	i.mu.Lock()
 	conn := i.control
 	i.mu.Unlock()
@@ -305,12 +336,12 @@ func (i *TamperInterceptor) sendHeld(connID uint32, id int64, direction int, len
 	}
 
 	meta := heldMsg{
-		Type:      "held",
+		Type:      msgHeld,
 		Conn:      connID,
-		ID:        id,
-		Direction: direction,
-		Time:      time.Now().UnixMilli(),
+		Direction: dir,
+		Offset:    offset,
 		Length:    length,
+		Time:      time.Now().UnixMilli(),
 	}
 
 	i.sendEventTo(conn, meta)
@@ -321,9 +352,13 @@ func (i *TamperInterceptor) sendStreamList() {
 	conn := i.control
 	streams := make([]streamInfo, 0, len(i.streams))
 	for _, st := range i.streams {
-		pending := make([]pendingInfo, 0, len(st.pending))
-		for id, pc := range st.pending {
-			pending = append(pending, pendingInfo{ID: id, Direction: pc.direction, Time: pc.time, Length: len(pc.data)})
+		pending := make([]pendingInfo, 0, 2)
+		for _, d := range [2]direction{directionC2S, directionS2C} {
+			chunks := st.held[d].numChunks()
+			if chunks == 0 {
+				continue
+			}
+			pending = append(pending, pendingInfo{Direction: d, Chunks: chunks, Length: st.held[d].length()})
 		}
 		streams = append(streams, streamInfo{Conn: st.connID, Src: st.src, Dst: st.dst, Intercepting: st.intercepting, Pending: pending})
 	}
@@ -331,5 +366,5 @@ func (i *TamperInterceptor) sendStreamList() {
 	if conn == nil {
 		return
 	}
-	i.sendEventTo(conn, streamListMsg{Type: "stream-list", Streams: streams})
+	i.sendEventTo(conn, streamListMsg{Type: msgStreamList, Streams: streams})
 }

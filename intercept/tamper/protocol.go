@@ -1,40 +1,69 @@
 package tamper
 
-// Messages sent from the proxy to the control client (WebSocket text frames).
-// "held" is metadata-only — no binary frame follows. A held chunk's actual bytes are
-// only obtainable via the "peek" command on that stream's /watch connection (see
-// below), so that reconnecting to control at any time (via "list-streams") is enough
-// to discover and act on everything currently outstanding, without having had to be
-// connected at the exact moment a chunk was held.
+// msgType is the "type" field of every message the proxy sends to a control or watch
+// client (JSON discriminator).
+type msgType string
+
+const (
+	msgStreamCreated    msgType = "stream-created"    // control, unsolicited: a new stream appeared
+	msgStreamTerminated msgType = "stream-terminated" // control, unsolicited: a stream ended
+	msgHeld             msgType = "held"              // control, unsolicited: one new chunk was appended to a held buffer
+	msgStreamList       msgType = "stream-list"       // control, reply to "list-streams"
+	msgScriptUpdated    msgType = "script-updated"    // control, unsolicited: a script was written or deleted via REST
+	msgOk               msgType = "ok"                // control, reply acknowledging a command
+	msgError            msgType = "error"             // control or watch, reply to any failed command
+	msgPending          msgType = "pending"           // watch, reply to "peek"
+	msgPeekDone         msgType = "peek-done"         // watch, terminates a "peek" reply
+)
+
+// cmdType is the "type" field of every message a client sends to the proxy (JSON
+// discriminator).
+type cmdType string
+
+const (
+	cmdSetAutoIntercept cmdType = "set-auto-intercept" // control
+	cmdSetMode          cmdType = "set-mode"           // control
+	cmdRelease          cmdType = "release"            // control
+	cmdDropConnection   cmdType = "drop-connection"    // control
+	cmdListStreams      cmdType = "list-streams"       // control
+	cmdPeek             cmdType = "peek"               // watch
+)
+
+// ── Outbound: control channel ───────────────────────────────────────────────────────
 
 type streamCreatedMsg struct {
-	Type string `json:"type"` // "stream-created"
-	Conn uint32 `json:"conn"`
-	Src  string `json:"src"`
-	Dst  string `json:"dst"`
+	Type msgType `json:"type"`
+	Conn uint32  `json:"conn"`
+	Src  string  `json:"src"`
+	Dst  string  `json:"dst"`
 }
 
 type streamTerminatedMsg struct {
-	Type string `json:"type"` // "stream-terminated"
-	Conn uint32 `json:"conn"`
+	Type msgType `json:"type"`
+	Conn uint32  `json:"conn"`
 }
 
+// heldMsg announces that one new chunk was appended to one direction's held buffer.
+// Offset/Length describe just that new chunk (not the buffer as a whole), so a connected
+// client can extend its own locally-tracked bounds incrementally instead of re-peeking on
+// every arrival; Offset doubles as a consistency check the client can use to detect it
+// missed an event and should fall back to "peek" to resync.
 type heldMsg struct {
-	Type      string `json:"type"` // "held"
-	Conn      uint32 `json:"conn"`
-	ID        int64  `json:"id"`
-	Direction int    `json:"direction"`
-	Time      int64  `json:"time"`
-	Length    int    `json:"length"`
+	Type      msgType   `json:"type"`
+	Conn      uint32    `json:"conn"`
+	Direction direction `json:"direction"`
+	Offset    int       `json:"offset"`
+	Length    int       `json:"length"`
+	Time      int64     `json:"time"`
 }
 
-// pendingInfo describes one currently-held chunk, reported inline in streamInfo so
-// that "list-streams" alone is enough to resync after (re)connecting to control.
+// pendingInfo summarizes one direction's currently-held buffer as a chunk count + byte
+// length — chunk boundaries themselves aren't reported here (see heldMsg/"peek" for
+// those); embedded in streamInfo so "list-streams" alone is a full resync.
 type pendingInfo struct {
-	ID        int64 `json:"id"`
-	Direction int   `json:"direction"`
-	Time      int64 `json:"time"`
-	Length    int   `json:"length"`
+	Direction direction `json:"direction"`
+	Chunks    int       `json:"chunks"`
+	Length    int       `json:"length"`
 }
 
 type streamInfo struct {
@@ -42,82 +71,105 @@ type streamInfo struct {
 	Src          string        `json:"src"`
 	Dst          string        `json:"dst"`
 	Intercepting bool          `json:"intercepting"`
-	Pending      []pendingInfo `json:"pending"`
+	Pending      []pendingInfo `json:"pending"` // 0-2 entries: only directions with something held
 }
 
 type streamListMsg struct {
-	Type    string       `json:"type"` // "stream-list"
+	Type    msgType      `json:"type"`
 	Streams []streamInfo `json:"streams"`
 }
 
-type errorMsg struct {
-	Type    string `json:"type"` // "error"
-	Message string `json:"message"`
+// scriptUpdatedMsg announces that a script was written (PUT) or removed (DELETE) via the
+// REST API — Name alone is enough for a client to know what to re-pull or forget; whether
+// it still exists is a plain GET/list away, so no separate "deleted" flag is carried.
+type scriptUpdatedMsg struct {
+	Type msgType `json:"type"`
+	Name string  `json:"name"`
 }
 
-// okMsg acknowledges a successful "set-auto-intercept", "set-mode", or "resolve"
-// command. Failures use errorMsg instead (missing required fields, an unknown stream
-// for "set-mode", or an unknown/already-resolved chunk for "resolve").
+// okMsg acknowledges a successful command. Failures use errorMsg instead.
 type okMsg struct {
-	Type    string `json:"type"` // "ok"
-	Command string `json:"command"`
+	Type    msgType `json:"type"`
+	Command cmdType `json:"command"`
 }
 
-// watchFrameMsg precedes a binary frame with the mirrored chunk's bytes, sent on a
-// per-stream /watch connection for every chunk actually forwarded (live mirror; see
-// watchInboundMsg for reading currently-held, not-yet-forwarded chunks instead).
-type watchFrameMsg struct {
-	Direction int   `json:"direction"`
-	Time      int64 `json:"time"`
-	Length    int   `json:"length"`
+// ── Shared: control + watch ─────────────────────────────────────────────────────────
+
+type errorMsg struct {
+	Type    msgType `json:"type"`
+	Message string  `json:"message"`
 }
 
-// watchInboundMsg is the one command a /watch client may send: a request to read the
-// bytes of one or all currently-held chunks for that stream (this is the only way to
-// read a held chunk's bytes at all — see the note on held above).
-type watchInboundMsg struct {
-	Type string `json:"type"` // "peek"
+// ── Inbound: control channel ────────────────────────────────────────────────────────
 
-	// ID omitted => return every currently-pending chunk for the stream (at most one
-	// per direction), in full, ignoring Offset/Length. ID set => return just that one
-	// chunk, sliced by Offset/Length if given.
-	ID     *int64 `json:"id,omitempty"`
-	Offset int64  `json:"offset,omitempty"`
-	Length int64  `json:"length,omitempty"` // 0 = to the end of the chunk
-}
-
-// pendingChunkMsg precedes a binary frame with the (possibly sliced) requested bytes,
-// sent in reply to a "peek" command.
-type pendingChunkMsg struct {
-	Type        string `json:"type"` // "pending"
-	ID          int64  `json:"id"`
-	Direction   int    `json:"direction"`
-	Time        int64  `json:"time"`
-	Offset      int64  `json:"offset"`       // start of the returned slice within the chunk
-	Length      int    `json:"length"`       // length of the returned slice
-	TotalLength int    `json:"total_length"` // full chunk length
-}
-
-// peekDoneMsg terminates a "peek" reply (0 or more pendingChunkMsg + binary pairs).
-type peekDoneMsg struct {
-	Type string `json:"type"` // "peek-done"
-}
-
-// inboundMsg is a flexible container for every control-channel command, discriminated
-// by Type. A "resolve" message with Edited=true must be immediately followed by a
-// binary frame carrying the replacement bytes.
+// inboundMsg is a flexible container for every control-channel command, discriminated by
+// Type; only the fields relevant to that Type are populated (see the per-field comments).
+//
+// A "release" with Edited=true must be immediately followed by a binary frame carrying
+// the replacement bytes for the buffer's first PrefixLength bytes; Edited=false releases
+// ReleaseChunks chunks of the buffer exactly as it stands (PrefixLength/Bounds ignored).
+// PrefixLength is checked against the buffer's actual current length, rejecting a stale
+// edit (e.g. one a hold-timeout already flushed) rather than silently misapplying it.
+//
+// "drop-connection" is its own command rather than a Release Action value, since it
+// isn't parameterized by buffer content the way forward/drop are.
 type inboundMsg struct {
-	Type string `json:"type"`
+	Type cmdType `json:"type"`
 
-	// set-auto-intercept
-	Enabled *bool `json:"enabled,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"` // set-auto-intercept
 
-	// set-mode (also uses Conn); resolve (also uses Conn)
-	Conn         *uint32 `json:"conn,omitempty"`
-	Intercepting *bool   `json:"intercepting,omitempty"`
+	Conn *uint32 `json:"conn,omitempty"` // set-mode; release; drop-connection
 
-	// resolve
-	ID     *int64 `json:"id,omitempty"`
-	Action string `json:"action,omitempty"`
-	Edited *bool  `json:"edited,omitempty"`
+	Intercepting *bool `json:"intercepting,omitempty"` // set-mode
+
+	Direction *direction `json:"direction,omitempty"` // release; drop-connection
+
+	// release
+	Edited        *bool  `json:"edited,omitempty"`
+	PrefixLength  int    `json:"prefix_length,omitempty"`
+	Bounds        []int  `json:"bounds,omitempty"`
+	ReleaseChunks int    `json:"release_chunks,omitempty"`
+	Action        action `json:"action,omitempty"`
+}
+
+// ── Outbound: watch channel ─────────────────────────────────────────────────────────
+
+// watchFrameMsg precedes a binary frame with the mirrored chunk's bytes, sent for every
+// chunk actually forwarded on the stream (live mirror; see pendingChunkMsg for reading
+// currently-held, not-yet-forwarded bytes instead). No Type field: a /watch connection
+// has exactly one unsolicited shape, so there's nothing to discriminate.
+type watchFrameMsg struct {
+	Direction direction `json:"direction"`
+	Time      int64     `json:"time"`
+	Length    int       `json:"length"`
+}
+
+// pendingChunkMsg precedes a binary frame with the (possibly sliced) requested bytes, in
+// reply to a "peek". Offset/Length describe the *returned slice*; TotalLength and Bounds
+// always describe the whole buffer regardless of what was sliced, since a resync always
+// wants the complete picture and both are cheap to include in full.
+type pendingChunkMsg struct {
+	Type        msgType   `json:"type"`
+	Direction   direction `json:"direction"`
+	Time        int64     `json:"time"`
+	Offset      int64     `json:"offset"`
+	Length      int       `json:"length"`
+	TotalLength int       `json:"total_length"`
+	Bounds      []int     `json:"bounds"`
+}
+
+// peekDoneMsg terminates a "peek" reply (one pendingChunkMsg + binary pair, or a single errorMsg).
+type peekDoneMsg struct {
+	Type msgType `json:"type"`
+}
+
+// ── Inbound: watch channel ──────────────────────────────────────────────────────────
+
+// watchInboundMsg is the one command a /watch client may send: read the bytes of one
+// direction's currently-held buffer (the only way to read held bytes at all — see heldMsg).
+type watchInboundMsg struct {
+	Type      cmdType   `json:"type"`
+	Direction direction `json:"direction"`
+	Offset    int64     `json:"offset,omitempty"`
+	Length    int64     `json:"length,omitempty"` // 0 = to the end of the buffer
 }

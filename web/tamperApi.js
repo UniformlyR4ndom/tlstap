@@ -6,10 +6,17 @@ function wsUrl(path) {
 }
 
 // Opens the single tamper control connection. handlers: { onOpen, onClose, onError,
-// onStreamCreated, onStreamTerminated, onHeld, onStreamList }, all optional.
+// onStreamCreated, onStreamTerminated, onHeld, onStreamList, onScriptUpdated }, all
+// optional.
 //
 // Returns { setAutoIntercept(enabled), setMode(conn, intercepting), listStreams(),
-// resolve(conn, id, action, editedBytes?), close() }, each command returning a Promise.
+// release(conn, direction, opts, editedBytes?), dropConnection(conn, direction),
+// close() }, each command returning a Promise.
+//
+// release's opts: { action: 'forward'|'drop', releaseChunks, edited, prefixLength,
+// bounds } — mirrors the server's combined edit+release command directly (see
+// intercept/tamper/protocol.go's inboundMsg doc comment). editedBytes is required iff
+// opts.edited is true.
 //
 // Replies are matched by their "type", not by "the next message in": the server can
 // interleave a push event (held/stream-created/stream-terminated) with the ok/error/
@@ -59,6 +66,9 @@ export function openTamperControl(handlers = {}) {
                 handlers.onStreamList?.(msg.streams)
                 settle('resolve', msg)
                 break
+            case 'script-updated':
+                handlers.onScriptUpdated?.(msg.name)
+                break
         }
     }
 
@@ -79,25 +89,35 @@ export function openTamperControl(handlers = {}) {
         listStreams() {
             return sendCommand({ type: 'list-streams' })
         },
-        resolve(conn, id, action, editedBytes) {
-            const edited = editedBytes != null
-            const p = sendCommand({ type: 'resolve', conn, id, action, edited })
+        release(conn, direction, opts, editedBytes) {
+            const { action, releaseChunks = 0, edited = false, prefixLength = 0, bounds = [] } = opts
+            const p = sendCommand({
+                type: 'release', conn, direction, action,
+                release_chunks: releaseChunks, edited,
+                prefix_length: prefixLength, bounds,
+            })
             if (edited) ws.send(editedBytes)
             return p
+        },
+        dropConnection(conn, direction) {
+            return sendCommand({ type: 'drop-connection', conn, direction })
         },
         close() { ws.close() },
     }
 }
 
-// Reads one currently-held chunk's bytes via a short-lived /watch connection: open,
-// send "peek", collect the reply, close. Rejects if the chunk isn't currently pending.
-export function peekChunk(conn, id) {
+// Reads one direction's currently-held buffer via a short-lived /watch connection: open,
+// send "peek", collect the reply, close. Unlike the old per-chunk-id "peek", the server
+// always replies with exactly one "pending" + binary pair (or a single "error" for an
+// invalid direction) — a direction with nothing held is a normal zero-length reply, not
+// an error. offset/length optionally slice the buffer; omit both for the whole thing.
+export function peekBuffer(conn, direction, offset, length) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl(`${BASE}/watch?conn=${conn}`))
         ws.binaryType = 'arraybuffer'
         let pendingMeta = null
 
-        ws.onopen = () => ws.send(JSON.stringify({ type: 'peek', id }))
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'peek', direction, offset, length }))
         ws.onerror = () => reject(new Error('WebSocket error'))
         ws.onmessage = event => {
             if (typeof event.data === 'string') {
@@ -106,7 +126,7 @@ export function peekChunk(conn, id) {
                     pendingMeta = msg
                 } else if (msg.type === 'peek-done') {
                     ws.close()
-                    if (!pendingMeta) reject(new Error('chunk not found or no longer pending'))
+                    if (!pendingMeta) reject(new Error('no reply received for peek'))
                 } else if (msg.type === 'error') {
                     ws.close()
                     reject(new Error(msg.message))
@@ -116,15 +136,52 @@ export function peekChunk(conn, id) {
                 pendingMeta = null
                 ws.close()
                 resolve({
-                    id: meta.id,
                     direction: meta.direction,
                     time: meta.time,
                     offset: meta.offset,
                     length: meta.length,
                     totalLength: meta.total_length,
+                    bounds: meta.bounds ?? [],
                     data: new Uint8Array(event.data),
                 })
             }
         }
     })
+}
+
+// ── Script storage REST API (see intercept/tamper/scripts.go) ─────────────────────
+// Content is a raw body (always UTF-8 JS text), not JSON/base64-wrapped.
+
+async function checkOk(res) {
+    if (!res.ok) {
+        let message = res.statusText
+        try {
+            const body = await res.json()
+            if (body.error) message = body.error
+        } catch {}
+        throw new Error(message)
+    }
+    return res
+}
+
+export async function listScripts() {
+    const res = await checkOk(await fetch(`${BASE}/scripts`))
+    return res.json()
+}
+
+export async function getScript(name) {
+    const res = await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`))
+    return res.text()
+}
+
+export async function putScript(name, content) {
+    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/javascript' },
+        body: content,
+    }))
+}
+
+export async function deleteScript(name) {
+    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
 }

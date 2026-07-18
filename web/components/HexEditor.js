@@ -27,7 +27,7 @@ function rowStart(index) { return index - (index % ROW_BYTES) }
 // A small, non-virtualized hex/ASCII editor for typed or pasted input. Distinct from the
 // read-only, virtualized HexDump.js (built for large captured traffic) — this widget only
 // needs to handle modest, user-entered buffers, with a real insertion cursor.
-export default function HexEditor({ bytes, onChange, style, readOnly, direction }) {
+export default function HexEditor({ bytes, onChange, style, readOnly, direction, onContextMenu }) {
     const [cursor, setCursor] = useState({ index: 0, area: 'hex' })
     const [pendingNibble, setPendingNibble] = useState(null)
     const containerRef = useRef(null)
@@ -43,6 +43,22 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction 
         if (!el) return
         moveTo(parseInt(el.dataset.index, 10), el.dataset.area)
         containerRef.current?.focus()
+    }
+
+    // Reports a right-click to the caller instead of rendering any menu itself — HexEditor
+    // is shared with TransformPanel, which has no notion of what a context menu here would
+    // even mean, so ownership of the menu's content/behavior stays entirely with whichever
+    // caller opts in by passing onContextMenu (only the Tamper detail panel does). index is
+    // null when the click didn't land on a real byte or the trailing insertion cell (e.g. a
+    // filler cell, or empty space below the last row) — deliberately not the same as "index
+    // 0", so callers can tell "no byte position" apart from "the first byte" (see
+    // TamperDetailPanel.js's Split menu item, which needs exactly that distinction).
+    function handleContextMenu(e) {
+        if (!onContextMenu) return
+        e.preventDefault()
+        const el = e.target.closest('[data-index]')
+        const index = el ? parseInt(el.dataset.index, 10) : null
+        onContextMenu({ index, x: e.clientX, y: e.clientY })
     }
 
     function handleKeyDown(e) {
@@ -159,6 +175,7 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction 
             onClick=${handleClick}
             onKeyDown=${handleKeyDown}
             onPaste=${handlePaste}
+            onContextMenu=${handleContextMenu}
             style=${`${style ?? ''}; --hexed-row-height: ${ROW_HEIGHT}px`}
         >
             ${rows.map(rowOffset => html`

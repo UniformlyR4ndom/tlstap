@@ -28,6 +28,26 @@ export function fmtAsHexdump(bytes, baseOffset) {
     return lines.join('\n')
 }
 
+// Inverse of fmtAsHexdump: parses an xxd-style "OOOOOOOO  hh hh … hh  hh hh … hh  |ascii|"
+// dump back into bytes. Ignores the offset and |ascii| columns entirely (both are derived,
+// lossy for non-printable bytes in the ascii case) and only reads the hex byte tokens
+// between them; lenient about exact spacing so a manually-tweaked or partially-reflowed
+// dump still parses, as long as each line keeps the "offset  hexbytes  |ascii|" shape.
+export function parseHexdump(text) {
+    const bytes = []
+    for (const rawLine of text.split('\n')) {
+        const line = rawLine.trim()
+        if (!line) continue
+        const m = line.match(/^[0-9a-fA-F]+\s+(.*?)\s*\|.*\|$/)
+        if (!m) throw new Error(`invalid hexdump line: "${rawLine}"`)
+        for (const tok of m[1].split(/\s+/).filter(Boolean)) {
+            if (!/^[0-9a-fA-F]{2}$/.test(tok)) throw new Error(`invalid hex byte "${tok}" in line: "${rawLine}"`)
+            bytes.push(parseInt(tok, 16))
+        }
+    }
+    return new Uint8Array(bytes)
+}
+
 export function mergeUint8Arrays(arrays) {
     const total = arrays.reduce((n, a) => n + a.length, 0)
     const out = new Uint8Array(total)

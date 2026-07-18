@@ -353,6 +353,8 @@ func (p *Proxy) newHandler(mode Mode, mux *Mux, serverName string) (*ConnHandler
 		},
 		InterceptorsUp:   iUp,
 		InterceptorsDown: iDown,
+		bufferingUp:      scanBuffering(iUp),
+		bufferingDown:    scanBuffering(iDown),
 		logger:           logger,
 		ConnId:           p.nextConnId,
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,8 +23,10 @@ func tamperMain(args []string) {
 		cmdTamperStreams(args[1:])
 	case "peek":
 		cmdTamperPeek(args[1:])
-	case "resolve":
-		cmdTamperResolve(args[1:])
+	case "release":
+		cmdTamperRelease(args[1:])
+	case "drop-connection":
+		cmdTamperDropConnection(args[1:])
 	case "set-mode":
 		cmdTamperSetMode(args[1:])
 	case "set-auto-intercept":
@@ -41,10 +45,19 @@ func tamperUsage() {
 
 Usage:
   tapctl tamper streams [--api URL]
-  tapctl tamper peek --conn N [--id N] [--offset N] [--length N] [--api URL]
-  tapctl tamper resolve --conn N --id N --action forward|drop|drop-connection [--edit PATH|-] [--api URL]
+  tapctl tamper peek --conn N --direction 0|1 [--offset N] [--length N] [--api URL]
+  tapctl tamper release --conn N --direction 0|1 [--action forward|drop] [--release-chunks N]
+                         [--edit PATH|- | --edit-base64 STRING] [--prefix-length N] [--bounds "0,10"]
+                         [--api URL]
+  tapctl tamper drop-connection --conn N --direction 0|1 [--api URL]
   tapctl tamper set-mode --conn N --intercepting=true|false [--api URL]
   tapctl tamper set-auto-intercept --enabled=true|false [--api URL]
+
+release combines an optional edit with an optional release, mirroring the server's
+performAction: --release-chunks defaults to 0 (edit only, nothing released); pass a
+positive count to also release that many chunks of the post-edit buffer. --edit/
+--edit-base64 replace the buffer's first --prefix-length bytes (as you last learned them
+via peek) with the given data; --bounds defaults to "0" (the whole edit as one chunk).
 `)
 }
 
@@ -56,25 +69,28 @@ Usage:
 
 // outboundMsg covers every control-channel command tapctl sends.
 type outboundMsg struct {
-	Type         string  `json:"type"`
-	Enabled      *bool   `json:"enabled,omitempty"`
-	Conn         *uint32 `json:"conn,omitempty"`
-	Intercepting *bool   `json:"intercepting,omitempty"`
-	ID           *int64  `json:"id,omitempty"`
-	Action       string  `json:"action,omitempty"`
-	Edited       *bool   `json:"edited,omitempty"`
+	Type          string  `json:"type"`
+	Enabled       *bool   `json:"enabled,omitempty"`
+	Conn          *uint32 `json:"conn,omitempty"`
+	Intercepting  *bool   `json:"intercepting,omitempty"`
+	Direction     *int    `json:"direction,omitempty"`
+	Edited        *bool   `json:"edited,omitempty"`
+	PrefixLength  int     `json:"prefix_length,omitempty"`
+	Bounds        []int   `json:"bounds,omitempty"`
+	ReleaseChunks int     `json:"release_chunks,omitempty"`
+	Action        string  `json:"action,omitempty"`
 }
 
 // watchRequest is the "peek" command sent on a /watch connection.
 type watchRequest struct {
-	Type   string `json:"type"`
-	ID     *int64 `json:"id,omitempty"`
-	Offset int64  `json:"offset,omitempty"`
-	Length int64  `json:"length,omitempty"`
+	Type      string `json:"type"`
+	Direction int    `json:"direction"`
+	Offset    int64  `json:"offset,omitempty"`
+	Length    int64  `json:"length,omitempty"`
 }
 
 // ackReply is the {"type":"ok"|"error",...} shape every set-auto-intercept/set-mode/
-// resolve command receives back.
+// release/drop-connection command receives back.
 type ackReply struct {
 	Type    string `json:"type"`
 	Command string `json:"command"`
@@ -97,12 +113,12 @@ func readAck(conn *websocket.Conn) {
 // command can produce, decoded generically since which one arrived is read from Type.
 type peekReply struct {
 	Type        string `json:"type"`
-	ID          int64  `json:"id"`
 	Direction   int    `json:"direction"`
 	Time        int64  `json:"time"`
 	Offset      int64  `json:"offset"`
 	Length      int    `json:"length"`
 	TotalLength int    `json:"total_length"`
+	Bounds      []int  `json:"bounds"`
 	Message     string `json:"message"`
 }
 
@@ -130,20 +146,30 @@ func cmdTamperStreams(args []string) {
 	printJSON(reply)
 }
 
+// parseDirection reads --direction, requiring it to be present and either 0 or 1.
+func parseDirection(fs *flag.FlagSet, direction *int) int {
+	if !flagWasSet(fs, "direction") {
+		fail("--direction is required (0 = c->s, 1 = s->c)")
+	}
+	if *direction != 0 && *direction != 1 {
+		fail("--direction must be 0 or 1")
+	}
+	return *direction
+}
+
 func cmdTamperPeek(args []string) {
 	fs := flag.NewFlagSet("tamper peek", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
 	connFlag := fs.Uint64("conn", 0, "stream ConnID (required)")
-	idFlag := fs.Int64("id", 0, "specific chunk id (omit to peek every currently pending chunk)")
-	offset := fs.Int64("offset", 0, "byte offset within the chunk (only applies with --id)")
-	length := fs.Int64("length", 0, "number of bytes to read from offset; 0 = to the end (only applies with --id)")
+	direction := fs.Int("direction", 0, "0 = c->s, 1 = s->c (required)")
+	offset := fs.Int64("offset", 0, "byte offset within the buffer")
+	length := fs.Int64("length", 0, "number of bytes to read from offset; 0 = to the end")
 	fs.Parse(args)
-
-	idSet := flagWasSet(fs, "id")
 
 	if !flagWasSet(fs, "conn") {
 		fail("--conn is required")
 	}
+	dir := parseDirection(fs, direction)
 
 	conn, err := dialWS(*api, fmt.Sprintf("/api/i/tamper/watch?conn=%d", uint32(*connFlag)))
 	if err != nil {
@@ -151,25 +177,22 @@ func cmdTamperPeek(args []string) {
 	}
 	defer conn.Close()
 
-	req := watchRequest{Type: "peek", Offset: *offset, Length: *length}
-	if idSet {
-		req.ID = idFlag
-	}
+	req := watchRequest{Type: "peek", Direction: dir, Offset: *offset, Length: *length}
 	if err := conn.WriteJSON(req); err != nil {
 		fail("send peek: %v", err)
 	}
 
-	type outChunk struct {
-		ID          int64  `json:"id"`
+	type outBuffer struct {
 		Direction   int    `json:"direction"`
 		Time        int64  `json:"time"`
 		Offset      int64  `json:"offset"`
 		Length      int    `json:"length"`
 		TotalLength int    `json:"total_length"`
+		Bounds      []int  `json:"bounds"`
 		DataBase64  string `json:"data_base64"`
 	}
 
-	var chunks []outChunk
+	var buffers []outBuffer
 	for {
 		var r peekReply
 		if err := conn.ReadJSON(&r); err != nil {
@@ -181,15 +204,15 @@ func cmdTamperPeek(args []string) {
 			if err != nil {
 				fail("read chunk data: %v", err)
 			}
-			chunks = append(chunks, outChunk{
-				ID: r.ID, Direction: r.Direction, Time: r.Time,
-				Offset: r.Offset, Length: r.Length, TotalLength: r.TotalLength,
+			buffers = append(buffers, outBuffer{
+				Direction: r.Direction, Time: r.Time,
+				Offset: r.Offset, Length: r.Length, TotalLength: r.TotalLength, Bounds: r.Bounds,
 				DataBase64: base64.StdEncoding.EncodeToString(data),
 			})
 		case "peek-done":
 			printJSON(struct {
-				Chunks []outChunk `json:"chunks"`
-			}{chunks})
+				Chunks []outBuffer `json:"chunks"`
+			}{buffers})
 			return
 		case "error":
 			fail("%s", r.Message)
@@ -199,30 +222,61 @@ func cmdTamperPeek(args []string) {
 	}
 }
 
-func cmdTamperResolve(args []string) {
-	fs := flag.NewFlagSet("tamper resolve", flag.ExitOnError)
+// parseBounds parses a comma-separated list of ints, e.g. "0,10,20".
+func parseBounds(s string) []int {
+	parts := strings.Split(s, ",")
+	bounds := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			fail("invalid --bounds entry %q: %v", p, err)
+		}
+		bounds = append(bounds, n)
+	}
+	return bounds
+}
+
+func cmdTamperRelease(args []string) {
+	fs := flag.NewFlagSet("tamper release", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
 	connFlag := fs.Uint64("conn", 0, "stream ConnID (required)")
-	idFlag := fs.Int64("id", 0, "held chunk id (required)")
-	action := fs.String("action", "forward", "forward | drop | drop-connection")
-	edit := fs.String("edit", "", "path to replacement bytes, or - for stdin (forward only)")
+	direction := fs.Int("direction", 0, "0 = c->s, 1 = s->c (required)")
+	action := fs.String("action", "forward", "forward | drop")
+	releaseChunks := fs.Int("release-chunks", 0, "how many chunks of the post-edit buffer to release; 0 = edit only, release nothing")
+	edit := fs.String("edit", "", "path to replacement bytes, or - for stdin (mutually exclusive with --edit-base64)")
+	editBase64 := fs.String("edit-base64", "", "replacement bytes as base64 (mutually exclusive with --edit)")
+	prefixLength := fs.Int("prefix-length", 0, "bytes of the current buffer (as you last learned them via peek) this edit replaces; required if editing")
+	bounds := fs.String("bounds", "0", `comma-separated chunk-boundary offsets within the replacement data, e.g. "0,10"; defaults to a single chunk`)
 	fs.Parse(args)
 
 	if !flagWasSet(fs, "conn") {
 		fail("--conn is required")
 	}
-	if !flagWasSet(fs, "id") {
-		fail("--id is required")
-	}
+	dir := parseDirection(fs, direction)
 	switch *action {
-	case "forward", "drop", "drop-connection":
+	case "forward", "drop":
 	default:
-		fail("--action must be forward, drop, or drop-connection")
+		fail("--action must be forward or drop (use 'tapctl tamper drop-connection' to abort the connection)")
+	}
+	if *releaseChunks < 0 {
+		fail("--release-chunks must be >= 0")
+	}
+
+	if *edit != "" && *editBase64 != "" {
+		fail("--edit and --edit-base64 are mutually exclusive")
 	}
 
 	var editedData []byte
 	edited := false
-	if *edit != "" {
+	switch {
+	case *editBase64 != "":
+		var err error
+		editedData, err = base64.StdEncoding.DecodeString(*editBase64)
+		if err != nil {
+			fail("decode --edit-base64: %v", err)
+		}
+		edited = true
+	case *edit != "":
 		var err error
 		if *edit == "-" {
 			editedData, err = io.ReadAll(os.Stdin)
@@ -235,6 +289,13 @@ func cmdTamperResolve(args []string) {
 		edited = true
 	}
 
+	if !edited && *releaseChunks == 0 {
+		fail("nothing to do: set --edit/--edit-base64 and/or --release-chunks > 0")
+	}
+	if edited && !flagWasSet(fs, "prefix-length") {
+		fail("--prefix-length is required when editing")
+	}
+
 	conn, err := dialWS(*api, "/api/i/tamper/control")
 	if err != nil {
 		fail("connect: %v", err)
@@ -242,17 +303,51 @@ func cmdTamperResolve(args []string) {
 	defer conn.Close()
 
 	connID := uint32(*connFlag)
-	msg := outboundMsg{Type: "resolve", Conn: &connID, ID: idFlag, Action: *action}
+	msg := outboundMsg{
+		Type: "release", Conn: &connID, Direction: &dir,
+		ReleaseChunks: *releaseChunks, Action: *action,
+	}
 	if edited {
 		msg.Edited = &edited
+		msg.PrefixLength = *prefixLength
+		msg.Bounds = parseBounds(*bounds)
 	}
 	if err := conn.WriteJSON(msg); err != nil {
-		fail("send resolve: %v", err)
+		fail("send release: %v", err)
 	}
 	if edited {
 		if err := conn.WriteMessage(websocket.BinaryMessage, editedData); err != nil {
 			fail("send edited data: %v", err)
 		}
+	}
+
+	readAck(conn)
+	printJSON(struct {
+		Status string `json:"status"`
+	}{"ok"})
+}
+
+func cmdTamperDropConnection(args []string) {
+	fs := flag.NewFlagSet("tamper drop-connection", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	connFlag := fs.Uint64("conn", 0, "stream ConnID (required)")
+	direction := fs.Int("direction", 0, "0 = c->s, 1 = s->c (required)")
+	fs.Parse(args)
+
+	if !flagWasSet(fs, "conn") {
+		fail("--conn is required")
+	}
+	dir := parseDirection(fs, direction)
+
+	conn, err := dialWS(*api, "/api/i/tamper/control")
+	if err != nil {
+		fail("connect: %v", err)
+	}
+	defer conn.Close()
+
+	connID := uint32(*connFlag)
+	if err := conn.WriteJSON(outboundMsg{Type: "drop-connection", Conn: &connID, Direction: &dir}); err != nil {
+		fail("send drop-connection: %v", err)
 	}
 
 	readAck(conn)
