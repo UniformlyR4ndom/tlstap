@@ -207,7 +207,8 @@
       "args": {
         "hold-timeout-ms": 0,
         "hold-until-connected": false,
-        "scripts-dir": "tamper-scripts"
+        "scripts-dir": "examples/tamper/scripts",
+	"log-file": "/tmp/tamper.log"
       }
     },
     "match-replace-demo": {

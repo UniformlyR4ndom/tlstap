@@ -102,6 +102,17 @@ export function openTamperControl(handlers = {}) {
         dropConnection(conn, direction) {
             return sendCommand({ type: 'drop-connection', conn, direction })
         },
+        // Fire-and-forget: the server never replies on success (see
+        // intercept/tamper/protocol.go's cmdScriptLog), so this deliberately bypasses
+        // sendCommand's one-in-flight pending-promise tracking rather than leaving a
+        // promise that would never resolve. Silently dropped if the socket isn't open
+        // (e.g. a log line racing connection teardown) — script logging is best-effort,
+        // same as the browser's own in-memory log panel.
+        scriptLog(level, text) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'script-log', level, text }))
+            }
+        },
         close() { ws.close() },
     }
 }
@@ -149,6 +160,14 @@ export function peekBuffer(conn, direction, offset, length) {
     })
 }
 
+// Reports whether a script log file is configured server-side (see the tamper
+// interceptor's "log-file" config arg), and its display filename — static for the
+// server's whole run, so a plain one-shot GET is enough (no push event to track).
+export async function getLogFileInfo() {
+    const res = await checkOk(await fetch(`${BASE}/log-file`))
+    return res.json()
+}
+
 // ── Script storage REST API (see intercept/tamper/scripts.go) ─────────────────────
 // Content is a raw body (always UTF-8 JS text), not JSON/base64-wrapped.
 
@@ -184,4 +203,44 @@ export async function putScript(name, content) {
 
 export async function deleteScript(name) {
     await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
+}
+
+// ── Filesystem REST API (see intercept/tamper/fs.go) ───────────────────────────────
+// Content is a raw body (arbitrary binary), not JSON/base64-wrapped. path is always
+// slash-separated, even for a nested subdirectory — segments are percent-encoded
+// individually (not the path as a whole) so slashes survive as separators, matching the
+// server's {path...} wildcard route.
+
+function encodeFsPath(path) {
+    return path.split('/').filter(s => s !== '').map(encodeURIComponent).join('/')
+}
+
+export async function listFs(path = '') {
+    const enc = encodeFsPath(path)
+    const res = await checkOk(await fetch(`${BASE}/fs/list${enc ? '/' + enc : ''}`))
+    return res.json()
+}
+
+export async function readFs(path) {
+    const res = await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`))
+    return new Uint8Array(await res.arrayBuffer())
+}
+
+export async function writeFs(path, bytes) {
+    await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes,
+    }))
+}
+
+// POST, not PUT: appending isn't idempotent (repeat = appended twice), unlike write/PUT
+// above — see intercept/tamper/fs.go's handleFsAppend doc comment. Creates the file
+// (and missing parent directories) if it doesn't exist yet, same as writeFs.
+export async function appendFs(path, bytes) {
+    await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes,
+    }))
 }

@@ -5,7 +5,7 @@
 // crypto-js doesn't support either) comes from the vendored hash-wasm instead of being
 // hand-rolled — see ../vendor/hash-wasm-whirlpool.module.js for why.
 import { WordArray, MD5, SHA1, SHA224, SHA256, SHA384, SHA512 } from '../vendor/crypto-js.module.js'
-import { whirlpool as whirlpoolWasm } from '../vendor/hash-wasm-whirlpool.module.js'
+import { createWhirlpool } from '../vendor/hash-wasm-whirlpool.module.js'
 
 function bytesFromWordArray(wordArray) {
     const { words, sigBytes } = wordArray
@@ -20,17 +20,33 @@ function cryptoJsHash(hasher, bytes) {
     return bytesFromWordArray(hasher(WordArray.create(bytes)))
 }
 
-function bytesFromHex(hex) {
-    const bytes = new Uint8Array(hex.length / 2)
-    for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16)
-    return bytes
+// createWhirlpool() (unlike hash-wasm's plain whirlpool() convenience function — see
+// ../vendor/hash-wasm-whirlpool.module.js) returns a reusable IHasher whose init()/update()/
+// digest() are synchronous once the WASM module has been compiled+instantiated. That
+// compilation is the only actually-async part, so it's paid once (memoized here) rather than on
+// every call: warmupWhirlpool() lets a caller (scriptRuntime.js's Worker bootstrap, for one —
+// see its header comment) force that one-time cost up front, so every whirlpool() call from then
+// on is genuinely synchronous instead of returning a Promise. Without an explicit warmup, the
+// first call anywhere in this JS realm still pays it lazily and returns a Promise; every call
+// after that (in that same realm) is sync.
+let whirlpoolHasher = null
+let whirlpoolHasherPromise = null
+
+export function warmupWhirlpool() {
+    if (!whirlpoolHasherPromise) {
+        whirlpoolHasherPromise = createWhirlpool().then(h => { whirlpoolHasher = h; return h })
+    }
+    return whirlpoolHasherPromise
 }
 
-// hash-wasm's whirlpool() is async (WASM compilation) and returns a hex string rather than
-// bytes — matches this project's existing pattern of step run()s returning a Promise<Uint8Array>
-// (see transforms/compression.js).
-async function whirlpool(bytes) {
-    return bytesFromHex(await whirlpoolWasm(bytes))
+function whirlpoolDigest(bytes) {
+    whirlpoolHasher.init()
+    whirlpoolHasher.update(bytes)
+    return whirlpoolHasher.digest('binary')
+}
+
+function whirlpool(bytes) {
+    return whirlpoolHasher ? whirlpoolDigest(bytes) : warmupWhirlpool().then(() => whirlpoolDigest(bytes))
 }
 
 // Permutation of pi's digits, per RFC 1319 Appendix A. Cross-checked against an independent

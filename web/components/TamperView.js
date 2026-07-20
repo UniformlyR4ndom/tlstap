@@ -6,7 +6,7 @@ import TamperStreamsList from './TamperStreamsList.js'
 import TamperQueueList from './TamperQueueList.js'
 import TamperDetailPanel from './TamperDetailPanel.js'
 import TamperScriptsPanel from './TamperScriptsPanel.js'
-import { openTamperControl, peekBuffer } from '../tamperApi.js'
+import { openTamperControl, peekBuffer, getLogFileInfo, listFs, readFs, writeFs, appendFs } from '../tamperApi.js'
 import { createScriptRuntime } from '../scriptRuntime.js'
 import { loadLayout, saveLayoutValue } from '../layout.js'
 
@@ -42,6 +42,19 @@ export default function TamperView() {
     const [runningScript, setRunningScript] = useState(null)
     const [scriptLog,     setScriptLog]     = useState([])
     const [scriptsRefreshSignal, setScriptsRefreshSignal] = useState(0)
+    // Whether the server persists the script log to a file (static for the server's
+    // whole run — fetched once on mount, see getLogFileInfo) and the user's choice to
+    // skip the browser's own in-memory copy of it (only meaningful/offered while a log
+    // file is active — see TamperScriptsPanel.js). Both are read from inside onLog
+    // below, a callback created once (see the scriptRuntimeRef guard's own comment) —
+    // logFileRef/bypassLogRef keep it seeing live values instead of the stale ones
+    // captured at first render, same trick TrafficView.js's displayRef uses.
+    const [logFileInfo,     setLogFileInfo]     = useState({ enabled: false, filename: '' })
+    const [bypassBrowserLog, setBypassBrowserLog] = useState(false)
+    const logFileRef = useRef(logFileInfo)
+    logFileRef.current = logFileInfo
+    const bypassLogRef = useRef(bypassBrowserLog)
+    bypassLogRef.current = bypassBrowserLog
     // Set of "conn:direction" keys currently suspended in a script's ctx.pause(), waiting
     // on a human "Continue" — see TamperDetailPanel's restricted toolbar for those entries.
     const [pausedEntries, setPausedEntries] = useState(() => new Set())
@@ -61,13 +74,39 @@ export default function TamperView() {
             peek: (conn, direction) => peekBuffer(conn, direction),
             release: (conn, direction, opts, editedBytes) => handleRelease(conn, direction, opts, editedBytes),
             dropConnection: (conn, direction) => handleDropConnection(conn, direction),
-            setMode: (conn, intercepting) => controlRef.current
+            // scriptRuntime.js's tamper.setIntercept -> this handler; the wire command
+            // underneath (controlRef.current.setMode) stays named after the "set-mode"
+            // control-protocol command, which also drives the human Intercept-checkbox UI
+            // (TamperStreamsList.js) — only the script-facing name changed.
+            setIntercept: (conn, intercepting) => controlRef.current
                 ? controlRef.current.setMode(conn, intercepting).then(res => { resync(); return res })
                 : Promise.reject(new Error('not connected')),
             listStreams: () => controlRef.current
                 ? controlRef.current.listStreams().then(res => res.streams)
                 : Promise.reject(new Error('not connected')),
-            onLog: (level, args) => setScriptLog(log => [...log, { level, text: formatLogArgs(args) }].slice(-LOG_LIMIT)),
+            // fs-root access is a plain REST call, independent of the control connection's
+            // lifecycle (see intercept/tamper/fs.go and tamperApi.js) — no controlRef guard
+            // needed here, unlike every handler above.
+            fsList: (path) => listFs(path),
+            fsRead: (path) => readFs(path),
+            fsWrite: (path, bytes) => writeFs(path, bytes),
+            fsAppend: (path, bytes) => appendFs(path, bytes),
+            // prefix (ctx.log only — see scriptRuntime.js's handleWorkerMessage 'ctxlog'
+            // branch) is a ready-made connection-summary + timestamp line, rendered above
+            // the formatted args rather than joined into them so it stays visually distinct
+            // even when args is empty (a bare ctx.log() with no arguments still logs
+            // something useful: "reached this point" for this connection/direction/time).
+            onLog: (level, args, prefix) => {
+                const text = prefix ? (args.length ? `${prefix}\n${formatLogArgs(args)}` : prefix) : formatLogArgs(args)
+                // Persistence is independent of the browser copy below: it always happens
+                // while a log file is configured, regardless of the bypass checkbox — the
+                // checkbox only ever controls the (memory-bounded, LOG_LIMIT-capped)
+                // browser copy, for the large-output use case (see TamperScriptsPanel.js).
+                if (logFileRef.current.enabled) controlRef.current?.scriptLog(level, text)
+                if (!logFileRef.current.enabled || !bypassLogRef.current) {
+                    setScriptLog(log => [...log, { level, text }].slice(-LOG_LIMIT))
+                }
+            },
             onStatusChange: setRunningScript,
             // A pause just started: surface it like a breakpoint — jump to the Intercept
             // sub-tab and select the paused entry so the human actually notices it, rather
@@ -132,6 +171,12 @@ export default function TamperView() {
             controlRef.current = null
             scriptRuntimeRef.current.stop()
         }
+    }, [])
+
+    // Independent of the control connection (a REST GET, not pushed over the
+    // WebSocket) since log-file config never changes for the server's lifetime.
+    useEffect(() => {
+        getLogFileInfo().then(setLogFileInfo).catch(() => {})
     }, [])
 
     // One entry per (conn, direction) that currently has something held — a summary
@@ -253,6 +298,9 @@ export default function TamperView() {
                     logLines=${scriptLog}
                     onClearLog=${() => setScriptLog([])}
                     refreshSignal=${scriptsRefreshSignal}
+                    logFile=${logFileInfo}
+                    bypassBrowserLog=${bypassBrowserLog}
+                    onBypassBrowserLogChange=${setBypassBrowserLog}
                 />
             `}
         </div>

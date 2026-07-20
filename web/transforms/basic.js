@@ -13,6 +13,7 @@ const HEX_SEPARATOR_CHARS = {
     x0: '0x', xesc: '\\x', comma: ',', semi: ';', colon: ':', space: ' ', newline: '\n',
 }
 const HEX_SEPARATOR_OPTIONS = [
+    { value: 'none',    label: 'None' },
     { value: 'x0',      label: '0x' },
     { value: 'xesc',    label: '\\x' },
     { value: 'comma',   label: ',' },
@@ -27,7 +28,8 @@ function hexEncode(bytes, params) {
     const sep = params.separator
     const hexBytes = Array.from(bytes, b => b.toString(16).padStart(2, '0'))
     let text
-    if (sep === 'x0') text = hexBytes.map(h => '0x' + h).join(' ')
+    if (sep === 'none') text = hexBytes.join('')
+    else if (sep === 'x0') text = hexBytes.map(h => '0x' + h).join(' ')
     else if (sep === 'xesc') text = hexBytes.map(h => '\\x' + h).join('')
     else text = hexBytes.join(HEX_SEPARATOR_CHARS[sep])
     return new TextEncoder().encode(text)
@@ -35,6 +37,8 @@ function hexEncode(bytes, params) {
 
 function hexDecode(bytes, params) {
     const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    // 'none' has no entry in HEX_SEPARATOR_CHARS, so sepChars is falsy and text is used as-is
+    // (below whitespace-stripping still applies, same as every other separator).
     const sepChars = HEX_SEPARATOR_CHARS[params.separator]
     const withoutSeparator = sepChars ? text.split(sepChars).join('') : text
     const cleaned = withoutSeparator.replace(/\s+/g, '')

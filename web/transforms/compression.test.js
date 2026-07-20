@@ -26,8 +26,8 @@ for (const format of ['gzip', 'deflate']) {
         assert.equal(decompressed.length, 0)
     })
 
-    test(`${format}: decompress rejects malformed input`, async () => {
-        await assert.rejects(
+    test(`${format}: decompress rejects malformed input`, () => {
+        assert.throws(
             () => OPERATIONS[`${format}-decompress`].run(new Uint8Array([1, 2, 3, 4, 5])),
             new RegExp(`invalid ${format} data`),
         )
@@ -39,14 +39,14 @@ test('gzip and deflate produce different (non-interchangeable) framing for the s
     const gzipped = await OPERATIONS['gzip-compress'].run(input)
     const deflated = await OPERATIONS['deflate-compress'].run(input)
     assert.notDeepEqual([...gzipped], [...deflated])
-    await assert.rejects(() => OPERATIONS['deflate-decompress'].run(gzipped))
-    await assert.rejects(() => OPERATIONS['gzip-decompress'].run(deflated))
+    assert.throws(() => OPERATIONS['deflate-decompress'].run(gzipped))
+    assert.throws(() => OPERATIONS['gzip-decompress'].run(deflated))
 })
 
 test('known vector: gzip-decompress of a pre-calculated buffer matches the original text', async () => {
     // Pre-calculated via Node's zlib.gzipSync(Buffer.from('tlstap'), { mtime: 0 }) — a
-    // different implementation entry point than the CompressionStream API under test, fixing
-    // the mtime field so the vector is deterministic.
+    // different implementation than fflate's gzipSync under test, fixing the mtime field so
+    // the vector is deterministic.
     const gzipped = Uint8Array.from([
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
         0x2b, 0xc9, 0x29, 0x2e, 0x49, 0x2c, 0x00, 0x00, 0x1c, 0x90, 0x22, 0x7b, 0x06, 0x00, 0x00, 0x00,

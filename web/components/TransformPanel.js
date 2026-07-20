@@ -11,6 +11,30 @@ const html = htm.bind(h)
 
 function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
+// Groups a step's body params (i.e. excluding any `inHeader` ones) into render units: params
+// sharing the same `row` key render together on one labeled line (e.g. checksum.js's `init` and
+// `refin` both under "XOR in"); a param with no `row` renders alone, unchanged from the original
+// flat per-param layout. `rowLabel` may be set on any member of the group (first one found wins)
+// since a group's shared label isn't naturally "owned" by any single param in it.
+function groupParams(params) {
+    const rows = []
+    const indexByRow = new Map()
+    for (const p of params) {
+        if (!p.row) {
+            rows.push({ label: null, members: [p] })
+            continue
+        }
+        if (!indexByRow.has(p.row)) {
+            indexByRow.set(p.row, rows.length)
+            rows.push({ label: null, members: [] })
+        }
+        const row = rows[indexByRow.get(p.row)]
+        row.members.push(p)
+        if (!row.label && p.rowLabel) row.label = p.rowLabel
+    }
+    return rows
+}
+
 // Plain hex text -> bytes, for the Hex view. Distinct from transforms/basic.js's hex-decode
 // operation (which has a configurable separator param for the step pipeline) — this is a
 // simpler, fixed-format decode for the base view mode. Tolerates incidental whitespace so
@@ -71,13 +95,20 @@ export default function TransformPanel() {
     function removeStep(id) {
         setSteps(prev => prev.filter(s => s.id !== id))
     }
+    // paramDef.onSet(value, params) may return extra params to merge in alongside the changed
+    // key — used by checksum.js's `variant` select to copy a preset's poly/init/refin/refout/
+    // xorout into the step so `Custom` starts from (and non-Custom reflects) that preset.
     function updateStepParam(id, key, value, paramDef) {
         let v = value
         if (paramDef.type === 'number') {
             v = clamp(Math.round(Number(value)), paramDef.min, paramDef.max)
             if (!Number.isFinite(v)) return
         }
-        setSteps(prev => prev.map(s => s.id === id ? { ...s, params: { ...s.params, [key]: v } } : s))
+        setSteps(prev => prev.map(s => {
+            if (s.id !== id) return s
+            const extra = paramDef.onSet ? paramDef.onSet(v, s.params) : null
+            return { ...s, params: { ...s.params, [key]: v, ...extra } }
+        }))
     }
 
     function handleDragStart(e, id) {
@@ -261,7 +292,7 @@ export default function TransformPanel() {
                 <input
                     key=${p.key}
                     type="text"
-                    class="encdec-step-param"
+                    class=${'encdec-step-param' + (p.wide ? ' encdec-step-param-wide' : '')}
                     title=${p.label}
                     placeholder=${p.label}
                     value=${s.params[p.key]}
@@ -313,7 +344,11 @@ export default function TransformPanel() {
                     `}
                 </div>
                 <div class="encdec-steps">
-                    ${steps.map(s => html`
+                    ${steps.map(s => {
+                        const visibleParams = (OPERATIONS[s.op]?.params ?? []).filter(p => !p.showIf || p.showIf(s.params))
+                        const headerParams = visibleParams.filter(p => p.inHeader)
+                        const bodyRows = groupParams(visibleParams.filter(p => !p.inHeader))
+                        return html`
                         <div
                             class=${'encdec-step' + (dragOverId === s.id ? ' encdec-step-drag-over' : '')}
                             key=${s.id}
@@ -324,12 +359,27 @@ export default function TransformPanel() {
                             onDrop=${e => handleDrop(e, s.id)}
                             onDragEnd=${handleDragEnd}
                         >
-                            <span class="encdec-step-handle">⠿</span>
-                            <span class="encdec-step-label">${s.label}</span>
-                            ${(OPERATIONS[s.op]?.params ?? []).map(p => renderStepParam(s, p))}
-                            <span class="encdec-step-remove" onclick=${() => removeStep(s.id)} title="Remove">×</span>
+                            <div class="encdec-step-header">
+                                <span class="encdec-step-handle">⠿</span>
+                                <span class="encdec-step-label">${s.label}</span>
+                                ${headerParams.map(p => renderStepParam(s, p))}
+                                <span class="encdec-step-remove" onclick=${() => removeStep(s.id)} title="Remove">×</span>
+                            </div>
+                            ${bodyRows.length > 0 && html`
+                                <div class="encdec-step-params">
+                                    ${bodyRows.map(row => row.label
+                                        ? html`
+                                            <div class="encdec-step-param-row" key=${row.members[0].key}>
+                                                <span class="encdec-step-param-row-label">${row.label}</span>
+                                                ${row.members.map(p => renderStepParam(s, p))}
+                                            </div>
+                                        `
+                                        : row.members.map(p => renderStepParam(s, p))
+                                    )}
+                                </div>
+                            `}
                         </div>
-                    `)}
+                    `})}
                 </div>
             </div>
             <${ResizeHandle} orientation="v" onResize=${handleOptionsResize} />

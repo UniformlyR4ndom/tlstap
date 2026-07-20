@@ -2,6 +2,8 @@ package tamper
 
 import (
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +61,19 @@ type TamperConfig struct {
 	// still exist but reject every request with 501, rather than silently defaulting to
 	// some implicit directory.
 	ScriptsDir string `json:"scripts-dir"`
+
+	// Directory scripts get read/write/list access to, via the /fs/* REST endpoints (see
+	// fs.go). Empty disables the feature entirely — the REST endpoints still exist but
+	// reject every request with 501. Unlike ScriptsDir, this must already exist: it
+	// exposes a directory the operator chose (e.g. test fixtures), so a typo'd path
+	// should fail interceptor construction loudly rather than silently creating one.
+	FsRoot string `json:"fs-root"`
+
+	// Path a connected control client's script log (tamper.log/ctx.log calls) is
+	// persisted to, in addition to the browser's own in-memory log panel. Empty
+	// disables persistence entirely. Always appended to (existing content is kept);
+	// there is no truncate option, unlike PcapConfig/DbDumpConfig's file args.
+	LogFile string `json:"log-file"`
 }
 
 // mirrorFrame is one chunk queued for delivery to a /watch client.
@@ -125,6 +140,7 @@ type TamperInterceptor struct {
 	holdUntilConnected bool
 	logger             *logging.Logger
 	scripts            *scriptStore // nil if ScriptsDir wasn't configured
+	fsRoot             *fsStore     // nil if FsRoot wasn't configured
 
 	mu               sync.Mutex
 	control          *websocket.Conn
@@ -132,6 +148,16 @@ type TamperInterceptor struct {
 	streams          map[uint32]*streamState
 
 	controlWriteMu sync.Mutex
+
+	// logFile persists a connected control client's script log (see handleScriptLog).
+	// Opened in Init/closed in Finalize (unlike scripts, which has to be ready the
+	// moment RegisterRoutes runs — see NewTamperInterceptor's doc comment); nil if
+	// LogFile wasn't configured. logFileMu is its own lock, held only around the
+	// actual file write, and never together with mu/controlWriteMu — same "no I/O
+	// while holding the state lock" discipline as the rest of the codebase.
+	logFilePath string
+	logFile     *os.File
+	logFileMu   sync.Mutex
 }
 
 // NewTamperInterceptor creates the interceptor and, if config.ScriptsDir is set, the
@@ -154,20 +180,44 @@ func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*Tamper
 		}
 	}
 
+	var fsRoot *fsStore
+	if config.FsRoot != "" {
+		var err error
+		fsRoot, err = newFsStore(config.FsRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &TamperInterceptor{
 		holdTimeout:        holdTimeout,
 		holdUntilConnected: config.HoldUntilConnected,
 		logger:             logger,
 		scripts:            scripts,
+		fsRoot:             fsRoot,
 		streams:            make(map[uint32]*streamState),
+		logFilePath:        config.LogFile,
 	}, nil
 }
 
 func (i *TamperInterceptor) Init(addr net.TCPAddr) error {
+	if i.logFilePath == "" {
+		return nil
+	}
+
+	f, err := os.OpenFile(i.logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	i.logFile = f
 	return nil
 }
 
-func (i *TamperInterceptor) Finalize(addr net.TCPAddr) {}
+func (i *TamperInterceptor) Finalize(addr net.TCPAddr) {
+	if i.logFile != nil {
+		i.logFile.Close()
+	}
+}
 
 func (i *TamperInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 	return nil
@@ -354,5 +404,42 @@ func (i *TamperInterceptor) detachWatcher(st *streamState, conn *websocket.Conn)
 
 	if existed {
 		close(w.stop)
+	}
+}
+
+// writeScriptLog appends one script-log line to logFile, if configured; a no-op
+// otherwise. text is the already-formatted line as the browser's log panel rendered it
+// (ctx.log's connection-summary prefix and formatted args already folded in, possibly
+// spanning multiple lines) — this deliberately reuses that formatting rather than
+// reconstructing it from raw args server-side. The timestamp is the server's own
+// receipt time, not anything embedded in text: a plain tamper.log call carries no
+// timestamp of its own at all, so without this, half the persisted lines would be
+// untimed.
+func (i *TamperInterceptor) writeScriptLog(level, text string) {
+	if i.logFile == nil {
+		return
+	}
+
+	header := "[" + time.Now().Format("2006-01-02 15:04:05.000") + "]"
+	if level == "error" {
+		header += " [ERROR]"
+	}
+
+	lines := strings.Split(text, "\n")
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString(" ")
+	b.WriteString(lines[0])
+	b.WriteString("\n")
+	for _, l := range lines[1:] {
+		b.WriteString("  ")
+		b.WriteString(l)
+		b.WriteString("\n")
+	}
+
+	i.logFileMu.Lock()
+	defer i.logFileMu.Unlock()
+	if _, err := i.logFile.WriteString(b.String()); err != nil {
+		i.logger.Warn("tamper: failed to write script log: %v", err)
 	}
 }

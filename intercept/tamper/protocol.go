@@ -26,6 +26,7 @@ const (
 	cmdRelease          cmdType = "release"            // control
 	cmdDropConnection   cmdType = "drop-connection"    // control
 	cmdListStreams      cmdType = "list-streams"       // control
+	cmdScriptLog        cmdType = "script-log"         // control; fire-and-forget, no ok/error reply on success
 	cmdPeek             cmdType = "peek"               // watch
 )
 
@@ -130,6 +131,14 @@ type inboundMsg struct {
 	Bounds        []int  `json:"bounds,omitempty"`
 	ReleaseChunks int    `json:"release_chunks,omitempty"`
 	Action        action `json:"action,omitempty"`
+
+	// script-log: one already-formatted line from the browser's own script log panel
+	// (see TamperView.js's onLog), pushed here purely for optional server-side
+	// persistence (see TamperInterceptor.writeScriptLog) — Level is "log" or "error";
+	// Text may itself span multiple lines (a ctx.log call's connection-summary prefix
+	// plus its formatted args).
+	Level string `json:"level,omitempty"`
+	Text  string `json:"text,omitempty"`
 }
 
 // ── Outbound: watch channel ─────────────────────────────────────────────────────────

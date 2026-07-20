@@ -193,3 +193,55 @@ func httpPostRaw(apiBase, path string, reqBody any) (*http.Response, error) {
 	}
 	return resp, nil
 }
+
+// httpSendRaw sends a request with a raw (non-JSON) body via the given method and
+// returns the raw response body — used by REST endpoints whose request content isn't
+// JSON, e.g. tamper's script/fs-root stores.
+func httpSendRaw(method, apiBase, path string, body []byte, contentType string) ([]byte, error) {
+	req, err := http.NewRequest(method, strings.TrimSuffix(apiBase, "/")+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return data, checkHTTPError(resp, data)
+}
+
+// httpPutRaw sends a PUT with a raw (non-JSON) body — see httpSendRaw.
+func httpPutRaw(apiBase, path string, body []byte, contentType string) ([]byte, error) {
+	return httpSendRaw(http.MethodPut, apiBase, path, body, contentType)
+}
+
+// httpPostRawBody sends a POST with a raw (non-JSON) body — see httpSendRaw. Distinct
+// from httpPostJSON/httpPostRaw above, which both send a JSON-encoded request body
+// (dbdump's REST convention); this one is for tamper's fs-root append, which — like
+// scripts/fs PUT — transfers content as a raw body, not JSON.
+func httpPostRawBody(apiBase, path string, body []byte, contentType string) ([]byte, error) {
+	return httpSendRaw(http.MethodPost, apiBase, path, body, contentType)
+}
+
+// httpDelete sends a DELETE request and returns the raw response body.
+func httpDelete(apiBase, path string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodDelete, strings.TrimSuffix(apiBase, "/")+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return data, checkHTTPError(resp, data)
+}

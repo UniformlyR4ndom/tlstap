@@ -361,21 +361,44 @@ body {
 }
 .encdec-step {
     display: flex;
-    align-items: center;
-    gap: 6px;
+    flex-direction: column;
+    gap: 4px;
     padding: 5px 8px;
     border-bottom: 1px solid var(--border);
     cursor: grab;
 }
 .encdec-step:active { cursor: grabbing; }
 .encdec-step-drag-over { background: var(--selected-bg); }
+.encdec-step-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.encdec-step-params {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-left: 18px;
+}
+.encdec-step-param-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.encdec-step-param-row-label {
+    min-width: 60px;
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-dim);
+}
 .encdec-step-handle {
     color: var(--text-dim);
     font-size: 12px;
     flex-shrink: 0;
 }
 .encdec-step-label {
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
     font-size: 11.5px;
     color: var(--text);
@@ -392,6 +415,13 @@ body {
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 3px;
+}
+/* Wide enough for an 8-hex-digit value plus its "0x" prefix (e.g. checksum.js's poly/init/xorout
+   fields) without truncation; monospace so hex digits stay legible/aligned, same convention as
+   ExtractPanel.js's .extract-offset-input. */
+.encdec-step-param-wide {
+    width: 192px;
+    font-family: 'Consolas', 'Courier New', monospace;
 }
 .encdec-step-select-param {
     width: 68px;
@@ -420,6 +450,7 @@ body {
     font-size: 13px;
     padding: 0 3px;
     flex-shrink: 0;
+    margin-left: auto;
 }
 .encdec-step-remove:hover { color: #f85149; }
 .encdec-io {
@@ -813,8 +844,12 @@ body {
     overflow: hidden;
 }
 .tamper-scripts-list-panel {
-    width: 220px;
-    flex-shrink: 0;
+    /* Overrides .panel's `flex: 1` (grow:1, shrink:1, basis:0%) entirely: with a
+       0% basis the element ignores `width` and just splits space with its flex
+       sibling regardless of the inline width style — flex-basis must be `auto`
+       for `width` to take effect again, and grow/shrink must be 0 so it doesn't
+       get stretched or squeezed away from that width. */
+    flex: 0 0 auto;
     border-right: 1px solid var(--border);
 }
 .tamper-script-row {
@@ -867,24 +902,16 @@ body {
 }
 .tamper-scripts-title { font-size: 12px; color: var(--text-dim); }
 .tamper-scripts-toolbar-spacer { flex: 1; }
-.tamper-scripts-editor {
+.tamper-scripts-editor-mount {
     flex: 1;
     min-height: 0;
-    width: 100%;
-    resize: none;
-    border: none;
-    outline: none;
-    padding: 10px 14px;
-    background: var(--bg);
-    color: var(--text);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12.5px;
-    line-height: 1.5;
-    tab-size: 4;
+    min-width: 0;
+    overflow: hidden;
 }
+.tamper-scripts-editor-mount .cm-editor { height: 100%; }
+.tamper-scripts-editor-mount .cm-editor.cm-focused { outline: none; }
 .tamper-scripts-status { padding: 6px 14px; font-size: 12px; border-top: 1px solid var(--border); }
 .tamper-scripts-log {
-    height: 160px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -903,8 +930,34 @@ body {
 .tamper-log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-word; }
 .tamper-log-error { color: #f85149; }
 
+.tamper-log-bypass-toggle {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+}
+.tamper-log-file-status {
+    font-size: 11px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--text-dim);
+    font-style: italic;
+}
+
 .btn-sm { padding: 2px 8px; font-size: 11px; }
 .panel-header .btn-sm { margin-left: auto; }
+/* When a panel-header has more than one .btn-sm, only the first should absorb the
+   leftover flex space (pushing the whole group right) — otherwise each auto margin
+   splits the space evenly and later buttons drift toward the middle instead of sitting
+   next to the one before them. */
+.panel-header .btn-sm + .btn-sm { margin-left: 6px; }
 
 /* ── Misc ── */
 .placeholder {

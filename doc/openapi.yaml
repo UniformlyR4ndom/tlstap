@@ -46,6 +46,11 @@ tags:
       Storage for scripts driving programmatic tamper interception. Execution is
       client-side only (a browser Web Worker via the "Scripts" sub-tab of the Tamper
       view) — these endpoints are just the REST CRUD backing that store.
+  - name: fs
+    description: >-
+      Scoped read/write/list access to one host directory (`fs-root`), for a
+      running script to read fixtures or persist artifacts. See CLAUDE.md's
+      "Filesystem access" section.
   - name: ui
     description: Embedded web frontend
 
@@ -594,15 +599,18 @@ paths:
           ```
           Acknowledges that command succeeded. Each of those four commands
           gets exactly one `ok` or `error` reply — never both, never neither.
+          `script-log` (below) is the one command type that gets neither on
+          success — it's fire-and-forget.
         - ```json
           {"type": "error", "message": "..."}
           ```
           Sent for: an unrecognized command type; missing required fields;
           `set-mode`/`release`/`drop-connection` against an unknown stream;
-          or `release` whose `prefix_length` exceeds the buffer's actual
-          current length (e.g. a hold-timeout already flushed it) or whose
-          `release_chunks` exceeds the resulting chunk count. The connection
-          is not closed.
+          `release` whose `prefix_length` exceeds the buffer's actual current
+          length (e.g. a hold-timeout already flushed it) or whose
+          `release_chunks` exceeds the resulting chunk count; or `script-log`
+          with a `level` other than `"log"`/`"error"`. The connection is not
+          closed.
 
         **Client → proxy** (JSON text frame; `release` with `"edited": true`
         must be immediately followed by a binary frame with the replacement
@@ -653,6 +661,15 @@ paths:
           {"type": "list-streams"}
           ```
           Requests a `stream-list` snapshot of every currently active stream.
+        - ```json
+          {"type": "script-log", "level": "log" | "error", "text": "..."}
+          ```
+          Pushes one already-formatted line from a running script's log (see
+          the "Scripts" sub-tab / `scriptRuntime.js`) for optional
+          server-side persistence — see `GET /api/i/tamper/log-file`. A
+          no-op if the interceptor wasn't configured with `log-file`.
+          `text` may itself span multiple lines. Fire-and-forget: no `ok`
+          reply on success, only `error` for an invalid `level`.
       operationId: tamperControl
       responses:
         '101':
@@ -734,6 +751,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /api/i/tamper/log-file:
+    get:
+      tags: [tamper]
+      summary: Whether a script log file is configured, and its display name
+      description: |
+        Static for the interceptor's whole lifetime (set once at startup from
+        the `log-file` config arg), so a plain one-shot GET is enough — no
+        push event to track. Used by the "Scripts" sub-tab to show "Logged to
+        `<filename>`" in place of the manual Download button when a
+        connected script's log output is also being persisted server-side
+        (see the `script-log` control command above).
+      operationId: getLogFileInfo
+      responses:
+        '200':
+          description: Log file status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogFileInfo'
 
   /api/i/tamper/scripts:
     get:
@@ -821,6 +858,140 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/tamper/fs/list:
+    get:
+      tags: [fs]
+      summary: List fs-root's top-level contents
+      description: |
+        Equivalent to `GET /fs/list/{path}` with an empty path — lists
+        `fs-root` itself. One directory level, not recursive (a `dir: true`
+        entry is listed again by requesting that path). Returns `501` if the
+        `tamper` interceptor wasn't configured with `fs-root`.
+      operationId: listFsRoot
+      responses:
+        '200':
+          description: Directory entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FsEntry'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/tamper/fs/list/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: >-
+          Path of a subdirectory relative to `fs-root`. May itself contain
+          further `/`-separated segments (each percent-encoded individually
+          by clients, not the path as a whole); resolved and
+          containment-checked server-side — see CLAUDE.md's "Filesystem
+          access" section.
+    get:
+      tags: [fs]
+      summary: List a subdirectory's contents
+      description: One directory level, not recursive.
+      operationId: listFsDir
+      responses:
+        '200':
+          description: Directory entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FsEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/tamper/fs/file/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: >-
+          Path of a file relative to `fs-root`. May itself contain further
+          `/`-separated subdirectory segments (each percent-encoded
+          individually by clients); resolved and containment-checked
+          server-side.
+    get:
+      tags: [fs]
+      summary: Read a file's content
+      operationId: getFsFile
+      responses:
+        '200':
+          description: Raw file bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      tags: [fs]
+      summary: Create or overwrite a file
+      description: >-
+        Writes the request body verbatim (atomically — never observable as a
+        partial write). Missing parent directories under `fs-root` are
+        created automatically.
+      operationId: putFsFile
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: File written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      tags: [fs]
+      summary: Append to a file
+      description: >-
+        Appends the request body verbatim, creating the file (and any missing
+        parent directories under `fs-root`) if it doesn't exist yet. `POST`,
+        not `PUT`, because appending isn't idempotent — repeating the request
+        appends again, unlike `PUT`'s overwrite. Safe under concurrent
+        appends to the same file (opened with `O_APPEND`; see CLAUDE.md's
+        "Filesystem access" section).
+      operationId: appendFsFile
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: Content appended
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '501':
           $ref: '#/components/responses/NotImplemented'
 
@@ -987,6 +1158,36 @@ components:
           type: integer
           format: int64
           description: Size of the script's content in bytes
+
+    FsEntry:
+      type: object
+      required: [name, dir, size]
+      properties:
+        name:
+          type: string
+          description: Entry name (not a full path)
+        dir:
+          type: boolean
+          description: Whether this entry is a subdirectory
+        size:
+          type: integer
+          format: int64
+          description: >-
+            Size in bytes for a file; meaningless (whatever the OS reports)
+            for a directory — key off `dir` instead
+
+    LogFileInfo:
+      type: object
+      required: [enabled, filename]
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the `tamper` interceptor was configured with `log-file`
+        filename:
+          type: string
+          description: >-
+            Basename (not the full configured path) of the log file; empty
+            when `enabled` is `false`
 
   responses:
 

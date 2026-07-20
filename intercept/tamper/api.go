@@ -2,6 +2,7 @@ package tamper
 
 import (
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -17,10 +18,37 @@ func (i *TamperInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	mux.HandleFunc(basePath+"/control", i.handleControl)
 	mux.HandleFunc(basePath+"/watch", i.handleWatch)
 
+	mux.HandleFunc("GET "+basePath+"/log-file", i.handleLogFileInfo)
+
 	mux.HandleFunc("GET "+basePath+"/scripts", i.handleScriptsList)
 	mux.HandleFunc("GET "+basePath+"/scripts/{name}", i.handleScriptGet)
 	mux.HandleFunc("PUT "+basePath+"/scripts/{name}", i.handleScriptPut)
 	mux.HandleFunc("DELETE "+basePath+"/scripts/{name}", i.handleScriptDelete)
+
+	mux.HandleFunc("GET "+basePath+"/fs/list", i.handleFsList)
+	mux.HandleFunc("GET "+basePath+"/fs/list/{path...}", i.handleFsList)
+	mux.HandleFunc("GET "+basePath+"/fs/file/{path...}", i.handleFsGet)
+	mux.HandleFunc("PUT "+basePath+"/fs/file/{path...}", i.handleFsPut)
+	mux.HandleFunc("POST "+basePath+"/fs/file/{path...}", i.handleFsAppend)
+}
+
+// logFileInfoResponse is the reply to GET .../log-file — static for the interceptor's
+// whole lifetime (set once in Init), so a plain REST GET is enough; no push event is
+// needed the way script-updated exists for the scripts store.
+type logFileInfoResponse struct {
+	Enabled  bool   `json:"enabled"`
+	Filename string `json:"filename"` // basename only (not the full configured path); "" if !Enabled
+}
+
+// handleLogFileInfo reports whether a script log file is configured, and its display
+// name, so the frontend can show "Logged to <name>" in place of the manual Download
+// button (see TamperScriptsPanel.js) — see writeScriptLog for the actual persistence.
+func (i *TamperInterceptor) handleLogFileInfo(w http.ResponseWriter, r *http.Request) {
+	resp := logFileInfoResponse{Enabled: i.logFile != nil}
+	if resp.Enabled {
+		resp.Filename = filepath.Base(i.logFilePath)
+	}
+	writeJSONResponse(w, resp)
 }
 
 // handleControl accepts the single control WebSocket connection: stream lifecycle
@@ -95,6 +123,12 @@ func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request
 			i.handleDropConnection(conn, msg)
 		case cmdListStreams:
 			i.sendStreamList()
+		case cmdScriptLog:
+			if msg.Level != "log" && msg.Level != "error" {
+				i.sendEventTo(conn, errorMsg{Type: msgError, Message: "script-log requires level \"log\" or \"error\""})
+				break
+			}
+			i.writeScriptLog(msg.Level, msg.Text)
 		default:
 			i.sendEventTo(conn, errorMsg{Type: msgError, Message: "unknown message type: " + string(msg.Type)})
 		}
