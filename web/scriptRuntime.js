@@ -1,12 +1,28 @@
 // Runs one user script in a Worker and bridges it to the tamper control/watch
 // connections, which the Worker itself never touches directly (only one control
 // connection is allowed at a time, and it's already owned by TamperView). The Worker's
-// `self.tamper` API (defined by BOOTSTRAP below, prepended to the script's own source
-// before it's loaded) does most things via postMessage RPC: `call` messages go out to
-// the main thread, which performs the real peek/release/etc. through the handlers passed
-// to createScriptRuntime and posts a matching `result` back; `event` messages carry
-// onConnect/onReceive/onClose pushes in, matching the same events a human control client
-// reacts to. `tamper.transform.*` is the one exception — see "Transform calls" below.
+// `self.tamper` API (defined by BOOTSTRAP below) does most things via postMessage RPC:
+// `call` messages go out to the main thread, which performs the real peek/release/etc.
+// through the handlers passed to createScriptRuntime and posts a matching `result` back;
+// `event` messages carry onConnect/onReceive/onClose pushes in, matching the same events a
+// human control client reacts to. `tamper.transform.*` is the one exception — see
+// "Transform calls" below.
+//
+// Loading: BOOTSTRAP and the script are two separate Blobs, not one concatenated file — the
+// Worker's actual entry point is BOOTSTRAP's own Blob, which (after wiring up self.tamper/
+// self.onmessage/the error listeners) synchronously importScripts() the script's Blob into
+// that same global scope (importScripts, unlike an ES module import, runs the imported code
+// in the *same* scope as the caller — no separate module namespace, so the script sees the
+// bare `tamper` global exactly as if everything were still one file). Both Blobs end with
+// their own `//# sourceURL=...` comment (buildWorkerSource/buildScriptSource below) so
+// DevTools/stack traces show "tamper-bootstrap.js" or the script's own name — with accurate,
+// file-local line numbers — instead of an opaque `blob:http://.../<uuid>` URL covering both.
+// A failure loading the script (syntax error, or a top-level throw outside any hook) is
+// caught explicitly around the importScripts() call and reported as a 'fatal' message (see
+// handleWorkerMessage below) rather than left to the ambient error-event machinery, so it
+// reliably stops the running script — matching the "kills the Worker permanently" contract
+// documented below (see "Error handling") even though BOOTSTRAP itself, now a separate,
+// always-well-formed Blob, successfully initializes regardless of whether the script does.
 //
 // Transform calls: `tamper.transform.<category>.<function>` does NOT go through that RPC
 // bridge. transforms.js's OPERATIONS are all synchronous (gzip/deflate via fflate's sync
@@ -17,6 +33,17 @@
 // OPERATIONS[opId].run() straight from inside the Worker: no round trip, and — once the
 // one-time import+warmup during bootstrap has finished, which every hook dispatch is
 // gated on (see BOOTSTRAP's `ready` flag) — no `await` needed by the script either.
+//
+// Encode/decode calls: `tamper.encode.{hex,base64,hexdump}`/`tamper.decode.{hex,base64,
+// hexdump}` are a separate, smaller convenience layer for the common case of turning a
+// buffer into a loggable/matchable string (and back) — as opposed to `tamper.transform.*`,
+// whose every op is bytes-in/bytes-out so pipeline steps can chain. `hex`/`base64` are thin
+// wrappers around the same `OPERATIONS['hex-encode']`/etc. used above (TextEncoder/
+// TextDecoder at the boundary, same params, so there's exactly one implementation of each
+// codec); `hexdump` has no Transform-panel/OPERATIONS entry to wrap at all, so it calls
+// format.js's `fmtAsHexdump`/`parseHexdump` directly — both already string in/out, needing
+// no TextEncoder/TextDecoder step. format.js is dynamically imported the same way
+// transforms.js is (see FORMAT_URL below) and gated on the same `ready` flag.
 //
 // Direction is 'c2s' | 's2c' everywhere in the tamper.* surface (both the ctx-based API
 // and the raw peek/release/etc. escape hatch) — the numeric 0/1 the rest of the app uses
@@ -35,6 +62,10 @@ import { OPERATIONS_BY_CATEGORY } from './transforms.js'
 // transforms/* and vendor/* correctly from inside a Blob-URL-loaded Worker (see the header
 // comment above).
 const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
+
+// Same reasoning as TRANSFORMS_URL above, for format.js's fmtAsHexdump/parseHexdump (backing
+// tamper.encode.hexdump/tamper.decode.hexdump — see "Encode/decode calls" above).
+const FORMAT_URL = new URL('./format.js', import.meta.url).href
 
 // tamper.transform.<category>.<function> exposes every implemented Transform-panel operation to
 // scripts (see transforms.js's OPERATIONS_BY_CATEGORY) — one flat function per op id, regardless
@@ -79,19 +110,58 @@ const BOOTSTRAP = `
     const VALID_HOOKS = ['onConnect', 'onReceive', 'onClose']
 
     // Populated once the trailing async IIFE at the bottom of this file finishes dynamically
-    // importing transforms.js and warming up Whirlpool (see this file's header comment and
-    // TRANSFORMS_URL). pump() won't dispatch any hook until ready is true, so a script's own
-    // handlers never observe OPERATIONS as null — the only caller that can see the "not ready
-    // yet" state is a script calling a transform function at its own top level, outside any
-    // hook, which callTransform() below handles by falling back to a Promise.
+    // importing transforms.js/format.js and warming up Whirlpool (see this file's header
+    // comment and TRANSFORMS_URL/FORMAT_URL). pump() won't dispatch any hook until ready is
+    // true, so a script's own handlers never observe OPERATIONS/FORMAT as null — the only
+    // caller that can see the "not ready yet" state is a script calling a transform/encode/
+    // decode function at its own top level, outside any hook, which whenReady() below handles
+    // by falling back to a Promise.
     let OPERATIONS = null
+    let FORMAT = null
     let ready = false
     let resolveReady
     const readyPromise = new Promise(r => { resolveReady = r })
 
+    function whenReady(fn) {
+        return ready ? fn() : readyPromise.then(fn)
+    }
+
     function callTransform(opId, bytes, params) {
-        return ready ? OPERATIONS[opId].run(bytes, params)
-                     : readyPromise.then(() => OPERATIONS[opId].run(bytes, params))
+        return whenReady(() => OPERATIONS[opId].run(bytes, params))
+    }
+
+    // Most-common-case defaults so tamper.encode.hex(bytes)/tamper.encode.base64(bytes) work
+    // without a params argument at all — a plain contiguous hex/base64 string, matching what
+    // e.g. a hash digest is normally printed as. Explicit params still override individually
+    // (\`{...DEFAULTS, ...params}\`), same partial-override behavior the Transform panel gives
+    // for free via each param's own \`default\`.
+    const HEX_DEFAULTS = { prefix: '', separator: '' }
+    const BASE64_DEFAULTS = { urlSafe: false }
+
+    function callEncodeHex(bytes, params) {
+        const p = { ...HEX_DEFAULTS, ...params }
+        return whenReady(() => new TextDecoder().decode(OPERATIONS['hex-encode'].run(bytes, p)))
+    }
+    function callDecodeHex(text, params) {
+        const p = { ...HEX_DEFAULTS, ...params }
+        const bytes = new TextEncoder().encode(text)
+        return whenReady(() => OPERATIONS['hex-decode'].run(bytes, p))
+    }
+    function callEncodeBase64(bytes, params) {
+        const p = { ...BASE64_DEFAULTS, ...params }
+        return whenReady(() => new TextDecoder().decode(OPERATIONS['base64-encode'].run(bytes, p)))
+    }
+    function callDecodeBase64(text, params) {
+        const p = { ...BASE64_DEFAULTS, ...params }
+        const bytes = new TextEncoder().encode(text)
+        return whenReady(() => OPERATIONS['base64-decode'].run(bytes, p))
+    }
+    function callEncodeHexdump(bytes, baseOffset) {
+        const off = baseOffset ?? 0
+        return whenReady(() => FORMAT.fmtAsHexdump(bytes, off))
+    }
+    function callDecodeHexdump(text) {
+        return whenReady(() => FORMAT.parseHexdump(text))
     }
 
     function call(method, args) {
@@ -216,6 +286,16 @@ const BOOTSTRAP = `
         listStreams: raw.listStreams,
         fs,
         transform: ${buildTransformApiSource()},
+        encode: {
+            hex: callEncodeHex,
+            base64: callEncodeBase64,
+            hexdump: callEncodeHexdump,
+        },
+        decode: {
+            hex: callDecodeHex,
+            base64: callDecodeBase64,
+            hexdump: callDecodeHexdump,
+        },
         log(...args) { postMessage({ kind: 'log', args }) },
     }
 
@@ -233,8 +313,26 @@ const BOOTSTRAP = `
     // Serializes all events for one connection (both directions together) strictly one at
     // a time: the next queued event for a conn is only dispatched once the previous one's
     // handler(s) — including any ctx.pause() suspension inside it — have fully resolved.
-    // Different conns run fully independently. Nothing is ever dropped/coalesced: onReceive
-    // carries incremental offset/length info a script may depend on seeing in order.
+    // Different conns run fully independently.
+    //
+    // Consecutive still-queued onReceive entries for the same (conn, direction) are
+    // coalesced into a single dispatch rather than run one after another: a 'held'
+    // notification only ever means "go look at the buffer again", and TCP gives no
+    // guarantee about how incoming data is chunked into physical reads in the first
+    // place, so there's nothing meaningful tied to any one of these notifications
+    // individually. Once accumulation outpaces how fast a dispatch can round-trip
+    // (peek, decide, release), several can pile up for the same direction before the
+    // first one even starts — without coalescing, only the first actually finds
+    // anything to do (whatever's accumulated by then), and every one behind it is a
+    // redundant round trip that finds an already-drained, empty buffer. This never
+    // reorders anything relative to an interleaved other-direction/other-conn event —
+    // only entries strictly adjacent in this queue, for the same direction, are merged
+    // — so a genuinely interleaved sequence still dispatches every distinct state in
+    // order. offset is kept from the earliest entry, length is summed across all
+    // merged entries, so ctx.newLength still means "how many new bytes since the last
+    // dispatch" rather than just one physical chunk's own size. A script is still
+    // guaranteed to eventually see an onReceive whose ctx.get() reflects the complete,
+    // not-yet-processed buffer — just not necessarily one dispatch per notification.
     function pump(conn) {
         if (!ready) return // flushed for every queued conn once the trailing IIFE below resolves
         const q = queues.get(conn)
@@ -243,12 +341,19 @@ const BOOTSTRAP = `
         ;(async () => {
             let closed = false
             while (q.items.length) {
-                const { name, args } = q.items.shift()
+                const item = q.items.shift()
                 try {
-                    if (name === 'onReceive') await handleOnReceive(conn, ...args)
-                    else await runHandlers(name, args)
+                    if (item.name === 'onReceive') {
+                        let [direction, offset, length] = item.args
+                        while (q.items.length && q.items[0].name === 'onReceive' && q.items[0].args[0] === direction) {
+                            length += q.items.shift().args[2]
+                        }
+                        await handleOnReceive(conn, direction, offset, length)
+                    } else {
+                        await runHandlers(item.name, item.args)
+                    }
                 } catch (err) { reportError(err) }
-                if (name === 'onClose') closed = true
+                if (item.name === 'onClose') closed = true
             }
             q.busy = false
             if (closed) queues.delete(conn) // conn ids are never reused within a proxy run
@@ -281,9 +386,13 @@ const BOOTSTRAP = `
     // tamper.transform.* call for the rest of this script's run is a plain synchronous call.
     ;(async () => {
         try {
-            const mod = await import(${JSON.stringify(TRANSFORMS_URL)})
-            await mod.warmupWhirlpool()
-            OPERATIONS = mod.OPERATIONS
+            const [transformsMod, formatMod] = await Promise.all([
+                import(${JSON.stringify(TRANSFORMS_URL)}),
+                import(${JSON.stringify(FORMAT_URL)}),
+            ])
+            await transformsMod.warmupWhirlpool()
+            OPERATIONS = transformsMod.OPERATIONS
+            FORMAT = formatMod
             ready = true
             resolveReady()
             for (const conn of queues.keys()) pump(conn)
@@ -294,11 +403,41 @@ const BOOTSTRAP = `
 })();
 `
 
-function buildWorkerSource(source) {
-    // Wrapped in its own IIFE so the script's top-level declarations don't collide with
-    // BOOTSTRAP's, or with a later restart's script sharing the same Worker global scope
-    // (moot today since start() always creates a fresh Worker, but harmless either way).
-    return `${BOOTSTRAP}\n;(function(){\n${source}\n})();\n`
+// sourceURL is a single-line magic comment — strip anything that would break out of it, and
+// fall back to a stable name if the script has no name yet (e.g. an unsaved new script).
+function sanitizeScriptSourceUrl(name) {
+    const base = String(name ?? '').replace(/[\r\n]/g, ' ').trim() || 'script'
+    return base.endsWith('.js') ? base : `${base}.js`
+}
+
+// The script's own Blob: wrapped in its own IIFE so its top-level declarations don't collide
+// with BOOTSTRAP's, or with a later restart's script sharing the same Worker global scope
+// (moot today since start() always creates a fresh Worker, but harmless either way). The
+// trailing sourceURL is what makes this show up as its own correctly-named, correctly
+// line-numbered file in stack traces/DevTools, separate from BOOTSTRAP's own (see
+// buildWorkerSource below and this file's header comment).
+function buildScriptSource(name, source) {
+    return `;(function(){\n${source}\n})();\n//# sourceURL=${sanitizeScriptSourceUrl(name)}\n`
+}
+
+// BOOTSTRAP's own Blob: BOOTSTRAP itself plus a trailing importScripts() of the script's
+// separate Blob (scriptBlobUrl) — this is the Worker's actual entry point. importScripts()
+// runs the script in the same global scope as BOOTSTRAP (self.tamper etc. stay visible), but
+// as its own parse/compilation unit, so a syntax error in the script can never prevent
+// BOOTSTRAP itself from initializing — that failure is instead caught right here and
+// reported as 'fatal' (see handleWorkerMessage), which explicitly stops the running script,
+// preserving the documented "a syntax error in the script kills the Worker permanently"
+// contract (see "Error handling") even though the mechanism producing it is now explicit
+// rather than incidental.
+function buildWorkerSource(scriptBlobUrl) {
+    return `${BOOTSTRAP}
+try {
+    importScripts(${JSON.stringify(scriptBlobUrl)})
+} catch (err) {
+    postMessage({ kind: 'fatal', message: (err && (err.stack || err.message)) || String(err) })
+}
+//# sourceURL=tamper-bootstrap.js
+`
 }
 
 const DIR_STR = ['c2s', 's2c']
@@ -331,7 +470,7 @@ function formatLogTime(ms) {
 // when a script's ctx.pause() call starts/stops waiting on a human "Continue".
 export function createScriptRuntime(handlers) {
     let worker = null
-    let blobUrl = null
+    let blobUrls = []  // [scriptBlobUrl, bootstrapBlobUrl] — both revoked together in stop()
     let runningName = null
     const connMeta = new Map()      // conn -> {conn,src,dst}, cached from onConnect for onClose
                                      // and ctx.log's connection-summary prefix (see below)
@@ -394,6 +533,15 @@ export function createScriptRuntime(handlers) {
             handlers.onLog?.('log', msg.args, prefix)
         } else if (msg.kind === 'error') {
             handlers.onLog?.('error', [msg.message])
+        } else if (msg.kind === 'fatal') {
+            // Explicitly reported by BOOTSTRAP's own importScripts() try/catch (see
+            // buildWorkerSource) — a syntax error in the script, or a top-level throw
+            // outside any hook. Unlike a plain 'error' (which leaves the script running —
+            // see "Error handling" in CLAUDE.md), this always stops it, matching the
+            // documented "a syntax error in the script kills the Worker permanently"
+            // contract that used to fall out incidentally of worker.onerror.
+            handlers.onLog?.('error', [msg.message])
+            runtime.stop()
         }
     }
 
@@ -403,14 +551,18 @@ export function createScriptRuntime(handlers) {
         // Stops any previously running script first — only one instance at a time.
         start(name, source) {
             runtime.stop()
-            blobUrl = URL.createObjectURL(new Blob([buildWorkerSource(source)], { type: 'text/javascript' }))
-            worker = new Worker(blobUrl)
+            const scriptBlobUrl = URL.createObjectURL(new Blob([buildScriptSource(name, source)], { type: 'text/javascript' }))
+            const bootstrapBlobUrl = URL.createObjectURL(new Blob([buildWorkerSource(scriptBlobUrl)], { type: 'text/javascript' }))
+            blobUrls = [scriptBlobUrl, bootstrapBlobUrl]
+            worker = new Worker(bootstrapBlobUrl)
             worker.onmessage = handleWorkerMessage
-            // A syntax error in the script's own source fails before BOOTSTRAP's own
-            // 'error' listener is ever registered, so it only ever reaches us here — and
-            // since BOOTSTRAP never ran, self.onmessage was never wired up either, so this
-            // worker will never respond to anything again. Treat it the same as stop()
-            // rather than leaving the UI stuck showing it as still running.
+            // Defensive fallback only at this point — BOOTSTRAP's own Blob is fixed,
+            // trusted, always-well-formed source, so a genuine parse failure here would
+            // mean something more fundamental broke (e.g. the Blob failed to load at
+            // all). A syntax error in the *script* is caught explicitly inside BOOTSTRAP
+            // itself and reported as 'fatal' (see handleWorkerMessage) instead of reaching
+            // this handler, since BOOTSTRAP now always finishes initializing regardless of
+            // whether the script does (see this file's header comment).
             worker.onerror = (e) => {
                 handlers.onLog?.('error', [e.message || String(e)])
                 e.preventDefault()
@@ -424,7 +576,8 @@ export function createScriptRuntime(handlers) {
             if (!worker) return
             worker.terminate()
             worker = null
-            if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null }
+            for (const url of blobUrls) URL.revokeObjectURL(url)
+            blobUrls = []
             runningName = null
             connMeta.clear()
             // The worker's gone — nothing to resolve into, and nothing left to notify.

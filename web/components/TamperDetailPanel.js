@@ -10,15 +10,15 @@ const html = htm.bind(h)
 
 // Decodes popover input text per the chosen format. 'hex'/'base64' reuse the Transform
 // panel's own (tested) decode ops rather than re-implementing hex/base64 parsing here —
-// 'hex' passes a fixed space separator since that op's separator stripping already treats
-// contiguous or whitespace-joined hex identically once whitespace is collapsed. 'hexdump'
-// has no Transform-panel equivalent (it isn't a general encode/decode op, just this
-// popover's way to round-trip HexDump's own "Copy as hexdump" output), so it goes through
-// format.js's parseHexdump directly.
+// 'hex' passes a fixed space separator (no prefix) since that op's separator stripping
+// already treats contiguous or whitespace-joined hex identically once whitespace is
+// collapsed. 'hexdump' has no Transform-panel equivalent (it isn't a general encode/decode
+// op, just this popover's way to round-trip HexDump's own "Copy as hexdump" output), so it
+// goes through format.js's parseHexdump directly.
 function decodeChunkText(text, format) {
     if (format === 'plain') return new TextEncoder().encode(text)
     const bytes = new TextEncoder().encode(text)
-    if (format === 'hex') return OPERATIONS['hex-decode'].run(bytes, { separator: 'space' })
+    if (format === 'hex') return OPERATIONS['hex-decode'].run(bytes, { prefix: '', separator: ' ' })
     if (format === 'base64') return OPERATIONS['base64-decode'].run(bytes, { urlSafe: false })
     if (format === 'hexdump') return parseHexdump(text)
     throw new Error(`unknown format "${format}"`)

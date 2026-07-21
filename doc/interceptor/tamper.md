@@ -54,14 +54,25 @@ you wrote or trust, the same caution you'd apply to any browser extension or use
 ### 2.1 Where a script runs
 
 `scriptRuntime.js`'s `createScriptRuntime()` manages one Web Worker at a time. `start(name,
-source)` builds the worker's actual source by prepending a bootstrap template
-(`BOOTSTRAP`) to the script's own text, wraps the whole thing in a `Blob`, and creates
-`new Worker(blobUrl)`. The script's source runs inside its own IIFE tacked onto the end of
-`BOOTSTRAP`, so its top-level `const`/`function` declarations can't collide with the
-runtime's own.
+source)` builds **two separate Blobs**, not one concatenated file: one for the bootstrap
+template (`BOOTSTRAP`), one for the script's own text (wrapped in its own IIFE, so its
+top-level `const`/`function` declarations can't collide with the runtime's own). `BOOTSTRAP`'s
+Blob is the Worker's actual entry point (`new Worker(bootstrapBlobUrl)`); after wiring up
+`self.tamper`/`self.onmessage`/the error listeners, it synchronously `importScripts()`s the
+script's Blob into that same global scope. `importScripts`, unlike an ES module import, runs
+the imported code in the *same* scope as the caller rather than a separate module namespace -
+the script still sees the bare `tamper` global exactly as if everything were one file; nothing
+about how you write a script changes because of this split.
 
-It's a classic (non-module) Worker, not `{type: 'module'}` - this matters for how
-`tamper.transform.*` is wired (§2.4).
+Each Blob ends with its own `//# sourceURL=...` magic comment - `BOOTSTRAP`'s as
+`tamper-bootstrap.js`, the script's as its own name (sanitized to end in `.js`) - so
+DevTools/stack traces show a real, correctly-line-numbered file name for whichever side
+actually failed, instead of one opaque `blob:http://.../<uuid>` URL covering both. See §2.8 for
+why this split (rather than one Blob) matters for error handling, not just naming.
+
+It's a classic (non-module) Worker, not `{type: 'module'}` - this matters both for how
+`tamper.transform.*` is wired (§2.4) and because `importScripts()` itself is only available
+in classic Workers to begin with.
 
 ### 2.2 The `tamper` object and the RPC bridge
 
@@ -98,6 +109,27 @@ buffer's current full contents, constructs the working copy, runs the registered
 `onReceive` handler(s), then - if the handler mutated the buffer but never called an
 explicit `release`/`drop`/`pause` - auto-commits the remainder as an edit-only hold, so
 nothing is silently lost.
+
+**`onReceive` isn't guaranteed one dispatch per `held` notification.** A `held` push only
+ever means "go look at the buffer again" - and TCP itself gives no guarantee about how
+incoming data gets split into physical reads in the first place, so there's nothing
+meaningful tied to any one notification individually, only to whatever `ctx.get()`
+actually observes. `pump()` coalesces **consecutive still-queued** `onReceive` entries for
+the same `(conn, direction)` into a single dispatch instead of running them one after
+another: once the Go side (appending is near-instant) outpaces how fast a dispatch can
+round-trip (peek, decide, release), several notifications routinely queue up for the same
+direction before the first one even starts - without coalescing, only that first dispatch
+finds anything to do, and every one behind it is a redundant round trip that finds an
+already-drained, empty buffer. Coalescing merges those trailing round trips into one; it
+never reorders anything relative to an interleaved other-direction/other-connection event,
+since only entries adjacent in the same per-connection queue, for the same direction, are
+ever merged. The guarantee this leaves you with: **at least one `onReceive` will
+eventually see the complete, not-yet-processed buffer** - just not necessarily one
+dispatch per notification. In practice this reduces empty dispatches rather than
+eliminating them outright (the very first notification of a fresh burst can't be
+pre-merged with anything not yet queued, and typically drains everything itself before the
+next, merged dispatch runs) - a script that wants to suppress the remainder entirely can
+add `if (ctx.get().length === 0) return` at the top of its handler.
 
 ### 2.4 Why `tamper.transform.*` doesn't use the RPC bridge
 
@@ -180,14 +212,26 @@ tamper.register('onClose', c => perStream.delete(c.conn))
 This state is memory-only - gone on Stop/Restart/error/disconnect. `tamper.fs.*` (§3.3)
 is what you'd use for anything that needs to survive that.
 
+Note `count` above counts `onReceive` *dispatches*, not physical TCP reads - per §2.3,
+consecutive still-queued notifications for the same `(conn, direction)` can be coalesced
+into one dispatch, so this is a lower bound on chunk arrivals under load, not an exact
+count of them.
+
 ### 2.8 Error handling
 
-A syntax error in the script's own source kills the Worker before `BOOTSTRAP`'s own error
-listeners even register - the main thread's `worker.onerror` catches this case instead
-and treats it the same as calling `stop()`. An exception thrown *inside* a registered
-handler is caught per-event (inside `pump()`'s loop) and reported to the log panel with
-`level: 'error'`, but the Worker keeps running - the queue just moves on to the next
-event. Losing the control WebSocket connection stops the running script outright.
+A syntax error in the script's own source kills the Worker permanently - reported (with a
+full stack trace naming the actual failing file, per §2.1) and treated as an explicit
+`stop()`. Since `BOOTSTRAP` and the script are two separate Blobs (§2.1), `BOOTSTRAP` always
+finishes initializing `self.tamper`/`self.onmessage`/its own error listeners regardless of
+whether the script's `importScripts()` call succeeds; that call is wrapped in its own
+`try`/`catch`, and a failure there is reported as a `'fatal'` message, which
+`createScriptRuntime` turns into the same `stop()` the old single-Blob design got
+incidentally from `worker.onerror` (back when a script syntax error meant the *whole*
+concatenated file failed to parse, so `BOOTSTRAP` itself never ran either). An exception
+thrown *inside* a registered handler is still just caught per-event (inside `pump()`'s loop)
+and reported to the log panel with `level: 'error'`, but the Worker keeps running - the
+queue just moves on to the next event. Losing the control WebSocket connection stops the
+running script outright.
 
 ### 2.9 Logging
 
@@ -350,13 +394,34 @@ Function names are a mechanical camelCase of the underlying operation id (e.g.
 `tripleDesEncrypt`/`tripleDesDecrypt` (`3desEncrypt` isn't a valid property name). `params`
 is passed straight through to the operation - the same shape the Transform panel's UI
 itself builds; see the root `CLAUDE.md`'s "Transform panel" section for every operation's
-exact `params` (e.g. `{mode, key, iv, aad}` for a cipher, `{separator}` for `hexEncode`) -
-this document doesn't duplicate that full catalog.
+exact `params` (e.g. `{mode, key, iv, aad}` for a cipher, `{prefix, separator}` for
+`hexEncode`) - this document doesn't duplicate that full catalog.
 
 A call made *before* the script has finished its own startup (i.e. before any hook has
 fired) returns a `Promise<Uint8Array>` instead of a plain `Uint8Array`; from inside any
 registered hook, it's always the latter. `await` works either way if you don't want to
 special-case it.
+
+### 3.6 `tamper.encode.*` / `tamper.decode.*`
+
+A smaller convenience layer, separate from `tamper.transform.*`, for the common case of
+turning a buffer into a loggable/matchable string and back:
+
+```js
+tamper.encode.hex(bytes, params)          // -> string;  params: {prefix, separator}, both default ''
+tamper.encode.base64(bytes, params)       // -> string;  params: {urlSafe}, default false
+tamper.encode.hexdump(bytes, baseOffset)  // -> string (xxd-style); baseOffset default 0
+
+tamper.decode.hex(text, params)     // -> Uint8Array; same params as tamper.encode.hex
+tamper.decode.base64(text, params)  // -> Uint8Array; same params as tamper.encode.base64
+tamper.decode.hexdump(text)         // -> Uint8Array
+```
+
+Unlike `tamper.transform.*`, `hex`/`base64` aren't Transform-panel operations you could chain
+into a pipeline step - they return a plain string, not `Uint8Array`. `hexdump` in particular has
+no Transform-panel/`tamper.transform.*` equivalent at all today. Same synchronous-after-startup
+behavior as `tamper.transform.*` (§3.5): a `Promise` only if called before the script's own
+startup has finished.
 
 ## 4. Examples
 
@@ -377,16 +442,27 @@ tamper.register('onClose', (conn) => {
     tamper.log(`[close] #${conn.conn} ${conn.src} -> ${conn.dst}`)
 })
 
-function hexDigest(bytes) {
-    return new TextDecoder().decode(tamper.transform.basic.hexEncode(bytes, { separator: 'colon' }))
-}
-
 tamper.register('onReceive', async (ctx) => {
     const bytes = ctx.get()
-    const sha256Hex = hexDigest(tamper.transform.hash.sha256(bytes))
-    const whirlpoolHex = hexDigest(tamper.transform.hash.whirlpool(bytes))
+    const sha256Hex = tamper.encode.hex(tamper.transform.hash.sha256(bytes))
     ctx.log(`(${ctx.direction}) SHA256(${bytes.length} bytes) = ${sha256Hex}`)
     await ctx.release()
+})
+```
+
+Under load (many chunks arriving faster than a dispatch can round-trip), you'll likely
+see occasional `SHA256(0 bytes) = e3b0c442...` lines - this is expected, not a bug: per
+§2.3's `onReceive` coalescing, a run of several queued notifications for the same
+direction can still leave one trailing dispatch that finds the buffer already drained by
+an earlier one. It's harmless here (an empty `ctx.release()` is a no-op, nothing is
+double-logged or double-forwarded) but if the noise is unwanted, guard the top of the
+handler:
+
+```js
+tamper.register('onReceive', async (ctx) => {
+    const bytes = ctx.get()
+    if (bytes.length === 0) return
+    ...
 })
 ```
 

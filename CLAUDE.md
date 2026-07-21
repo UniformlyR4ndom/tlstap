@@ -468,7 +468,7 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
   - **`[E]`/`[D]` label prefixing**: `sectionPrefix(name)` (exported) returns `'[E] '`/`'[D] '` for any section/subsection name that **starts with** `"Encode"`/`"Decode"` — this covers `Basic > Encode/Decode` and `Numeric > Encode/Decode` uniformly, while `Encrypt`/`Decrypt` and `Compress`/`Uncompress` are deliberately excluded (they don't match the `Encode`/`Decode` prefix test). Catalog entries (`ALGORITHM_SECTIONS`) keep plain, unprefixed `label`s — the menu shows just the algorithm name, since the Encode/Decode grouping is already visible from the section/subsection header. `TransformPanel.js`'s `renderAlgoItem(entry, prefix)` applies `sectionPrefix(...)` only when constructing the label stored on a step (`addStep`), so the prefix appears in the step chain but not the selection menu.
   - Algorithms within each (sub)section are sorted alphabetically by plain `label` — applying the same fixed prefix to every entry in a group never changes their relative order, so sorting doesn't need to account for it.
 - **Implemented operations:**
-  - `hex-encode`/`hex-decode` (`transforms/basic.js`): `separator` param (`select`: None, `0x`, `\x`, `,`, `;`, `:`, Space, `\n` — default Space). `0x`/`\x` are per-byte prefixes (`0x48 0x65 ...` / `\x48\x65...`); `,`/`;`/`:`/Space/`\n` are plain join characters between byte pairs; None concatenates with nothing between bytes (`4865...`). Decode strips the selected separator's literal characters (plus any incidental whitespace) before the existing hex-digit-pair parsing/validation — None has no entry in `HEX_SEPARATOR_CHARS`, so decode's `sepChars` lookup is falsy and the text is used as-is (still whitespace-tolerant), rather than needing a special case.
+  - `hex-encode`/`hex-decode` (`transforms/basic.js`): two orthogonal params — `prefix` (`select`: None, `0x`, `\x` — default None), a literal string prepended to every byte (e.g. `0x48 0x65...` / `\x48\x65...`), and `separator` (`text`, default Space), a literal string joined between bytes, empty for no separator at all (e.g. `4865...`). The two combine freely (e.g. prefix `\x` + separator `,` → `\x48,\x65`) — this replaced an earlier single `separator` enum (None/`0x`/`\x`/`,`/`;`/`:`/Space/`\n`) that conflated the per-byte-prefix and join-separator concepts into one field. Decode strips the configured prefix (if any) and separator (if any) via plain `split(...).join('')`, then collapses any remaining incidental whitespace before the existing hex-digit-pair parsing/validation.
   - `base64-encode`/`base64-decode` (`transforms/basic.js`): `urlSafe` boolean param (default `false`). Encode swaps `+`/`/` for `-`/`_` and strips trailing `=` padding; decode reverses the substitution and restores correct padding (based on length mod 4) before `atob`.
   - `octal-encode`/`octal-decode` (`transforms/basic.js`): each byte as 3-digit zero-padded octal, space-separated.
   - `basen-encode`/`basen-decode` (`transforms/basic.js`): `base` param (`number`, 2–64, default 64). Arbitrary-base big-integer encoding via `BigInt`; alphabet is the first *N* characters of the standard base64 char ordering (`ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/`); leading zero bytes are preserved as leading zero-symbol characters (same convention as Base58).
@@ -677,13 +677,14 @@ second-level tab bar (**Intercept** / **Scripts**, `.tamper-subtabs`); only one 
 at a time, but the running script, its log, and which entries are script-paused are
 lifted to `TamperView` so they survive switching away and back.
 
-**Script-facing API surface** (defined by `BOOTSTRAP`, a template string
-`scriptRuntime.js` prepends to the script's own source, both loaded as one Worker via a
-Blob URL):
+**Script-facing API surface** (defined by `BOOTSTRAP`, loaded as its own Blob — the Worker's
+actual entry point — which then `importScripts()`s the script's own separate Blob into that
+same global scope; see `scriptRuntime.js`'s header comment and "Error handling" below for why
+they're two Blobs rather than one concatenated file):
 
 ```js
 tamper.register('onConnect', (conn) => { ... })   // conn: { conn, src, dst }
-tamper.register('onReceive', (ctx) => { ... })      // fired once per newly-held chunk, either direction
+tamper.register('onReceive', (ctx) => { ... })      // fired for newly-held data, either direction — see "Per-connection event serialization" below for the exact firing guarantee
 tamper.register('onClose',   (conn) => { ... })      // same shape as onConnect
 
 tamper.peek(conn, direction)                     // raw escape hatch — direction is always 'c2s' | 's2c'
@@ -701,6 +702,14 @@ tamper.fs.appendFile(path, bytes)  // appends, creating the file if it doesn't e
 tamper.transform.<category>.<function>(bytes, params)  // -> Uint8Array (Promise<Uint8Array> only if called before the script has finished loading — see below)
 // categories: basic, numeric, compression, checksum, encryption, mac, hash
 // e.g. tamper.transform.hash.md5(bytes), tamper.transform.encryption.aesEncrypt(bytes, {mode:'gcm', key, nonce, aad})
+
+tamper.encode.hex(bytes, params)      // -> string; params: {prefix, separator}, both default '' (plain contiguous hex)
+tamper.encode.base64(bytes, params)   // -> string; params: {urlSafe}, default false
+tamper.encode.hexdump(bytes, baseOffset)  // -> string (xxd-style); baseOffset default 0
+
+tamper.decode.hex(text, params)       // -> Uint8Array; same params as tamper.encode.hex
+tamper.decode.base64(text, params)    // -> Uint8Array; same params as tamper.encode.base64
+tamper.decode.hexdump(text)           // -> Uint8Array
 ```
 
 `register` only accepts these three hook names; a hook can be registered more than once,
@@ -753,20 +762,40 @@ calls a `callTransform(opId, bytes, params)` helper defined inside `BOOTSTRAP` i
 an RPC `call`. No new privilege is exposed here beyond convenience: a script already has full
 read/write access to the bytes in question via `ctx`/`tamper.peek`/`tamper.release`.
 
-**Bootstrap sequencing (why `tamper.transform.*` is synchronous in practice, not just in
-principle):** `BOOTSTRAP`'s outer IIFE stays synchronous — `self.tamper`, `self.onmessage`, and
-the `error`/`unhandledrejection` listeners are all wired up immediately — and only *after* that
-does a trailing `async` IIFE dynamically `import(TRANSFORMS_URL)` and `await`
-`warmupWhirlpool()` (see the Transform panel's Whirlpool entry above), then flips a module-level
-`ready` flag. `pump()` — the function that dispatches queued `onConnect`/`onReceive`/`onClose`
-events to the script's registered handlers — checks `ready` first and simply declines to run
-until it's true; events still queue normally via `self.onmessage` in the meantime (nothing is
-dropped or reordered), and the trailing IIFE calls `pump()` for every queued `conn` once `ready`
-flips. The practical effect: a script's own hook handlers never observe `OPERATIONS` as
-unpopulated, so every `tamper.transform.*` call made from inside `onConnect`/`onReceive`/
-`onClose` is genuinely synchronous — no `await`, no `Promise` wrapper. `callTransform()`'s
-`ready` check exists only for the one case this doesn't cover: a script calling a transform
-function at its own top level, outside any hook, which can run before the import/warmup has
+**`tamper.encode.*`/`tamper.decode.*`** are a smaller, separate convenience layer for the common
+case of turning a buffer into a loggable/matchable string and back — as opposed to
+`tamper.transform.*`, whose every op is deliberately bytes-in/bytes-out so Transform-panel steps
+can chain. `hex`/`base64` are thin wrappers around the same `OPERATIONS['hex-encode']`/
+`['hex-decode']`/`['base64-encode']`/`['base64-decode']` used by `tamper.transform.basic.*`
+(`TextEncoder`/`TextDecoder` at the string/bytes boundary, same `params` shape — see the "Transform
+panel" section's `hex-encode`/`hex-decode` entry above for `prefix`/`separator`), so there's exactly
+one implementation of each codec; unsupplied params default to the most common case (`prefix: ''`,
+`separator: ''` for hex — a plain contiguous string, `urlSafe: false` for base64), merged with any
+explicit `params` the same way `addStep`'s param defaults work in the UI. `hexdump` has no
+`OPERATIONS`/Transform-panel entry to wrap at all (see the "Transform panel" section's note on this
+gap), so `tamper.encode.hexdump`/`tamper.decode.hexdump` call `format.js`'s `fmtAsHexdump`/
+`parseHexdump` directly instead — both are already string in/out, so no `TextEncoder`/`TextDecoder`
+step is needed there. `format.js` is dynamically imported by `BOOTSTRAP` the same way
+`transforms.js` is (`FORMAT_URL`, computed identically to `TRANSFORMS_URL`), gated on the same
+`ready` flag described below.
+
+**Bootstrap sequencing (why `tamper.transform.*`/`tamper.encode.*`/`tamper.decode.*` are
+synchronous in practice, not just in principle):** `BOOTSTRAP`'s outer IIFE stays synchronous —
+`self.tamper`, `self.onmessage`, and the `error`/`unhandledrejection` listeners are all wired up
+immediately — and only *after* that does a trailing `async` IIFE dynamically import both
+`TRANSFORMS_URL` and `FORMAT_URL` in parallel and `await` `warmupWhirlpool()` (see the Transform
+panel's Whirlpool entry above), then flips a module-level `ready` flag. `pump()` — the function
+that dispatches queued `onConnect`/`onReceive`/`onClose` events to the script's registered
+handlers — checks `ready` first and simply declines to run until it's true; events still queue
+normally via `self.onmessage` in the meantime (nothing is dropped or reordered), and the trailing
+IIFE calls `pump()` for every queued `conn` once `ready` flips. The practical effect: a script's
+own hook handlers never observe `OPERATIONS`/`FORMAT` as unpopulated, so every
+`tamper.transform.*`/`tamper.encode.*`/`tamper.decode.*` call made from inside
+`onConnect`/`onReceive`/`onClose` is genuinely synchronous — no `await`, no `Promise` wrapper. A
+shared `whenReady(fn)` helper (`fn` called immediately if `ready`, otherwise chained onto the one
+`readyPromise`) backs `callTransform()` and the six `callEncode*`/`callDecode*` functions alike;
+its `ready` check exists only for the one case this doesn't cover: a script calling one of these
+functions at its own top level, outside any hook, which can run before the import/warmup has
 finished — that gets a `Promise` instead of a crash, `await`-compatible like the general
 convention elsewhere in this API. A thrown/rejected error propagates back as a rejected promise
 either way.
@@ -801,6 +830,37 @@ rest of the wire protocol is translated only at `scriptRuntime.js`'s main-thread
 `onConnect`/`onClose`) go through a per-conn FIFO queue — the next event only dispatches
 once every handler for the previous one (including any `ctx.pause()` suspension) has
 resolved. Different `conn`s run fully independently.
+
+**`onReceive` firing guarantee — coalesced, not strictly one-per-chunk:** a `held`
+notification only ever means "go look at the buffer again," and TCP itself gives no
+guarantee about how incoming data is chunked into physical reads in the first place — so
+there is nothing meaningful tied to any individual notification, only to the buffer state
+a dispatch actually observes via `ctx.get()`. `scriptRuntime.js`'s `pump()` therefore
+coalesces **consecutive still-queued** `onReceive` entries for the same `(conn,
+direction)` into a single dispatch, rather than running one after another: once
+accumulation on the Go side (near-instant) outpaces how fast a dispatch can round-trip
+(peek, decide, release), several notifications routinely pile up for the same direction
+before the first one even starts — without coalescing, only that first dispatch finds
+anything to do (whatever accumulated by then), and every one behind it is a redundant
+round trip that finds an already-drained, empty buffer. Coalescing merges those trailing,
+otherwise-empty round trips into one. It never reorders anything relative to an
+interleaved other-direction/other-`conn` event — only entries adjacent in the same
+per-conn queue, for the same direction, are ever merged, so a genuinely interleaved
+sequence still dispatches every distinct state in order. Merged entries sum their
+lengths, so `ctx.newLength` still means "how many new bytes since the last dispatch," not
+just one physical chunk's own size.
+
+The practical guarantee this leaves scripts with: **at least one `onReceive` will
+eventually see the complete, not-yet-processed buffer** (`ctx.get()` always reflects
+everything held at that instant, coalesced or not) — just not necessarily one dispatch
+per notification. In practice this only *reduces* redundant empty dispatches, it doesn't
+eliminate them entirely: the very first notification of a fresh burst (arriving into an
+idle queue) can never be pre-merged with anything not yet queued at that instant, and —
+since Go-side accumulation typically outpaces the round trip — that first dispatch
+usually drains everything by the time its own `peek()` resolves, leaving one merged
+trailing dispatch behind it that often still finds nothing left. A script that wants to
+suppress that entirely can add `if (ctx.get().length === 0) return` at the top of its
+`onReceive` handler.
 
 **Custom state across invocations is not `ctx`'s job — use closures instead.** `ctx` is
 rebuilt from scratch by `handleOnReceive` on every `onReceive` dispatch (a fresh object
@@ -844,11 +904,34 @@ numeric `conn`, but `onClose` gets the same `{conn, src, dst}` shape `onConnect`
 cached in `scriptRuntime.js`'s `connMeta` map from `onConnect`, looked up and deleted on
 `onClose`. A stream already open before the script started falls back to `{conn}` alone.
 
-**Error handling:** a syntax error in the script's own source kills the Worker
-permanently (surfaces via `onerror`, treated as an implicit `stop()`). An exception
-thrown *inside* a handler is caught per-event and reported without stopping the Worker —
-the queue moves on. Both paths render into the same log panel (`level: 'error'` vs
-`'log'`). Losing the control connection also stops the running script.
+**Error handling:** a syntax error in the script's own source kills the Worker permanently
+— reported (with a full stack trace naming the actual failing script file, see "Loading and
+stack-trace naming" below) and treated as an explicit `stop()`. This used to fall out
+incidentally of `worker.onerror` firing because BOOTSTRAP and the script were one
+concatenated parse unit — a script syntax error meant *nothing*, including BOOTSTRAP's own
+`self.tamper`/`self.onmessage`/error listeners, ever ran. Now that they're two separate
+Blobs (see below), BOOTSTRAP always finishes initializing regardless of whether the script
+does, so this is instead caught explicitly around the `importScripts()` call that loads the
+script and reported as a `'fatal'` message (`scriptRuntime.js`'s `handleWorkerMessage`),
+which `createScriptRuntime` turns into the same `stop()` call — same observable outcome,
+explicit mechanism instead of an incidental one. An exception thrown *inside* a handler is
+still just caught per-event and reported without stopping the Worker — the queue moves on.
+All three paths (`'error'`, `'fatal'`, a handler-local catch) render into the same log
+panel, `'fatal'` and a handler's own catch both under `level: 'error'`. Losing the control
+connection also stops the running script.
+
+**Loading and stack-trace naming:** BOOTSTRAP and the script are two separate Blobs, not one
+concatenated file. BOOTSTRAP's own Blob is the Worker's actual entry point — after wiring up
+`self.tamper`/`self.onmessage`/the error listeners, it synchronously `importScripts()`s the
+script's Blob into that same global scope (`importScripts`, unlike an ES module import, runs
+the imported code in the *same* scope as the caller, not a separate module namespace — the
+script still sees the bare `tamper` global exactly as if everything were one file; nothing
+about how a script is written changes). Each Blob ends with its own `//# sourceURL=...`
+magic comment (`scriptRuntime.js`'s `buildWorkerSource`/`buildScriptSource`) — `BOOTSTRAP`'s
+own Blob as `tamper-bootstrap.js`, the script's Blob as its own name (sanitized to end in
+`.js`) — so DevTools/stack traces show a real, correctly-line-numbered file name for
+whichever side actually failed, instead of one opaque `blob:http://.../<uuid>` URL covering
+both.
 
 **`TamperScriptsPanel.js`** is CRUD over the REST script store (`listScripts`/
 `getScript`/`putScript`/`deleteScript`) plus Run/Stop wired to the lifted runtime state

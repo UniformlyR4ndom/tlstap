@@ -22,25 +22,63 @@ function wsUrl(path) {
 // interleave a push event (held/stream-created/stream-terminated) with the ok/error/
 // stream-list reply to whatever command was just sent, since pushes originate from a
 // different goroutine than command replies (see intercept/tamper/api.go). "ok"/"error"
-// resolve or reject the one in-flight command promise (this wrapper only ever allows
-// one at a time); "stream-list" both updates onStreamList and resolves a pending
-// promise, since every stream-list is inherently a reply to list-streams — the server
-// never pushes it unsolicited.
+// resolve or reject the in-flight command; "stream-list" both updates onStreamList and
+// resolves it, since every stream-list is inherently a reply to list-streams — the
+// server never pushes it unsolicited.
+//
+// Only one command is ever in flight to the server at a time — sendCommand below queues
+// the rest rather than clobbering an outstanding one (a real bug this replaced: a naive
+// "one pending slot" implementation lets a second call silently overwrite the first
+// call's {resolve,reject} before its reply arrives, abandoning that promise forever).
+// list-streams is the one call site (TamperView.js's resync(), invoked from every push
+// event — in particular onHeld, which fires once per physical chunk a connection
+// receives) that isn't naturally rate-limited by real outstanding decisions, so it's
+// coalesced: at most one list-streams in flight plus at most one more already queued
+// behind it, with every extra resync() call in between just attaching its
+// resolve/reject to that single queued entry instead of enqueueing a new one. Every
+// other command (release/dropConnection/setMode/setAutoIntercept) corresponds to a
+// distinct, non-redundant decision — those are never merged, and the FIFO for them is
+// bounded by how many such decisions are genuinely outstanding across all connections
+// (further capped, for release, by scriptRuntime.js's own per-connection
+// serialization — at most one ctx.release() in flight per connection at a time), not by
+// per-chunk arrival frequency.
 export function openTamperControl(handlers = {}) {
     const ws = new WebSocket(wsUrl(`${BASE}/control`))
-    let pending = null // { resolve, reject }
+    let pending = null   // { type, waiters: [{resolve,reject}, ...] } — the in-flight command
+    const queue = []     // not-yet-sent commands: { payload, type, waiters, binaryFollowup? }
+
+    function settleWaiters(waiters, fn, value) {
+        for (const w of waiters) fn === 'resolve' ? w.resolve(value) : w.reject(value)
+    }
+
+    // Sends the next queued command, if the connection is idle and something's waiting.
+    // The binary followup (release's edited-bytes frame) is sent in the same tick,
+    // immediately after its JSON command, regardless of how long that command sat
+    // queued — the wire protocol requires them adjacent, and queueing delay must never
+    // let some other command's frame land in between.
+    function pump() {
+        if (pending || queue.length === 0) return
+        const next = queue.shift()
+        pending = { type: next.type, waiters: next.waiters }
+        ws.send(JSON.stringify(next.payload))
+        if (next.binaryFollowup) ws.send(next.binaryFollowup)
+    }
 
     function settle(fn, value) {
         if (!pending) return
         const p = pending
         pending = null
-        fn === 'resolve' ? p.resolve(value) : p.reject(value)
+        settleWaiters(p.waiters, fn, value)
+        pump()
     }
 
     ws.onopen = () => handlers.onOpen?.()
     ws.onclose = () => {
         handlers.onClose?.()
         settle('reject', new Error('control connection closed'))
+        // Anything still queued has no chance of ever being sent now — reject it too,
+        // rather than leaving those promises unsettled forever.
+        for (const q of queue.splice(0)) settleWaiters(q.waiters, 'reject', new Error('control connection closed'))
     }
     ws.onerror = () => handlers.onError?.(new Error('WebSocket error'))
     ws.onmessage = event => {
@@ -72,11 +110,18 @@ export function openTamperControl(handlers = {}) {
         }
     }
 
-    function sendCommand(payload) {
-        return new Promise((resolve, reject) => {
-            pending = { resolve, reject }
-            ws.send(JSON.stringify(payload))
+    function sendCommand(payload, binaryFollowup) {
+        if (payload.type === 'list-streams') {
+            const last = queue[queue.length - 1]
+            if (last && last.type === 'list-streams') {
+                return new Promise((resolve, reject) => { last.waiters.push({ resolve, reject }) })
+            }
+        }
+        const promise = new Promise((resolve, reject) => {
+            queue.push({ payload, type: payload.type, waiters: [{ resolve, reject }], binaryFollowup })
         })
+        pump()
+        return promise
     }
 
     return {
@@ -91,13 +136,11 @@ export function openTamperControl(handlers = {}) {
         },
         release(conn, direction, opts, editedBytes) {
             const { action, releaseChunks = 0, edited = false, prefixLength = 0, bounds = [] } = opts
-            const p = sendCommand({
+            return sendCommand({
                 type: 'release', conn, direction, action,
                 release_chunks: releaseChunks, edited,
                 prefix_length: prefixLength, bounds,
-            })
-            if (edited) ws.send(editedBytes)
-            return p
+            }, edited ? editedBytes : undefined)
         },
         dropConnection(conn, direction) {
             return sendCommand({ type: 'drop-connection', conn, direction })
@@ -122,11 +165,27 @@ export function openTamperControl(handlers = {}) {
 // always replies with exactly one "pending" + binary pair (or a single "error" for an
 // invalid direction) — a direction with nothing held is a normal zero-length reply, not
 // an error. offset/length optionally slice the buffer; omit both for the whole thing.
+//
+// This connection is also registered server-side as a live-mirror watcher for as long as
+// it's open (intercept/tamper/api.go's handleWatch) — mirroring fires on receipt of every
+// chunk, regardless of hold/intercept state, so a chunk arriving on this stream while our
+// own peek reply is still in flight interleaves its own unsolicited header+binary pair
+// with ours on the very same socket. A mirror-frame header has no "type" field (unlike
+// "pending"/"peek-done"/"error"), so text messages are already distinguishable — but
+// since the server's writeJSON/writeBinary each independently acquire its per-connection
+// writeMu (see watcher.writeJSON/writeBinary), not as one atomic pair, another goroutine's
+// write can land between a header and its own binary payload; a single "last header seen"
+// flag isn't enough if two unrelated pairs' headers both arrive before either's binary.
+// awaiting is a FIFO of headers in arrival order (our own "pending" metadata, or null for
+// a mirror frame) — every binary frame that arrives pairs with whichever header is at the
+// front of that queue, which is always correct regardless of how many pairs interleave,
+// since binaries arrive in the same relative order their own headers did.
 export function peekBuffer(conn, direction, offset, length) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl(`${BASE}/watch?conn=${conn}`))
         ws.binaryType = 'arraybuffer'
-        let pendingMeta = null
+        const awaiting = []
+        let gotReply = false
 
         ws.onopen = () => ws.send(JSON.stringify({ type: 'peek', direction, offset, length }))
         ws.onerror = () => reject(new Error('WebSocket error'))
@@ -134,17 +193,23 @@ export function peekBuffer(conn, direction, offset, length) {
             if (typeof event.data === 'string') {
                 const msg = JSON.parse(event.data)
                 if (msg.type === 'pending') {
-                    pendingMeta = msg
+                    awaiting.push(msg)
                 } else if (msg.type === 'peek-done') {
                     ws.close()
-                    if (!pendingMeta) reject(new Error('no reply received for peek'))
+                    if (!gotReply) reject(new Error('no reply received for peek'))
                 } else if (msg.type === 'error') {
                     ws.close()
                     reject(new Error(msg.message))
+                } else {
+                    // Unsolicited live-mirror frame header — queue a marker so its binary
+                    // payload, whenever it arrives relative to our own reply, is discarded
+                    // rather than misread as ours.
+                    awaiting.push(null)
                 }
             } else {
-                const meta = pendingMeta
-                pendingMeta = null
+                const meta = awaiting.shift()
+                if (meta == null) return // a mirror frame's payload (or a stray extra binary) — not ours
+                gotReply = true
                 ws.close()
                 resolve({
                     direction: meta.direction,

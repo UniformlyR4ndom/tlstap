@@ -8,40 +8,34 @@ function validateBase(base) {
     return b
 }
 
-// Maps a hex separator param value to its literal character(s).
-const HEX_SEPARATOR_CHARS = {
-    x0: '0x', xesc: '\\x', comma: ',', semi: ';', colon: ':', space: ' ', newline: '\n',
-}
-const HEX_SEPARATOR_OPTIONS = [
-    { value: 'none',    label: 'None' },
-    { value: 'x0',      label: '0x' },
-    { value: 'xesc',    label: '\\x' },
-    { value: 'comma',   label: ',' },
-    { value: 'semi',    label: ';' },
-    { value: 'colon',   label: ':' },
-    { value: 'space',   label: 'Space' },
-    { value: 'newline', label: '\\n' },
+// 'prefix' is per-byte (applied before each hex pair, e.g. "0x48 0x65"); 'separator' is the
+// literal string joined between bytes (may be empty for no separator at all). The two are
+// orthogonal — e.g. prefix '\\x' with separator ',' gives "\x48,\x65".
+const HEX_PREFIX_OPTIONS = [
+    { value: '',     label: 'None' },
+    { value: '0x',   label: '0x' },
+    { value: '\\x',  label: '\\x' },
 ]
-const HEX_PARAMS = [{ key: 'separator', label: 'Separator', type: 'select', options: HEX_SEPARATOR_OPTIONS, default: 'space' }]
+const HEX_PARAMS = [
+    { key: 'prefix',    label: 'Prefix',    type: 'select', options: HEX_PREFIX_OPTIONS, default: '' },
+    { key: 'separator', label: 'Separator', type: 'text', default: ' ' },
+]
 
 function hexEncode(bytes, params) {
-    const sep = params.separator
-    const hexBytes = Array.from(bytes, b => b.toString(16).padStart(2, '0'))
-    let text
-    if (sep === 'none') text = hexBytes.join('')
-    else if (sep === 'x0') text = hexBytes.map(h => '0x' + h).join(' ')
-    else if (sep === 'xesc') text = hexBytes.map(h => '\\x' + h).join('')
-    else text = hexBytes.join(HEX_SEPARATOR_CHARS[sep])
-    return new TextEncoder().encode(text)
+    const prefix = params.prefix || ''
+    const separator = params.separator ?? ''
+    const hexBytes = Array.from(bytes, b => prefix + b.toString(16).padStart(2, '0'))
+    return new TextEncoder().encode(hexBytes.join(separator))
 }
 
 function hexDecode(bytes, params) {
     const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
-    // 'none' has no entry in HEX_SEPARATOR_CHARS, so sepChars is falsy and text is used as-is
-    // (below whitespace-stripping still applies, same as every other separator).
-    const sepChars = HEX_SEPARATOR_CHARS[params.separator]
-    const withoutSeparator = sepChars ? text.split(sepChars).join('') : text
-    const cleaned = withoutSeparator.replace(/\s+/g, '')
+    const prefix = params.prefix || ''
+    const separator = params.separator ?? ''
+    let stripped = text
+    if (prefix) stripped = stripped.split(prefix).join('')
+    if (separator) stripped = stripped.split(separator).join('')
+    const cleaned = stripped.replace(/\s+/g, '')
     if (cleaned.length % 2 !== 0) throw new Error('odd number of hex digits')
     if (!/^[0-9a-fA-F]*$/.test(cleaned)) throw new Error('invalid hex digit')
     const out = new Uint8Array(cleaned.length / 2)
