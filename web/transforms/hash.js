@@ -6,15 +6,7 @@
 // hand-rolled — see ../vendor/hash-wasm-whirlpool.module.js for why.
 import { WordArray, MD5, SHA1, SHA224, SHA256, SHA384, SHA512 } from '../vendor/crypto-js.module.js'
 import { createWhirlpool } from '../vendor/hash-wasm-whirlpool.module.js'
-
-function bytesFromWordArray(wordArray) {
-    const { words, sigBytes } = wordArray
-    const bytes = new Uint8Array(sigBytes)
-    for (let i = 0; i < sigBytes; i++) {
-        bytes[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff
-    }
-    return bytes
-}
+import { bytesFromWordArray, fmtAsRaw } from '../format.js'
 
 function cryptoJsHash(hasher, bytes) {
     return bytesFromWordArray(hasher(WordArray.create(bytes)))
@@ -49,8 +41,7 @@ function whirlpool(bytes) {
     return whirlpoolHasher ? whirlpoolDigest(bytes) : warmupWhirlpool().then(() => whirlpoolDigest(bytes))
 }
 
-// Permutation of pi's digits, per RFC 1319 Appendix A. Cross-checked against an independent
-// implementation (nf404/crypto-api's md2.mjs) byte-for-byte before use.
+// Permutation of pi's digits, per RFC 1319 Appendix A.
 const MD2_SBOX = [
     41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6, 19, 98, 167, 5, 243, 192, 199, 115, 140,
     152, 147, 43, 217, 188, 76, 130, 202, 30, 155, 87, 60, 253, 212, 224, 22, 103, 66, 111, 24, 138, 23, 229, 18,
@@ -123,9 +114,7 @@ function md4Pad(bytes) {
     return padded
 }
 
-// RFC 1320. Round message-index/shift tables and function definitions match the reference
-// implementation; cross-checked against nf404/crypto-api's md4.mjs (itself verified against the
-// RFC's own test vectors) before use.
+// RFC 1320 round message-index/shift tables and function definitions.
 function md4(bytes) {
     const padded = md4Pad(bytes)
     const view = new DataView(padded.buffer)
@@ -175,7 +164,7 @@ function md4(bytes) {
 // NTLM hash = MD4(UTF-16LE(password)). Input bytes are treated as UTF-8 text (consistent with
 // SearchPanel.js's utf16le format) and re-encoded before hashing.
 function ntlm(bytes) {
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    const text = fmtAsRaw(bytes)
     const utf16le = new Uint8Array(text.length * 2)
     const view = new DataView(utf16le.buffer)
     for (let i = 0; i < text.length; i++) view.setUint16(i * 2, text.charCodeAt(i), true)

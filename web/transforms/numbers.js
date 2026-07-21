@@ -1,3 +1,5 @@
+import { fmtAsRaw, parseRaw } from '../format.js'
+
 // Fixed-width binary integer types. `get`/`set` name the DataView methods to use; the
 // 1-byte types ignore the extra `le` argument DataView getters/setters are called with.
 const NUMBER_TYPES = [
@@ -33,12 +35,12 @@ function numberDecode(bytes, type) {
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     const value = view[type.get](0, type.le)
-    return new TextEncoder().encode(String(value))
+    return parseRaw(String(value))
 }
 
 // Encodes decimal text (e.g. "-123") into the fixed-width binary representation.
 function numberEncode(bytes, type) {
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim()
+    const text = fmtAsRaw(bytes).trim()
     if (!/^-?\d+$/.test(text)) throw new Error(`"${text}" is not a valid integer`)
     const value = type.big ? BigInt(text) : Number(text)
     const { min, max } = numberRange(type)

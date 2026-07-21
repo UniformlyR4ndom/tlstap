@@ -114,11 +114,10 @@ export default function TamperScriptsPanel({
     // since the server-persisted copy is the better source for anything sizable anyway.
     // Plain per-line text; error lines get a textual [ERROR] marker since the red
     // .tamper-log-error styling doesn't survive into a downloaded file. Always a plain
-    // anchor-click download rather than showSaveFilePicker (like ExtractPanel.js/
-    // MarkersPanel.js use for their explicit file/clipboard choice) — this button is
-    // just "Download", not "Save As", and showSaveFilePicker's OS-native dialog turned
-    // out to hang with no visible feedback in at least one real environment, with no
-    // error to even report; a plain download has no such failure mode.
+    // anchor-click download rather than showSaveFilePicker (unlike ExtractPanel.js/
+    // MarkersPanel.js, which offer an explicit file/clipboard choice) — this button is
+    // just "Download", not "Save As", and showSaveFilePicker's native dialog can hang
+    // with no error and no visible feedback; a plain download has no such failure mode.
     function handleDownloadLog() {
         const text = logLines.map(l => l.level === 'error' ? `[ERROR] ${l.text}` : l.text).join('\n')
         const blob = new Blob([text], { type: 'text/plain' })

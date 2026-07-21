@@ -2,6 +2,10 @@ export function fmtAsRaw(bytes) {
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
 }
 
+export function parseRaw(text) {
+    return new TextEncoder().encode(text)
+}
+
 export function fmtAsBase64(bytes) {
     return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
 }
@@ -46,6 +50,63 @@ export function parseHexdump(text) {
         }
     }
     return new Uint8Array(bytes)
+}
+
+// Accepts an optional leading "0x"/"0X" prefix (stripped if present); the remainder must be a
+// plain, contiguous run of hex-digit pairs. `validLengths` (optional array of acceptable byte
+// counts) is enforced here for callers whose underlying library doesn't validate it itself.
+export function parseHexBytes(text, label, validLengths) {
+    let cleaned = String(text ?? '').replace(/\s+/g, '')
+    if (/^0[xX]/.test(cleaned)) cleaned = cleaned.slice(2)
+    if (cleaned.length === 0) throw new Error(`${label} must not be empty`)
+    if (cleaned.length % 2 !== 0) throw new Error(`${label}: odd number of hex digits`)
+    if (!/^[0-9a-fA-F]*$/.test(cleaned)) throw new Error(`${label}: invalid hex digit`)
+    const bytes = new Uint8Array(cleaned.length / 2)
+    for (let i = 0; i < cleaned.length; i += 2) bytes[i / 2] = parseInt(cleaned.slice(i, i + 2), 16)
+    if (validLengths && !validLengths.includes(bytes.length)) {
+        throw new Error(`${label} must be ${validLengths.join(' or ')} bytes, got ${bytes.length}`)
+    }
+    return bytes
+}
+
+// Unpacks a crypto-js WordArray-shaped object ({words: number[], sigBytes}) into a Uint8Array —
+// crypto-js packs bytes big-endian, 4 per 32-bit word.
+export function bytesFromWordArray(wordArray) {
+    const { words, sigBytes } = wordArray
+    const bytes = new Uint8Array(sigBytes)
+    for (let i = 0; i < sigBytes; i++) {
+        bytes[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff
+    }
+    return bytes
+}
+
+// Formats an unsigned integer as a fixed-width, zero-padded "0x"-prefixed hex string
+// (width in bits, e.g. fmtUintHex(0xFF, 16) -> "0x00FF").
+export function fmtUintHex(n, width) {
+    return '0x' + ((n >>> 0).toString(16).toUpperCase().padStart(width / 4, '0'))
+}
+
+// Accepts "0x"/"0X"-prefixed hex, plain decimal, or bare hex with no prefix at all (e.g.
+// "c10fd7ae") — a pure-digit string (no a-f letters) is read as decimal so an already-typed
+// value like "1021" doesn't silently become 0x1021; a string containing a-f is unambiguous
+// and accepted as hex directly. Validates the parsed value fits in `width` bits.
+export function parseUintField(text, label, width) {
+    const s = String(text).trim()
+    let value
+    if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = parseInt(s, 16)
+    else if (/^[0-9]+$/.test(s)) value = parseInt(s, 10)
+    else if (/^[0-9a-fA-F]+$/.test(s)) value = parseInt(s, 16)
+    else throw new Error(`invalid ${label}: "${text}"`)
+    const max = width === 32 ? 0xFFFFFFFF : (1 << width) - 1
+    if (value > max) throw new Error(`${label} out of range for a ${width}-bit value: "${text}"`)
+    return value >>> 0
+}
+
+// Rounds `value` to the nearest integer and validates it falls within [min, max].
+export function parseIntInRange(value, min, max, label) {
+    const n = Math.round(Number(value))
+    if (!Number.isFinite(n) || n < min || n > max) throw new Error(`${label} must be between ${min} and ${max}`)
+    return n
 }
 
 export function mergeUint8Arrays(arrays) {

@@ -6,38 +6,16 @@
 // the generic HMAC construction ourselves (our vendored copy is a minimal hash-only WASM bundle
 // with no HMAC helper) for a niche algorithm not judged worth it.
 //
-// All six come from the vendored crypto-js (already used by hash.js and, since the Encryption
-// work, encryption.js too) — its own module now also includes the HMAC helpers; see
-// ../vendor/crypto-js.module.js's header comment for the full rebuild recipe, including the
-// import-order requirement (hmac.js before the hash files) that isn't obvious from crypto-js's
-// own docs.
+// All six come from the vendored crypto-js (already used by hash.js and encryption.js) — its
+// own module now also includes the HMAC helpers; see ../vendor/crypto-js.module.js's header
+// comment for the full rebuild recipe, including the import-order requirement (hmac.js before
+// the hash files) that isn't obvious from crypto-js's own docs.
 import { WordArray, HmacMD5, HmacSHA1, HmacSHA224, HmacSHA256, HmacSHA384, HmacSHA512 } from '../vendor/crypto-js.module.js'
+import { bytesFromWordArray, parseHexBytes } from '../format.js'
 
-function bytesFromWordArray(wordArray) {
-    const { words, sigBytes } = wordArray
-    const bytes = new Uint8Array(sigBytes)
-    for (let i = 0; i < sigBytes; i++) {
-        bytes[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff
-    }
-    return bytes
-}
-
-// Same hex-parsing convention as encryption.js's parseHexBytes (0x-prefix optional, bare hex
-// accepted) — duplicated here rather than imported, matching this project's per-module-private-
-// helper convention (hash.js and encryption.js each already keep their own separate copy of a
-// near-identical bytesFromWordArray). No length constraint: HMAC is defined for any key length —
-// RFC 2104 zero-pads short keys and hashes down long ones internally — so the only requirement is
-// that a key was actually given.
-function parseHexBytes(text, label) {
-    let cleaned = String(text ?? '').replace(/\s+/g, '')
-    if (/^0[xX]/.test(cleaned)) cleaned = cleaned.slice(2)
-    if (cleaned.length === 0) throw new Error(`${label} must not be empty`)
-    if (cleaned.length % 2 !== 0) throw new Error(`${label}: odd number of hex digits`)
-    if (!/^[0-9a-fA-F]*$/.test(cleaned)) throw new Error(`${label}: invalid hex digit`)
-    const bytes = new Uint8Array(cleaned.length / 2)
-    for (let i = 0; i < cleaned.length; i += 2) bytes[i / 2] = parseInt(cleaned.slice(i, i + 2), 16)
-    return bytes
-}
+// No length constraint on the key: HMAC is defined for any key length — RFC 2104 zero-pads
+// short keys and hashes down long ones internally — so parseHexBytes is called with no
+// validLengths argument.
 
 const KEY_PARAM = [
     { key: 'key', label: 'Hex bytes', type: 'text', default: '', wide: true, row: 'key', rowLabel: 'Key' },

@@ -1,5 +1,4 @@
-// Library split, verified directly against each package's own source before use (not from
-// memory) — see checksum.js's header comment for the same discipline applied there:
+// Library split:
 // - AES (CBC/CTR/GCM) and ChaCha20/Salsa20 come from the vendored @noble/ciphers (MIT, zero
 //   runtime deps, audited) — see ../vendor/noble-ciphers/aes.js's header comment for why it's
 //   vendored as plain files rather than an esbuild bundle.
@@ -13,39 +12,11 @@ import { cbc as aesCbc, ctr as aesCtr, ecb as aesEcb, cfb as aesCfb, gcm as aesG
 import { chacha20 } from '../vendor/noble-ciphers/chacha.js'
 import { salsa20 } from '../vendor/noble-ciphers/salsa.js'
 import { WordArray, CipherParams, ModeCBC, ModeCTR, ModeECB, ModeCFB, ModeOFB, PadPkcs7, PadNoPadding, DES, TripleDES, RC4 } from '../vendor/crypto-js.module.js'
+import { bytesFromWordArray, parseHexBytes } from '../format.js'
 
-function bytesFromWordArray(wordArray) {
-    const { words, sigBytes } = wordArray
-    const bytes = new Uint8Array(sigBytes)
-    for (let i = 0; i < sigBytes; i++) {
-        bytes[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff
-    }
-    return bytes
-}
-
-// Key/IV/nonce/AAD fields are plain hex-digit-pair strings — byte strings, not single integer
-// constants, so the Basic category's hex-decode convention fits better than checksum.js's
-// 0x-or-decimal one for poly/init/xorout. An optional leading "0x"/"0X" is stripped and ignored
-// if present (consistent with checksum.js's parseUintField also treating it as optional), but
-// unlike that helper there's no decimal fallback to worry about here — these fields are always
-// hex, so a bare "c10fd7ae" with no prefix at all is accepted directly too. `validLengths` (array
-// of acceptable byte counts), when given, is enforced here; when omitted, the underlying library
-// (noble-ciphers) does its own length validation with an equally clear error message, so there's
-// no need to duplicate it for AES/Salsa20/ChaCha20 — only the crypto-js-backed ciphers
-// (DES/TripleDES), which are far less strict internally, need it enforced here.
-function parseHexBytes(text, label, validLengths) {
-    let cleaned = String(text ?? '').replace(/\s+/g, '')
-    if (/^0[xX]/.test(cleaned)) cleaned = cleaned.slice(2)
-    if (cleaned.length === 0) throw new Error(`${label} must not be empty`)
-    if (cleaned.length % 2 !== 0) throw new Error(`${label}: odd number of hex digits`)
-    if (!/^[0-9a-fA-F]*$/.test(cleaned)) throw new Error(`${label}: invalid hex digit`)
-    const bytes = new Uint8Array(cleaned.length / 2)
-    for (let i = 0; i < cleaned.length; i += 2) bytes[i / 2] = parseInt(cleaned.slice(i, i + 2), 16)
-    if (validLengths && !validLengths.includes(bytes.length)) {
-        throw new Error(`${label} must be ${validLengths.join(' or ')} bytes, got ${bytes.length}`)
-    }
-    return bytes
-}
+// `validLengths` is only passed for the crypto-js-backed ciphers (DES/TripleDES) below —
+// noble-ciphers validates AES/Salsa20/ChaCha20 key/IV lengths itself with an equally clear
+// error, so there's no need to duplicate it here.
 
 // AAD is the one optional hex field in this module (empty = no additional authenticated data,
 // the overwhelmingly common case) — parseHexBytes() alone would reject empty input.
@@ -80,8 +51,7 @@ const PADDING_OPTIONS = [
 ]
 
 // row/rowLabel/inHeader/wide/showIf are the generic param-model hooks built for checksum.js's
-// CRC variant/Custom design — reused here unchanged; no TransformPanel.js changes were needed
-// for this module at all.
+// CRC variant/Custom design, reused here unchanged.
 const AES_PARAMS = [
     { key: 'mode', label: 'Mode', type: 'select', default: 'cbc', inHeader: true, options: MODE_OPTIONS_AES },
     { key: 'key', label: 'Hex bytes', type: 'text', default: '', wide: true, row: 'key', rowLabel: 'Key' },
@@ -113,15 +83,12 @@ const KEY_NONCE_PARAMS = [
     { key: 'nonce', label: 'Hex bytes', type: 'text', default: '', wide: true, row: 'nonce', rowLabel: 'Nonce' },
 ]
 
-// @noble/ciphers has no OFB export at all (only ctr/ecb/cbc/cfb/gcm/... — confirmed by grepping
-// its source, not assumed) — hand-rolled here as the standard NIST SP 800-38A construction
-// (keystream_0 = E(IV), keystream_i = E(keystream_{i-1}), ciphertext = plaintext XOR keystream),
-// built entirely on noble's own already-audited ECB block encryption (`disablePadding: true`
-// processes one exact 16-byte block at a time with no padding invention of our own) — no
-// cryptographic design here, just orchestrating a trusted primitive in a well-known way, same
-// spirit as the hand-rolled CRC/XOR ops. Self-inverse like CTR (the keystream depends only on
-// key+IV, never on plaintext/ciphertext), so one function serves both directions. Cross-checked
-// against Node's `aes-*-ofb` in encryption.test.js.
+// @noble/ciphers has no OFB export (only ctr/ecb/cbc/cfb/gcm/...) — hand-rolled here as the
+// standard NIST SP 800-38A construction (keystream_0 = E(IV), keystream_i = E(keystream_{i-1}),
+// ciphertext = plaintext XOR keystream), built on noble's own ECB block encryption
+// (`disablePadding: true` processes one exact 16-byte block at a time). Self-inverse like CTR
+// (the keystream depends only on key+IV, never on plaintext/ciphertext), so one function serves
+// both directions.
 function aesOfbTransform(bytes, key, iv) {
     const blockSize = 16
     const numBlocks = Math.ceil(bytes.length / blockSize)

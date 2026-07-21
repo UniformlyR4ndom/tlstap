@@ -5,11 +5,9 @@
 // (same poly, different init) or CRC-32 vs. CRC-32/BZIP2 (same poly/init, different
 // refin/refout/xorout). Hand-rolled rather than vendored (unlike e.g. Whirlpool in hash.js):
 // the algorithm is a short, unambiguous bit-shift-and-XOR loop, not something meaningfully
-// error-prone enough to justify a dependency. All preset check-values below (crcCompute over
-// the ASCII bytes "123456789", the standard CRC catalogue "check" input) were cross-validated
-// against Python's zlib.crc32 (for CRC-32) and an independent generic reference implementation
-// (for every other variant) before use; see checksum.test.js.
+// error-prone enough to justify a dependency.
 // Adler-32 (RFC 1950) is unrelated to the CRC model and hand-rolled separately below.
+import { fmtUintHex, parseUintField } from '../format.js'
 
 function reflect(value, bits) {
     let result = 0
@@ -68,33 +66,6 @@ const CRC32_PRESETS = [
     { value: 'mpeg2',  label: 'MPEG-2',  poly: 0x04C11DB7, init: 0xFFFFFFFF, refin: false, refout: false, xorout: 0x00000000 },
 ]
 
-function byValue(presets) {
-    return Object.fromEntries(presets.map(p => [p.value, p]))
-}
-
-function hexField(n, width) {
-    return '0x' + ((n >>> 0).toString(16).toUpperCase().padStart(width / 4, '0'))
-}
-
-// Accepts "0x"/"0X"-prefixed hex, plain decimal, or bare hex with no prefix at all (e.g.
-// "c10fd7ae") — a pure-digit string (no a-f letters) is still read as decimal, same convention as
-// ExtractPanel.js's parseOffset, so "1021" stays decimal 1021 rather than silently becoming
-// 0x1021 and changing what already-typed values mean; a string that can't be decimal (contains
-// a-f) is unambiguous and accepted as hex directly, matching how encryption.js's parseHexBytes
-// treats its own hex fields (also 0x-prefix-optional) for consistency across every hex input
-// field in the Transform panel.
-function parseUintField(text, label, width) {
-    const s = String(text).trim()
-    let value
-    if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = parseInt(s, 16)
-    else if (/^[0-9]+$/.test(s)) value = parseInt(s, 10)
-    else if (/^[0-9a-fA-F]+$/.test(s)) value = parseInt(s, 16)
-    else throw new Error(`invalid ${label}: "${text}"`)
-    const max = width === 32 ? 0xFFFFFFFF : (1 << width) - 1
-    if (value > max) throw new Error(`${label} out of range for a ${width}-bit CRC: "${text}"`)
-    return value >>> 0
-}
-
 // Resolves a step's params down to the five crcCompute() fields: either a named preset's fixed
 // values, or the Custom variant's own poly/init/refin/refout/xorout fields (parsed/validated).
 function resolveCrcParams(params, presetsByValue, width) {
@@ -118,37 +89,32 @@ function resolveCrcParams(params, presetsByValue, width) {
 // starts from a sensible seed rather than blank. Both keep the same key names so resolveCrcParams
 // can read them uniformly regardless of how they got there.
 function makeCrcParams(width, presets) {
-    const lookup = byValue(presets)
+    const lookup = Object.fromEntries(presets.map(p => [p.value, p]))
     const defaultPreset = presets[0]
     return [
         {
-            // inHeader: rendered next to the step's title instead of in the body param area
-            // below it (TransformPanel.js) — the variant choice reads like a subtitle for the
-            // whole step, not "just another param", so it gets top billing.
+            // inHeader: rendered next to the step's title instead of the body param area below it.
             key: 'variant', label: 'Variant', type: 'select', default: defaultPreset.value, inHeader: true,
             options: [...presets.map(p => ({ value: p.value, label: p.label })), { value: 'custom', label: 'Custom' }],
             onSet: (value) => {
                 const preset = lookup[value]
                 if (!preset) return {}
                 return {
-                    poly: hexField(preset.poly, width),
-                    init: hexField(preset.init, width),
+                    poly: fmtUintHex(preset.poly, width),
+                    init: fmtUintHex(preset.init, width),
                     refin: preset.refin,
                     refout: preset.refout,
-                    xorout: hexField(preset.xorout, width),
+                    xorout: fmtUintHex(preset.xorout, width),
                 }
             },
         },
-        // row/rowLabel (TransformPanel.js): params sharing a `row` key render together on one
-        // labeled line — "XOR in" pairs the init value with its reflect toggle, "XOR out" pairs
-        // xorout with its reflect toggle, matching how these five fields are conventionally
-        // grouped when describing a CRC variant (initial register value == what gets XORed in
-        // at the start; final XOR value paired with whether the output is bit-reversed first).
-        { key: 'poly', label: 'Hex value', type: 'text', default: hexField(defaultPreset.poly, width), wide: true,
+        // row/rowLabel: params sharing a `row` key render on one labeled line — "XOR in" pairs
+        // init with its reflect toggle, "XOR out" pairs xorout with its reflect toggle.
+        { key: 'poly', label: 'Hex value', type: 'text', default: fmtUintHex(defaultPreset.poly, width), wide: true,
           row: 'poly', rowLabel: 'Polynomial', showIf: params => params.variant === 'custom' },
-        { key: 'init', label: 'Hex value', type: 'text', default: hexField(defaultPreset.init, width), wide: true,
+        { key: 'init', label: 'Hex value', type: 'text', default: fmtUintHex(defaultPreset.init, width), wide: true,
           row: 'xorin', rowLabel: 'XOR in', showIf: params => params.variant === 'custom' },
-        { key: 'xorout', label: 'Hex value', type: 'text', default: hexField(defaultPreset.xorout, width), wide: true,
+        { key: 'xorout', label: 'Hex value', type: 'text', default: fmtUintHex(defaultPreset.xorout, width), wide: true,
           row: 'xorout', rowLabel: 'XOR out', showIf: params => params.variant === 'custom' },
         { key: 'refin', label: 'Reflect in', type: 'boolean', default: defaultPreset.refin,
           row: 'xorin', showIf: params => params.variant === 'custom' },
@@ -157,8 +123,8 @@ function makeCrcParams(width, presets) {
     ]
 }
 
-const CRC16_BY_VALUE = byValue(CRC16_PRESETS)
-const CRC32_BY_VALUE = byValue(CRC32_PRESETS)
+const CRC16_BY_VALUE = Object.fromEntries(CRC16_PRESETS.map(p => [p.value, p]))
+const CRC32_BY_VALUE = Object.fromEntries(CRC32_PRESETS.map(p => [p.value, p]))
 
 function crc16Run(bytes, params) {
     const resolved = resolveCrcParams(params, CRC16_BY_VALUE, 16)

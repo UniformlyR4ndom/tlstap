@@ -1,12 +1,6 @@
-import { fmtAsBase64 } from '../format.js'
+import { fmtAsBase64, fmtAsRaw, parseRaw, parseIntInRange } from '../format.js'
 
 const BASEN_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
-function validateBase(base) {
-    const b = Math.round(Number(base))
-    if (!Number.isFinite(b) || b < 2 || b > 64) throw new Error('base must be between 2 and 64')
-    return b
-}
 
 // 'prefix' is per-byte (applied before each hex pair, e.g. "0x48 0x65"); 'separator' is the
 // literal string joined between bytes (may be empty for no separator at all). The two are
@@ -25,11 +19,11 @@ function hexEncode(bytes, params) {
     const prefix = params.prefix || ''
     const separator = params.separator ?? ''
     const hexBytes = Array.from(bytes, b => prefix + b.toString(16).padStart(2, '0'))
-    return new TextEncoder().encode(hexBytes.join(separator))
+    return parseRaw(hexBytes.join(separator))
 }
 
 function hexDecode(bytes, params) {
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    const text = fmtAsRaw(bytes)
     const prefix = params.prefix || ''
     const separator = params.separator ?? ''
     let stripped = text
@@ -46,11 +40,11 @@ function hexDecode(bytes, params) {
 function base64Encode(bytes, params) {
     let text = fmtAsBase64(bytes)
     if (params.urlSafe) text = text.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    return new TextEncoder().encode(text)
+    return parseRaw(text)
 }
 
 function base64Decode(bytes, params) {
-    let text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim()
+    let text = fmtAsRaw(bytes).trim()
     if (params.urlSafe) {
         text = text.replace(/-/g, '+').replace(/_/g, '/')
         const pad = text.length % 4
@@ -67,11 +61,11 @@ function base64Decode(bytes, params) {
 }
 
 function octalEncode(bytes) {
-    return new TextEncoder().encode(Array.from(bytes, b => b.toString(8).padStart(3, '0')).join(' '))
+    return parseRaw(Array.from(bytes, b => b.toString(8).padStart(3, '0')).join(' '))
 }
 
 function octalDecode(bytes) {
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    const text = fmtAsRaw(bytes)
     const tokens = text.trim().split(/\s+/).filter(t => t.length > 0)
     const out = new Uint8Array(tokens.length)
     for (let i = 0; i < tokens.length; i++) {
@@ -87,7 +81,7 @@ function octalDecode(bytes) {
 // Arbitrary-base encoding of the byte buffer as one big integer, base 2-64. Leading zero
 // bytes are preserved as leading zero-symbol characters (same convention as Base58).
 function baseNEncode(bytes, params) {
-    const base = validateBase(params.base)
+    const base = parseIntInRange(params.base, 2, 64, 'base')
     if (bytes.length === 0) return new Uint8Array(0)
     const alphabet = BASEN_ALPHABET.slice(0, base)
     let leadingZeros = 0
@@ -101,12 +95,12 @@ function baseNEncode(bytes, params) {
     }
     digits.reverse()
     const encoded = alphabet[0].repeat(leadingZeros) + digits.map(d => alphabet[d]).join('')
-    return new TextEncoder().encode(encoded)
+    return parseRaw(encoded)
 }
 
 function baseNDecode(bytes, params) {
-    const base = validateBase(params.base)
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim()
+    const base = parseIntInRange(params.base, 2, 64, 'base')
+    const text = fmtAsRaw(bytes).trim()
     if (text.length === 0) return new Uint8Array(0)
     const alphabet = BASEN_ALPHABET.slice(0, base)
     let leadingZeros = 0

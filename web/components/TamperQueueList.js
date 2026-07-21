@@ -9,12 +9,10 @@ function isSelected(selectedKey, entry) {
 
 // The main panel of the Tamper tab: one row per (stream, direction) that currently has
 // something held, summarized as chunk count + byte length — not one row per chunk, since
-// the new protocol has no more per-chunk ids (a direction's held bytes are one growing,
-// editable buffer; see intercept/tamper/buffer.go). Selecting a row is the entry point
-// into TamperDetailPanel. No relative "held Xs ago" time here — unlike the old per-chunk
-// protocol, stream-list's pendingInfo deliberately carries no timestamp for a buffer as a
-// whole (see protocol.go), and it wasn't judged worth new client-side time-tracking just
-// to keep a cosmetic display.
+// a direction's held bytes are one growing, editable buffer (see intercept/tamper/buffer.go),
+// with no per-chunk ids. Selecting a row is the entry point into TamperDetailPanel. No
+// relative "held Xs ago" time here — stream-list's pendingInfo carries no timestamp for a
+// buffer as a whole (see protocol.go).
 export default function TamperQueueList({ queue, selectedKey, onSelect, pausedEntries }) {
     return html`
         <div class="panel tamper-queue-panel">

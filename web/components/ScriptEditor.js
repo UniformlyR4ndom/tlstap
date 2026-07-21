@@ -44,25 +44,16 @@ const highlightStyle = HighlightStyle.define([
 // cursor/undo-history state internally; this wrapper reports every edit upward via
 // onChange, but only ever pushes `value` INTO CodeMirror when `loadVersion` changes — the
 // caller must bump it on every genuinely external reset (initial load, script switch,
-// Reload), and only then. It deliberately does NOT infer "was this value change external,
-// or just our own edit echoing back down through the parent's state?" from comparing
-// strings (what this used to do, first against a live `view.state.doc.toString()` read,
-// then against a `lastEmittedRef` of our last-reported text) — both are "always current"
-// references updated synchronously the instant a keystroke lands, compared against a
-// `value` snapshot from whichever render this effect instance happens to close over,
-// which can be arbitrarily stale: CodeMirror processes every keystroke immediately,
-// independent of Preact's own (deferred) effect scheduling, so several real keystrokes can
-// land before an earlier render's effect finally runs. When it does, it sees `value` (its
-// own stale snapshot) differ from the live/ref reference (which has since moved on) and
-// dispatches a destructive full-document replace using the stale text — rolling back real
-// keystrokes. That rollback is itself a docChange, which fires onChange again, which can
-// race the NEXT pending effect the same way; reproduced firsthand as an actual
-// content-duplicating, CPU-pegging freeze during ordinary typing (no highlighting, no
-// large paste required — just enough keystrokes landing before Preact's effect flush
-// catches up). No string-equality heuristic closes this race, since the staleness is about
-// *when* the effect runs relative to real keystrokes, not what it's compared against.
-// Gating the sync entirely on an explicit `loadVersion` signal sidesteps it structurally:
-// the sync effect literally never runs during typing, regardless of any reordering.
+// Reload), and only then.
+//
+// A string-equality check ("does `value` differ from CodeMirror's current doc?") can't
+// substitute for `loadVersion`: CodeMirror applies keystrokes synchronously, independent of
+// Preact's deferred effect scheduling, so an effect can run after several more keystrokes
+// have landed than the `value` it closed over accounts for. It then sees a stale mismatch
+// and dispatches a destructive full-document replace, rolling back real typing — and since
+// that rollback is itself a docChange, it can trigger the same race again. Gating the sync
+// entirely on an explicit `loadVersion` signal sidesteps this structurally: the sync effect
+// never runs during typing at all, regardless of scheduling order.
 export default function ScriptEditor({ value, onChange, loadVersion, readOnly = false }) {
     const containerRef = useRef(null)
     const viewRef = useRef(null)

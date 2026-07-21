@@ -180,10 +180,9 @@ export default function TamperView() {
     }, [])
 
     // One entry per (conn, direction) that currently has something held — a summary
-    // (chunks/length), not individually-addressable chunks, since the new protocol has
-    // no more per-chunk ids. Sorted by conn/direction for a stable order (the old
-    // oldest-first sort relied on a per-chunk "time" that stream-list's pendingInfo
-    // deliberately no longer carries — see TamperQueueList.js).
+    // (chunks/length), not individually-addressable chunks, since there are no per-chunk
+    // ids. Sorted by conn/direction for a stable order — stream-list's pendingInfo carries
+    // no per-buffer timestamp to sort by (see TamperQueueList.js).
     const queue = useMemo(() => {
         const flat = streams.flatMap(s => s.pending.map(p => ({ ...p, conn: s.conn, src: s.src, dst: s.dst })))
         flat.sort((a, b) => a.conn - b.conn || a.direction - b.direction)
