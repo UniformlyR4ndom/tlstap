@@ -14,34 +14,22 @@ function wsUrl(path) {
 // close() }, each command returning a Promise.
 //
 // release's opts: { action: 'forward'|'drop', releaseChunks, edited, prefixLength,
-// bounds } — mirrors the server's combined edit+release command directly (see
-// intercept/tamper/protocol.go's inboundMsg doc comment). editedBytes is required iff
-// opts.edited is true.
+// bounds } — mirrors the server's combined edit+release command directly. editedBytes
+// is required iff opts.edited is true.
 //
 // Replies are matched by their "type", not by "the next message in": the server can
 // interleave a push event (held/stream-created/stream-terminated) with the ok/error/
-// stream-list reply to whatever command was just sent, since pushes originate from a
-// different goroutine than command replies (see intercept/tamper/api.go). "ok"/"error"
-// resolve or reject the in-flight command; "stream-list" both updates onStreamList and
-// resolves it, since every stream-list is inherently a reply to list-streams — the
-// server never pushes it unsolicited.
+// stream-list reply to whatever command was just sent. "ok"/"error" resolve or reject
+// the in-flight command; "stream-list" both updates onStreamList and resolves it, since
+// every stream-list is inherently a reply to list-streams — the server never pushes it
+// unsolicited.
 //
 // Only one command is ever in flight to the server at a time — sendCommand below queues
-// the rest rather than clobbering an outstanding one (a real bug this replaced: a naive
-// "one pending slot" implementation lets a second call silently overwrite the first
-// call's {resolve,reject} before its reply arrives, abandoning that promise forever).
-// list-streams is the one call site (TamperView.js's resync(), invoked from every push
-// event — in particular onHeld, which fires once per physical chunk a connection
-// receives) that isn't naturally rate-limited by real outstanding decisions, so it's
-// coalesced: at most one list-streams in flight plus at most one more already queued
-// behind it, with every extra resync() call in between just attaching its
-// resolve/reject to that single queued entry instead of enqueueing a new one. Every
-// other command (release/dropConnection/setMode/setAutoIntercept) corresponds to a
-// distinct, non-redundant decision — those are never merged, and the FIFO for them is
-// bounded by how many such decisions are genuinely outstanding across all connections
-// (further capped, for release, by scriptRuntime.js's own per-connection
-// serialization — at most one ctx.release() in flight per connection at a time), not by
-// per-chunk arrival frequency.
+// the rest rather than clobbering an outstanding one. list-streams is coalesced (at most
+// one in flight plus one queued, with extra calls attaching to the queued one) since it
+// can be issued redundantly at high frequency, unlike every other command
+// (release/dropConnection/setMode/setAutoIntercept), each of which corresponds to a
+// distinct, non-redundant decision and is never merged.
 export function openTamperControl(handlers = {}) {
     const ws = new WebSocket(wsUrl(`${BASE}/control`))
     let pending = null   // { type, waiters: [{resolve,reject}, ...] } — the in-flight command
@@ -52,10 +40,8 @@ export function openTamperControl(handlers = {}) {
     }
 
     // Sends the next queued command, if the connection is idle and something's waiting.
-    // The binary followup (release's edited-bytes frame) is sent in the same tick,
-    // immediately after its JSON command, regardless of how long that command sat
-    // queued — the wire protocol requires them adjacent, and queueing delay must never
-    // let some other command's frame land in between.
+    // A binary followup (release's edited-bytes frame) is sent immediately after its
+    // JSON command, in the same tick — the wire protocol requires them adjacent.
     function pump() {
         if (pending || queue.length === 0) return
         const next = queue.shift()
@@ -145,12 +131,11 @@ export function openTamperControl(handlers = {}) {
         dropConnection(conn, direction) {
             return sendCommand({ type: 'drop-connection', conn, direction })
         },
-        // Fire-and-forget: the server never replies on success (see
-        // intercept/tamper/protocol.go's cmdScriptLog), so this deliberately bypasses
-        // sendCommand's one-in-flight pending-promise tracking rather than leaving a
-        // promise that would never resolve. Silently dropped if the socket isn't open
-        // (e.g. a log line racing connection teardown) — script logging is best-effort,
-        // same as the browser's own in-memory log panel.
+        // Fire-and-forget: the server never replies on success, so this deliberately
+        // bypasses sendCommand's one-in-flight pending-promise tracking rather than
+        // leaving a promise that would never resolve. Silently dropped if the socket
+        // isn't open (e.g. a log line racing connection teardown) — script logging
+        // here is best-effort.
         scriptLog(level, text) {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'script-log', level, text }))
@@ -161,25 +146,22 @@ export function openTamperControl(handlers = {}) {
 }
 
 // Reads one direction's currently-held buffer via a short-lived /watch connection: open,
-// send "peek", collect the reply, close. Unlike the old per-chunk-id "peek", the server
-// always replies with exactly one "pending" + binary pair (or a single "error" for an
-// invalid direction) — a direction with nothing held is a normal zero-length reply, not
-// an error. offset/length optionally slice the buffer; omit both for the whole thing.
+// send "peek", collect the reply, close. The server always replies with exactly one
+// "pending" + binary pair (or a single "error" for an invalid direction) — a direction
+// with nothing held is a normal zero-length reply, not an error. offset/length
+// optionally slice the buffer; omit both for the whole thing.
 //
-// This connection is also registered server-side as a live-mirror watcher for as long as
-// it's open (intercept/tamper/api.go's handleWatch) — mirroring fires on receipt of every
-// chunk, regardless of hold/intercept state, so a chunk arriving on this stream while our
-// own peek reply is still in flight interleaves its own unsolicited header+binary pair
-// with ours on the very same socket. A mirror-frame header has no "type" field (unlike
-// "pending"/"peek-done"/"error"), so text messages are already distinguishable — but
-// since the server's writeJSON/writeBinary each independently acquire its per-connection
-// writeMu (see watcher.writeJSON/writeBinary), not as one atomic pair, another goroutine's
-// write can land between a header and its own binary payload; a single "last header seen"
-// flag isn't enough if two unrelated pairs' headers both arrive before either's binary.
-// awaiting is a FIFO of headers in arrival order (our own "pending" metadata, or null for
-// a mirror frame) — every binary frame that arrives pairs with whichever header is at the
-// front of that queue, which is always correct regardless of how many pairs interleave,
-// since binaries arrive in the same relative order their own headers did.
+// This connection is also registered server-side as a live-mirror watcher for as long
+// as it's open — mirroring fires on receipt of every chunk regardless of hold/intercept
+// state, so a chunk arriving here while our own peek reply is still in flight
+// interleaves its own unsolicited header+binary pair with ours on the same socket. A
+// mirror-frame header has no "type" field, so text messages are already distinguishable,
+// but header and binary writes aren't atomic server-side, so another write can land
+// between a header and its own binary payload — a single "last header seen" flag isn't
+// enough if two pairs' headers both arrive before either's binary. `awaiting` is a FIFO
+// of headers in arrival order (our own "pending" metadata, or null for a mirror frame);
+// each binary frame pairs with whichever header is at the front, which is always correct
+// since binaries arrive in the same relative order as their headers.
 export function peekBuffer(conn, direction, offset, length) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl(`${BASE}/watch?conn=${conn}`))
@@ -225,15 +207,15 @@ export function peekBuffer(conn, direction, offset, length) {
     })
 }
 
-// Reports whether a script log file is configured server-side (see the tamper
+// Reports whether a script log file is configured server-side (the tamper
 // interceptor's "log-file" config arg), and its display filename — static for the
-// server's whole run, so a plain one-shot GET is enough (no push event to track).
+// server's whole run, so a one-shot GET needs no push event to track.
 export async function getLogFileInfo() {
     const res = await checkOk(await fetch(`${BASE}/log-file`))
     return res.json()
 }
 
-// ── Script storage REST API (see intercept/tamper/scripts.go) ─────────────────────
+// ── Script storage REST API ────────────────────────────────────────────────────────
 // Content is a raw body (always UTF-8 JS text), not JSON/base64-wrapped.
 
 async function checkOk(res) {
@@ -270,11 +252,11 @@ export async function deleteScript(name) {
     await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
 }
 
-// ── Filesystem REST API (see intercept/tamper/fs.go) ───────────────────────────────
+// ── Filesystem REST API ─────────────────────────────────────────────────────────────
 // Content is a raw body (arbitrary binary), not JSON/base64-wrapped. path is always
 // slash-separated, even for a nested subdirectory — segments are percent-encoded
-// individually (not the path as a whole) so slashes survive as separators, matching the
-// server's {path...} wildcard route.
+// individually (not the path as a whole) so slashes survive as separators, matching how
+// the server parses the path.
 
 function encodeFsPath(path) {
     return path.split('/').filter(s => s !== '').map(encodeURIComponent).join('/')
@@ -299,9 +281,8 @@ export async function writeFs(path, bytes) {
     }))
 }
 
-// POST, not PUT: appending isn't idempotent (repeat = appended twice), unlike write/PUT
-// above — see intercept/tamper/fs.go's handleFsAppend doc comment. Creates the file
-// (and missing parent directories) if it doesn't exist yet, same as writeFs.
+// POST, not PUT: appending isn't idempotent (repeat = appended twice), unlike PUT
+// above. Creates the file (and missing parent directories) if it doesn't exist yet.
 export async function appendFs(path, bytes) {
     await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`, {
         method: 'POST',

@@ -1,10 +1,11 @@
 import { h } from 'preact'
-import { useState, useEffect, useMemo, useRef } from 'preact/hooks'
+import { useState, useMemo, useRef } from 'preact/hooks'
 import htm from 'htm'
 import ResizeHandle from './ResizeHandle.js'
 import HexEditor from './HexEditor.js'
 import { clamp } from '../layout.js'
 import { useResizableLayout } from '../useResizableLayout.js'
+import { useDismissOnOutsideClick } from '../useDismissOnOutsideClick.js'
 import { OPERATIONS, ALGORITHM_SECTIONS, sectionPrefix } from '../transforms.js'
 import { fmtAsHex, fmtAsRaw, parseRaw } from '../format.js'
 
@@ -217,19 +218,7 @@ export default function TransformPanel() {
     )
 
     // Dismiss the algorithm menu on outside click or Escape.
-    useEffect(() => {
-        if (!menuOpen) return
-        const close = e => {
-            if (toolbarRef.current && !toolbarRef.current.contains(e.target)) setMenuOpen(false)
-        }
-        const onKey = e => { if (e.key === 'Escape') setMenuOpen(false) }
-        document.addEventListener('mousedown', close)
-        document.addEventListener('keydown', onKey)
-        return () => {
-            document.removeEventListener('mousedown', close)
-            document.removeEventListener('keydown', onKey)
-        }
-    }, [menuOpen])
+    useDismissOnOutsideClick(toolbarRef, () => setMenuOpen(false), menuOpen)
 
     // `prefix` (from sectionPrefix(), based on the enclosing section/subsection name) is
     // applied only to the step's stored label, not to what's shown here in the menu itself —

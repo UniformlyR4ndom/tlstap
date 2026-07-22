@@ -6,6 +6,7 @@ import { peekBuffer } from '../tamperApi.js'
 import { mergeUint8Arrays, parseHexdump, parseRaw } from '../format.js'
 import { OPERATIONS } from '../transforms.js'
 import { dirClass, dirLabel } from '../direction.js'
+import { useDismissOnOutsideClick } from '../useDismissOnOutsideClick.js'
 
 const html = htm.bind(h)
 
@@ -40,16 +41,7 @@ function InsertChunkPopover({ x, y, onInsert, onCancel }) {
     const popRef = useRef(null)
     const fileInputRef = useRef(null)
 
-    useEffect(() => {
-        const close = e => { if (!popRef.current || !popRef.current.contains(e.target)) onCancel() }
-        const onKey = e => { if (e.key === 'Escape') onCancel() }
-        document.addEventListener('mousedown', close)
-        document.addEventListener('keydown', onKey)
-        return () => {
-            document.removeEventListener('mousedown', close)
-            document.removeEventListener('keydown', onKey)
-        }
-    }, [])
+    useDismissOnOutsideClick(popRef, onCancel)
 
     function addEmpty() {
         onInsert(new Uint8Array(0))
@@ -234,28 +226,10 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
     const menuRef = useRef(null)
     const selKeyRef = useRef(null)
 
-    // Dismiss context menu on outside click or Escape. Deliberately *not* HexDump.js's exact
-    // pattern (a bare document "mousedown" -> close): mousedown fires before click, so an
-    // unconditional close there would unmount the menu before a click on one of its own
-    // items ever reaches it — invisible as long as every item's only effect was closing the
-    // menu anyway (indistinguishable from the listener doing it), but a real bug once an
-    // item does something else, caught here by Split silently not firing. Only treat a
-    // mousedown as "outside" if it didn't land inside the menu itself; each item's own
-    // onClick is what closes the menu after (optionally) doing its real work.
-    useEffect(() => {
-        if (!ctxMenu) return
-        const close = e => {
-            if (menuRef.current && menuRef.current.contains(e.target)) return
-            setCtxMenu(null)
-        }
-        const onKey = e => { if (e.key === 'Escape') setCtxMenu(null) }
-        document.addEventListener('mousedown', close)
-        document.addEventListener('keydown', onKey)
-        return () => {
-            document.removeEventListener('mousedown', close)
-            document.removeEventListener('keydown', onKey)
-        }
-    }, [!!ctxMenu])
+    // Dismiss context menu on outside click or Escape. Must use the ref-contains check (not
+    // HexDump.js's stopPropagation mechanism): mousedown fires before click, so an
+    // unconditional close would unmount the menu before an item's onClick ever fires.
+    useDismissOnOutsideClick(menuRef, () => setCtxMenu(null), !!ctxMenu)
 
     function openChunkMenu(chunkIndex, info) {
         const target = chunksForView(viewMode, chunks)

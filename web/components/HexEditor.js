@@ -159,13 +159,10 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction,
     // An empty buffer has no rows at all from the loop above, but still needs one to hold the
     // insertion cursor. A non-empty buffer never needs an extra row for this: whenever the
     // last row isn't completely full, it already renders its own trailing insertion cell (see
-    // HexEditorRow below); when the last row IS exactly full (an exact multiple of ROW_BYTES),
-    // deliberately don't add a further row just to hold the cursor — that would be an empty
-    // hexdump line with no bytes on it.
+    // HexEditorRow below); when the last row is exactly full (an exact multiple of ROW_BYTES),
+    // deliberately don't add a further row.
     if (bytes.length === 0) rows.push(0)
 
-    // Direction is optional (e.g. TransformPanel has no notion of c2s/s2c); only the Tamper
-    // detail panel passes it, to get the same green/blue direction tint HexDump.js uses.
     const dirClass = direction === DIRNUM_C2S ? 'c2s' : direction === DIRNUM_S2C ? 's2c' : ''
 
     return html`
@@ -206,12 +203,11 @@ function HexEditorRow({ rowOffset, bytes, cursor, pendingNibble, bufferLength, d
     if (rowOffset + bytes.length === bufferLength && bytes.length < ROW_BYTES) {
         hexCells.push(renderHexCell(bufferLength, null, cursor, pendingNibble))
     }
-    // Pad short rows (only possible on the last row) out to a fixed cell count, so the ASCII
-    // column stays aligned across rows instead of creeping left when the hex column shrinks.
+    // Pad short rows on the last row if needed.
     while (hexCells.length < ROW_BYTES) {
         hexCells.push(renderFillerCell(hexCells.length))
     }
-    // Group separator between the two 8-byte halves, matching HexDump.js's hex column.
+    // Group separator between the two 8-byte halves.
     hexCells.splice(8, 0, html`<span key="gap" class="hexed-gap"></span>`)
 
     const asciiCells = []
@@ -238,8 +234,6 @@ function renderHexCell(index, byte, cursor, pendingNibble) {
     return html`<span key=${index} data-index=${index} data-area="hex" class=${cls}> ${display}</span>`
 }
 
-// Purely cosmetic width-matching for padded-out rows — deliberately has no data-index/data-area
-// so it's inert (not clickable, never matches the cursor), unlike a real/insertion-point cell.
 function renderFillerCell(key) {
     return html`<span key=${'fill-' + key} class="hexed-byte">   </span>`
 }

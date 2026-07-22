@@ -67,11 +67,11 @@ tapctl tamper log-file [--api URL]
   separate `tapctl` invocations. The one workflow that actually works end-to-end from
   `tapctl` alone is: hold via `hold-until-connected` (so nothing needs an active
   control connection to begin with), `peek` freely to inspect, then a single combined
-  edit+`release` call. See the root `CLAUDE.md`'s "Held-buffer lifecycle" section,
-  "Possible future option" note, for what would actually lift this limitation.
+  edit+`release` call. See `intercept/tamper/CLAUDE.md`'s "Held-buffer lifecycle"
+  section, "Possible future option" note, for what would actually lift this limitation.
 - `script-log` pushes one already-formatted log line for optional server-side
-  persistence (the tamper interceptor's `log-file` config arg — see the root
-  `CLAUDE.md`'s "Log panel" note under "Scripted interception"). Unlike every other
+  persistence (the tamper interceptor's `log-file` config arg — see
+  `web/CLAUDE.md`'s "Log panel" note under "Scripted interception"). Unlike every other
   control command it never gets a reply on success — fire-and-forget by design (see
   `intercept/tamper/protocol.go`'s `cmdScriptLog`) — so `cmdTamperScriptLog` doesn't
   call `readAck` at all; it validates `--level` (`log` or `error`) client-side instead,
@@ -79,13 +79,13 @@ tapctl tamper log-file [--api URL]
 - `script-list`/`script-get`/`script-put`/`script-delete` — flat commands, not a nested
   `tapctl tamper script <action>` subgroup, consistent with every other tamper command
   being a single verb, and no dispatch-level restructuring needed to add them. They're
-  plain REST wrappers over `scripts.go`'s CRUD endpoints (see the root `CLAUDE.md`'s
+  plain REST wrappers over `scripts.go`'s CRUD endpoints (see `intercept/tamper/CLAUDE.md`'s
   "Script storage" section): `script-get` prints the raw script source (not
   JSON-wrapped) so it's directly pipeable; `script-put` reads from `--file PATH|-`,
   mirroring `release`'s `--edit` convention.
 - `fs-list`/`fs-get`/`fs-put`/`fs-append` — same flat-verb, plain-REST-wrapper shape as the
-  `script-*` commands, over `fs.go`'s endpoints (see the root `CLAUDE.md`'s "Filesystem
-  access" section). `--path` is slash-separated for subdirectories, percent-encoded
+  `script-*` commands, over `fs.go`'s endpoints (see `intercept/tamper/CLAUDE.md`'s
+  "Filesystem access" section). `--path` is slash-separated for subdirectories, percent-encoded
   per-segment (`encodeFsPath`, mirroring `web/tamperApi.js`'s helper of the same name)
   so literal slashes survive as separators rather than becoming `%2F`. `fs-list`'s
   `--path` defaults to `""` (list `fs-root` itself). `fs-get` prints raw file bytes to
@@ -102,7 +102,7 @@ tapctl tamper log-file [--api URL]
   non-idempotent-verb reasoning — everything else here is `GET`/`PUT`. It's a real
   server-side append (`fs.go`'s `Append`, opened with `O_APPEND`), safe under concurrent
   appends to the same file from elsewhere, not a client-side read-modify-write.
-- `log-file` — plain GET wrapper over `handleLogFileInfo` (see the root `CLAUDE.md`'s
+- `log-file` — plain GET wrapper over `handleLogFileInfo` (see `intercept/tamper/CLAUDE.md`'s
   note under "Script storage" REST endpoints): reports whether the interceptor was
   configured with `log-file` and, if so, its display filename. Static for the server's
   whole run, same as every other bare-GET dbdump command (`status`, `sessions`).

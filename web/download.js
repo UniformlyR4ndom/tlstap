@@ -9,11 +9,8 @@ export function downloadBlob(content, filename, mime) {
 }
 
 // Opens the File System Access API's save-file picker. Must be called while a user gesture
-// is still active (before any other await) — callers should still gate this on
-// `window.showSaveFilePicker` being truthy themselves rather than relying on this rejecting,
-// since that same feature check is also what decides whether to fall back to downloadBlob at
-// all. Resolves to null if the user dismisses the picker (AbortError) — a silent "nothing to
-// do", distinct from any other error, which rethrows so the caller can surface it.
+// is still active; caller must gate on `window.showSaveFilePicker` itself. Resolves to null
+// on user-cancel (AbortError); rethrows any other error.
 export async function acquireSaveHandle(suggestedName, mime, ext, description) {
     try {
         return await window.showSaveFilePicker({

@@ -26,17 +26,14 @@ export function fmtAsHexdump(bytes, baseOffset) {
         const hexParts = Array.from(slice, b => b.toString(16).padStart(2, '0'))
         const g1 = hexParts.slice(0, 8).join(' ').padEnd(23)
         const g2 = hexParts.slice(8).join(' ').padEnd(23)
-        const asc = Array.from(slice, b => b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.').join('')
+        const asc = fmtAsAscii(slice)
         lines.push(`${off}  ${g1}  ${g2}  |${asc}|`)
     }
     return lines.join('\n')
 }
 
-// Inverse of fmtAsHexdump: parses an xxd-style "OOOOOOOO  hh hh … hh  hh hh … hh  |ascii|"
-// dump back into bytes. Ignores the offset and |ascii| columns entirely (both are derived,
-// lossy for non-printable bytes in the ascii case) and only reads the hex byte tokens
-// between them; lenient about exact spacing so a manually-tweaked or partially-reflowed
-// dump still parses, as long as each line keeps the "offset  hexbytes  |ascii|" shape.
+// Inverse of fmtAsHexdump: reads only the hex byte tokens, ignoring the offset/ascii
+// columns (both derived). Tolerant of loose spacing between tokens.
 export function parseHexdump(text) {
     const bytes = []
     for (const rawLine of text.split('\n')) {
@@ -52,9 +49,8 @@ export function parseHexdump(text) {
     return new Uint8Array(bytes)
 }
 
-// Accepts an optional leading "0x"/"0X" prefix (stripped if present); the remainder must be a
-// plain, contiguous run of hex-digit pairs. `validLengths` (optional array of acceptable byte
-// counts) is enforced here for callers whose underlying library doesn't validate it itself.
+// Accepts an optional leading "0x"/"0X" prefix; the remainder must be a plain, contiguous
+// run of hex-digit pairs. `validLengths` (optional) enforces an exact byte count if given.
 export function parseHexBytes(text, label, validLengths) {
     let cleaned = String(text ?? '').replace(/\s+/g, '')
     if (/^0[xX]/.test(cleaned)) cleaned = cleaned.slice(2)
@@ -86,10 +82,9 @@ export function fmtUintHex(n, width) {
     return '0x' + ((n >>> 0).toString(16).toUpperCase().padStart(width / 4, '0'))
 }
 
-// Accepts "0x"/"0X"-prefixed hex, plain decimal, or bare hex with no prefix at all (e.g.
-// "c10fd7ae") — a pure-digit string (no a-f letters) is read as decimal so an already-typed
-// value like "1021" doesn't silently become 0x1021; a string containing a-f is unambiguous
-// and accepted as hex directly. Validates the parsed value fits in `width` bits.
+// Accepts "0x"-prefixed hex, plain decimal, or bare hex (e.g. "c10fd7ae"). A pure-digit
+// string is read as decimal (so "1021" doesn't silently become 0x1021); a string
+// containing a-f is read as hex. Validates the result fits in `width` bits.
 export function parseUintField(text, label, width) {
     const s = String(text).trim()
     let value
@@ -126,9 +121,8 @@ export function fmtByteSize(n) {
     return `${(n / 1048576).toFixed(1)} MB`
 }
 
-// Formats the duration between start and end (both ms epoch timestamps) as e.g. "12.34s".
-// end may be falsy for an ongoing/not-yet-finished span, in which case the duration is
-// measured against Date.now() and the result is suffixed with " (ongoing)".
+// Formats start→end (ms epoch) as e.g. "12.34s". If end is falsy, measures against
+// Date.now() and appends " (ongoing)".
 export function fmtDuration(start, end) {
     const d = (end || Date.now()) - start
     let s
@@ -136,4 +130,10 @@ export function fmtDuration(start, end) {
     else if (d < 60000) s = `${(d / 1000).toFixed(2)}s`
     else                s = `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
     return end ? s : `${s} (ongoing)`
+}
+
+// Formats a chunk timestamp relative to a stream/session start (both ms epoch), e.g. "+1.234s".
+export function fmtRelTime(ms, base) {
+    const d = ms - base
+    return `+${Math.floor(d / 1000)}.${String(d % 1000).padStart(3, '0')}s`
 }

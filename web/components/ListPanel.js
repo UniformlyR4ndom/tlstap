@@ -4,15 +4,13 @@ import htm from 'htm'
 
 const html = htm.bind(h)
 
-// Shared chrome for SessionList/StreamList: panel-header (title + count badge + sort-toggle)
-// and a sorted, selectable item list. Callers own fetching, per-row content (renderItem), and
-// what "empty" means; this owns only the sort-direction state and the header/list markup that
-// was otherwise duplicated verbatim between the two.
+// Shared panel-header (title + badge + sort-toggle) and sorted, selectable item list for
+// SessionList/StreamList. Callers own fetching, per-row content (renderItem), and the
+// empty-state message.
 export default function ListPanel({ title, items, error, emptyMessage, selected, onSelect, renderItem, resetSortKey }) {
     const [desc, setDesc] = useState(false)
 
-    // StreamList resets sort to ascending on session change; SessionList never passes
-    // resetSortKey, so this never fires there (matching its original never-reset behavior).
+    // resetSortKey resets sort to ascending when it changes; SessionList never passes it.
     useEffect(() => { setDesc(false) }, [resetSortKey])
 
     const sorted = desc ? [...items].reverse() : items

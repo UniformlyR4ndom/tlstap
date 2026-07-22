@@ -72,7 +72,8 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
         return () => document.removeEventListener('mouseup', up)
     }, [])
 
-    // Dismiss context menu on outside click or Escape.
+    // Dismiss context menu on outside click or Escape. Not useDismissOnOutsideClick: this menu
+    // has no ref to check containment against; relies on stopPropagation() below instead.
     useEffect(() => {
         if (!menu) return
         const close = () => setMenu(null)

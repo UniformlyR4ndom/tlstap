@@ -3,9 +3,9 @@
 Implementation notes for the `tamper` interceptor, loaded automatically when working
 under this directory. See the root `CLAUDE.md` for where `tamper` fits into the wider
 architecture (`ApiProvider`/REST API mechanics, `BufferingInterceptor` — "Buffering
-Interceptors" section — and the "Web Frontend" section's "Tamper tab"/"Scripted
-interception" subsections, which document the browser/script-facing side of everything
-below) and `test/tapctl/CLAUDE.md` for CLI usage against these endpoints.
+Interceptors" section) and `web/CLAUDE.md`'s "Tamper tab"/"Scripted interception"
+sections, which document the browser/script-facing side of everything below, and
+`test/tapctl/CLAUDE.md` for CLI usage against these endpoints.
 
 Lets a connected control client actively pause, inspect, edit, drop, or forward
 individual chunks of live traffic, or just live-watch it without holding anything up.
@@ -217,8 +217,8 @@ imperatively (not forced to return a verdict synchronously — a script can hold
 and decide later, same as the existing human flow) via the same `peek`/`release`
 primitives already documented above. The runtime itself (Worker bootstrap, RPC bridge,
 `self.tamper` framework API, and the "Scripts" sub-tab UI) lives entirely in the
-frontend — see `scriptRuntime.js`/`TamperScriptsPanel.js`, documented in the root
-`CLAUDE.md`'s "Web Frontend" section ("Scripted interception" subsection); nothing on
+frontend — see `scriptRuntime.js`/`TamperScriptsPanel.js`, documented in
+`web/CLAUDE.md`'s "Scripted interception" section; nothing on
 the Go side executes a script. This module deliberately stays a flat name→text-blob
 store with no opinion about which script is "main" or a "library" — that's a
 runtime-level concern (explicit load-by-name), not a storage-level one.

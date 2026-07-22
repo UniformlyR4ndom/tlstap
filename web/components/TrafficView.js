@@ -6,104 +6,74 @@ import HexDump, { ROW_HEIGHT } from './HexDump.js'
 import MarkersPanel from './MarkersPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { useResizableLayout } from '../useResizableLayout.js'
-import { fmtByteSize, fmtDuration } from '../format.js'
+import { useChunkBuffer, BATCH } from '../useChunkBuffer.js'
+import { fmtByteSize, fmtDuration, fmtRelTime } from '../format.js'
 import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
-const BATCH = 50
-const MAX_BUFFERED_CHUNKS = BATCH * 2
+function fetchPage(ws, stream, start, n) {
+    return ws.fetch(stream.session, stream.id, start, n)
+}
 
-function countChunks(rows) {
-    let n = 0
-    for (const row of rows) if (row.type === 'header') n++
-    return n
+function getId(row) {
+    return row.stid
+}
+
+function isClosed(stream) {
+    return !!stream.end
+}
+
+function buildRows(chunks, streamStart) {
+    const rows = []
+    for (const chunk of chunks) {
+        rows.push({
+            type:      'header',
+            direction: chunk.direction,
+            stid:      chunk.stid,
+            chunkId:   chunk.chunkId,
+            relTime:   fmtRelTime(chunk.time, streamStart),
+            size:      chunk.data.length,
+        })
+        for (let off = 0; off < chunk.data.length; off += 16) {
+            rows.push({
+                type:        'hex',
+                direction:   chunk.direction,
+                bytes:       chunk.data.slice(off, off + 16),
+                offset:      chunk.offset + off,
+                localOffset: off,
+            })
+        }
+    }
+    return rows
 }
 
 export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
-    const [display,    setDisplay]    = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
-    const [loading,    setLoading]    = useState(false)
-    const [error,      setError]      = useState(null)
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
     const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
     const viewHeightRef = useRef(0)
 
-    // nextStidRef: first stid to load on forward scroll (exclusive upper bound of buffer)
-    // prevStidRef: stid of the first chunk in the buffer (for backward scroll guard + fetch)
-    const nextStidRef    = useRef(0)
-    const prevStidRef    = useRef(0)
-    const hasMoreRef     = useRef(false)
-    const loadingMoreRef = useRef(false)
-    const generationRef  = useRef(0)
-    const streamRef      = useRef(stream)
-    const wsRef          = useRef(null)
-    const displayRef     = useRef(display)
-    const hasMountedRef  = useRef(false)
-    useEffect(() => { streamRef.current = stream }, [stream])
-    useEffect(() => { displayRef.current = display }, [display])
+    const { display, loading, error, setError, handleScrollEnd, reloadFrom } = useChunkBuffer({
+        entity: stream,
+        refreshKey,
+        openStream: openStidStream,
+        fetchPage,
+        getId,
+        buildRows,
+        isClosed,
+    })
 
-    // Initial load — runs whenever the selected stream changes.
+    // totalBytes is independent of the hook's fetch/display state, so it gets its own effect.
     useEffect(() => {
-        if (!stream) {
-            setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
-            setTotalBytes({ up: -1, down: -1 })
-            return
-        }
-
-        const ws = openStidStream()
-        wsRef.current = ws
-
-        generationRef.current++
-        const gen = generationRef.current
-
-        setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
-        setLoading(true)
-        setError(null)
-        setTotalBytes({ up: stream.length0 ?? -1, down: stream.length1 ?? -1 })
-        nextStidRef.current    = 0
-        prevStidRef.current    = 0
-        hasMoreRef.current     = false
-        loadingMoreRef.current = false
-
-        ;(async () => {
-            try {
-                const chunks = await ws.fetch(stream.session, stream.id, 0, BATCH)
-                if (generationRef.current !== gen) return
-                prevStidRef.current = chunks[0]?.stid ?? 0
-                nextStidRef.current = chunks.length > 0 ? chunks[chunks.length - 1].stid + 1 : 0
-                hasMoreRef.current  = chunks.length === BATCH
-                setDisplay({ rows: buildRows(chunks, stream.start), scrollAdjust: 0, adjustVersion: 0 })
-            } catch (e) {
-                if (generationRef.current === gen) setError(e.message)
-            } finally {
-                if (generationRef.current === gen) setLoading(false)
-            }
-        })()
-
-        return () => {
-            ws.close()
-            wsRef.current = null
-        }
+        setTotalBytes(stream ? { up: stream.length0 ?? -1, down: stream.length1 ?? -1 } : { up: -1, down: -1 })
     }, [stream?.id])
 
-    // Jump effect — fires when jumpTo.version changes.
+    // Jump effect — resolves jumpTo to a target stid, then calls the hook's reloadFrom.
+    // `cancelled` guards against a stale resolution superseding a newer jump.
     useEffect(() => {
-        if (!jumpTo || !streamRef.current) return
-        const s = streamRef.current
-
-        // Close any in-flight WS and open a fresh one to ensure clean state.
-        wsRef.current?.close()
-        const ws = openStidStream()
-        wsRef.current = ws
-
-        generationRef.current++
-        const gen = generationRef.current
-
-        loadingMoreRef.current = false
-        setLoading(true)
-        setError(null)
-        setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
+        if (!jumpTo || !stream) return
+        let cancelled = false
 
         ;(async () => {
             try {
@@ -112,154 +82,50 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                 let targetDirection = null
                 if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
                     const direction = jumpTo.unit === 'chunks-c2s' ? DIRNUM_C2S : DIRNUM_S2C
-                    const result = await getChunkStid(s.session, s.id, direction, jumpTo.value)
-                    if (generationRef.current !== gen) return
+                    const result = await getChunkStid(stream.session, stream.id, direction, jumpTo.value)
+                    if (cancelled) return
                     targetStid = result.stid
                 } else if (jumpTo.unit === 'offset-c2s' || jumpTo.unit === 'offset-s2c') {
                     const direction = jumpTo.unit === 'offset-c2s' ? DIRNUM_C2S : DIRNUM_S2C
-                    const result = await getByteStid(s.session, s.id, direction, jumpTo.value)
-                    if (generationRef.current !== gen) return
+                    const result = await getByteStid(stream.session, stream.id, direction, jumpTo.value)
+                    if (cancelled) return
                     targetStid = result.stid
                     targetByteOffset = jumpTo.value
                     targetDirection = direction
                 }
+                if (cancelled) return
+
                 const startStid = Math.max(0, targetStid - Math.floor(BATCH / 2))
-                const chunks = await ws.fetch(s.session, s.id, startStid, BATCH)
-                if (generationRef.current !== gen) return
-                prevStidRef.current = chunks[0]?.stid ?? startStid
-                nextStidRef.current = chunks.length > 0 ? chunks[chunks.length - 1].stid + 1 : startStid
-                hasMoreRef.current  = chunks.length === BATCH
-                const rows = buildRows(chunks, s.start)
-                let targetRowPx = 0
-                for (let i = 0; i < rows.length; i++) {
-                    const row = rows[i]
-                    if (targetByteOffset !== null) {
-                        if (row.type === 'hex' && row.direction === targetDirection && row.offset <= targetByteOffset && targetByteOffset < row.offset + row.bytes.length) {
-                            targetRowPx = i * ROW_HEIGHT
-                            break
+                reloadFrom(startStid, {
+                    computeExtra: rows => {
+                        let targetRowPx = 0
+                        for (let i = 0; i < rows.length; i++) {
+                            const row = rows[i]
+                            if (targetByteOffset !== null) {
+                                if (row.type === 'hex' && row.direction === targetDirection && row.offset <= targetByteOffset && targetByteOffset < row.offset + row.bytes.length) {
+                                    targetRowPx = i * ROW_HEIGHT
+                                    break
+                                }
+                            } else {
+                                if (row.type === 'header' && row.stid === targetStid) {
+                                    targetRowPx = i * ROW_HEIGHT
+                                    break
+                                }
+                            }
                         }
-                    } else {
-                        if (row.type === 'header' && row.stid === targetStid) {
-                            targetRowPx = i * ROW_HEIGHT
-                            break
-                        }
-                    }
-                }
-                const scrollTo = jumpTo.align === 'top'
-                    ? targetRowPx
-                    : Math.max(0, targetRowPx - Math.floor(viewHeightRef.current / 2))
-                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, scrollTo, scrollToVersion: jumpTo.version })
+                        const scrollTo = jumpTo.align === 'top'
+                            ? targetRowPx
+                            : Math.max(0, targetRowPx - Math.floor(viewHeightRef.current / 2))
+                        return { scrollTo, scrollToVersion: jumpTo.version }
+                    },
+                })
             } catch (e) {
-                if (generationRef.current === gen) setError(e.message)
-            } finally {
-                if (generationRef.current === gen) setLoading(false)
+                if (!cancelled) setError(e.message)
             }
         })()
+
+        return () => { cancelled = true }
     }, [jumpTo?.version])
-
-    // Refresh — tops up the buffer with newly available chunks, if there's room.
-    // Never evicts and never adjusts scroll; only appends to the tail.
-    useEffect(() => {
-        if (!hasMountedRef.current) { hasMountedRef.current = true; return }
-
-        const s = streamRef.current
-        if (!s || s.end) return
-        if (loadingMoreRef.current) return
-
-        const room = MAX_BUFFERED_CHUNKS - countChunks(displayRef.current.rows)
-        if (room <= 0) return
-
-        const capturedGen = generationRef.current
-        const capturedWs  = wsRef.current
-        if (!capturedWs) return
-
-        loadingMoreRef.current = true
-        setLoading(true)
-
-        ;(async () => {
-            try {
-                const chunks = await capturedWs.fetch(s.session, s.id, nextStidRef.current, room)
-                if (generationRef.current !== capturedGen) return
-                if (chunks.length === 0) return
-
-                const newChunkRows = buildRows(chunks, s.start)
-                nextStidRef.current = chunks[chunks.length - 1].stid + 1
-                hasMoreRef.current  = chunks.length === room
-
-                setDisplay(prev => ({ ...prev, rows: [...prev.rows, ...newChunkRows] }))
-            } catch (e) {
-                if (generationRef.current === capturedGen) setError(e.message)
-            } finally {
-                loadingMoreRef.current = false
-                if (generationRef.current === capturedGen) setLoading(false)
-            }
-        })()
-    }, [refreshKey])
-
-    // Stable callback — reads all mutable state via refs.
-    const handleScrollEnd = useCallback(async (scrollDir) => {
-        const goingForward = scrollDir === 1
-
-        if (goingForward  && !hasMoreRef.current)        return
-        if (!goingForward && prevStidRef.current === 0)  return
-        if (loadingMoreRef.current) return
-
-        const capturedGen    = generationRef.current
-        const capturedStream = streamRef.current
-        const capturedWs     = wsRef.current
-        if (!capturedStream || !capturedWs) return
-
-        loadingMoreRef.current = true
-        setLoading(true)
-
-        try {
-            let chunks
-            if (goingForward) {
-                chunks = await capturedWs.fetch(capturedStream.session, capturedStream.id, nextStidRef.current, BATCH)
-            } else {
-                const start = Math.max(0, prevStidRef.current - BATCH)
-                const n     = prevStidRef.current - start
-                chunks = await capturedWs.fetch(capturedStream.session, capturedStream.id, start, n)
-            }
-            if (generationRef.current !== capturedGen) return
-            if (chunks.length === 0) return
-
-            const newChunkRows = buildRows(chunks, capturedStream.start)
-
-            setDisplay(prev => {
-                if (goingForward) {
-                    const cutIdx = findChunkBoundaryNearHalf(prev.rows, 0)
-                    if (cutIdx > 0) prevStidRef.current = prev.rows[cutIdx].stid
-                    for (let i = newChunkRows.length - 1; i >= 0; i--) {
-                        if (newChunkRows[i].type === 'header') { nextStidRef.current = newChunkRows[i].stid + 1; break }
-                    }
-                    hasMoreRef.current = chunks.length === BATCH
-                    return {
-                        rows:          [...prev.rows.slice(cutIdx), ...newChunkRows],
-                        scrollAdjust:  -(cutIdx * ROW_HEIGHT),
-                        adjustVersion: prev.adjustVersion + 1,
-                    }
-                } else {
-                    const keepLen = findChunkBoundaryNearHalf(prev.rows, prev.rows.length)
-                    for (let i = keepLen - 1; i >= 0; i--) {
-                        if (prev.rows[i].type === 'header') { nextStidRef.current = prev.rows[i].stid + 1; break }
-                    }
-                    if (newChunkRows[0]?.type === 'header') prevStidRef.current = newChunkRows[0].stid
-                    hasMoreRef.current = true
-                    return {
-                        rows:          [...newChunkRows, ...prev.rows.slice(0, keepLen)],
-                        scrollAdjust:  newChunkRows.length * ROW_HEIGHT,
-                        adjustVersion: prev.adjustVersion + 1,
-                    }
-                }
-            })
-        } catch (e) {
-            if (generationRef.current === capturedGen) setError(e.message)
-        } finally {
-            loadingMoreRef.current = false
-            if (generationRef.current === capturedGen) setLoading(false)
-        }
-    }, [])
 
     const handleViewportChange = useCallback((scrollTop, height) => {
         viewHeightRef.current = height
@@ -326,46 +192,4 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
             </div>
         </div>
     `
-}
-
-// ── pure helpers ─────────────────────────────────────────────────────────────
-
-function findChunkBoundaryNearHalf(rows, fallback) {
-    const half = Math.floor(rows.length / 2)
-    for (let i = half; i < rows.length; i++) {
-        if (rows[i].type === 'header') return i
-    }
-    for (let i = half - 1; i >= 1; i--) {
-        if (rows[i].type === 'header') return i
-    }
-    return fallback
-}
-
-function buildRows(chunks, streamStart) {
-    const rows = []
-    for (const chunk of chunks) {
-        rows.push({
-            type:      'header',
-            direction: chunk.direction,
-            stid:      chunk.stid,
-            chunkId:   chunk.chunkId,
-            relTime:   fmtRelTime(chunk.time, streamStart),
-            size:      chunk.data.length,
-        })
-        for (let off = 0; off < chunk.data.length; off += 16) {
-            rows.push({
-                type:        'hex',
-                direction:   chunk.direction,
-                bytes:       chunk.data.slice(off, off + 16),
-                offset:      chunk.offset + off,
-                localOffset: off,
-            })
-        }
-    }
-    return rows
-}
-
-function fmtRelTime(ms, base) {
-    const d = ms - base
-    return `+${Math.floor(d / 1000)}.${String(d % 1000).padStart(3, '0')}s`
 }
