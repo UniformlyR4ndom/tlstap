@@ -8,11 +8,9 @@ import TamperDetailPanel from './TamperDetailPanel.js'
 import TamperScriptsPanel from './TamperScriptsPanel.js'
 import { openTamperControl, peekBuffer, getLogFileInfo, listFs, readFs, writeFs, appendFs } from '../tamperApi.js'
 import { createScriptRuntime } from '../scriptRuntime.js'
-import { loadLayout, saveLayoutValue } from '../layout.js'
+import { useResizableLayout } from '../useResizableLayout.js'
 
 const html = htm.bind(h)
-
-function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 const LOG_LIMIT = 500
 
@@ -37,7 +35,7 @@ export default function TamperView() {
     const [streams,       setStreams]       = useState([])
     const [selectedKey,   setSelectedKey]   = useState(null)
     const [autoIntercept, setAutoIntercept] = useState(false)
-    const [detailHeight,  setDetailHeight]  = useState(() => loadLayout().tamperDetailHeight)
+    const [detailHeight,  handleDetailResize] = useResizableLayout('tamperDetailHeight', { sign: -1, min: 120, max: () => Math.floor(window.innerHeight * 0.7) })
     const [subTab,        setSubTab]        = useState('intercept') // 'intercept' | 'scripts'
     const [runningScript, setRunningScript] = useState(null)
     const [scriptLog,     setScriptLog]     = useState([])
@@ -235,14 +233,6 @@ export default function TamperView() {
         }
         return controlRef.current.release(conn, direction, { ...opts, action: 'forward', releaseChunks: 0 }, editedBytes)
             .then(res => { resync(); scriptRuntimeRef.current.continuePause(conn); return res })
-    }
-
-    function handleDetailResize(deltaY) {
-        setDetailHeight(h => {
-            const next = clamp(h - deltaY, 120, Math.floor(window.innerHeight * 0.7))
-            saveLayoutValue('tamperDetailHeight', next)
-            return next
-        })
     }
 
     const selectedEntry = selectedKey

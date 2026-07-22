@@ -55,6 +55,7 @@
 // previous worker first.
 
 import { OPERATIONS_BY_CATEGORY } from './transforms.js'
+import { DIRNUM_C2S, DIRNUM_S2C } from './direction.js'
 
 // Real absolute URL of transforms.js, resolved from this module's own URL (a real network
 // URL, since scriptRuntime.js is loaded as part of the page's module graph) — this is what
@@ -441,7 +442,7 @@ try {
 }
 
 const DIR_STR = ['c2s', 's2c']
-const DIR_NUM = { c2s: 0, s2c: 1 }
+const DIR_NUM = { c2s: DIRNUM_C2S, s2c: DIRNUM_S2C }
 
 function dirToStr(d) { return DIR_STR[d] }
 function dirFromStr(s) {

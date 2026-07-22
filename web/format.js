@@ -116,3 +116,24 @@ export function mergeUint8Arrays(arrays) {
     for (const a of arrays) { out.set(a, off); off += a.length }
     return out
 }
+
+// Formats a byte count as a human-readable size. Negative n (e.g. a not-yet-known total)
+// formats as '?'.
+export function fmtByteSize(n) {
+    if (n < 0)       return '?'
+    if (n < 1024)    return `${n} B`
+    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+    return `${(n / 1048576).toFixed(1)} MB`
+}
+
+// Formats the duration between start and end (both ms epoch timestamps) as e.g. "12.34s".
+// end may be falsy for an ongoing/not-yet-finished span, in which case the duration is
+// measured against Date.now() and the result is suffixed with " (ongoing)".
+export function fmtDuration(start, end) {
+    const d = (end || Date.now()) - start
+    let s
+    if (d < 1000)       s = `${d}ms`
+    else if (d < 60000) s = `${(d / 1000).toFixed(2)}s`
+    else                s = `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
+    return end ? s : `${s} (ongoing)`
+}

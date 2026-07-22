@@ -5,14 +5,14 @@ import { openStidStream, getChunkStid, getByteStid } from '../api.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
 import MarkersPanel from './MarkersPanel.js'
 import ResizeHandle from './ResizeHandle.js'
-import { loadLayout, saveLayoutValue } from '../layout.js'
+import { useResizableLayout } from '../useResizableLayout.js'
+import { fmtByteSize, fmtDuration } from '../format.js'
+import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
 const BATCH = 50
 const MAX_BUFFERED_CHUNKS = BATCH * 2
-
-function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 function countChunks(rows) {
     let n = 0
@@ -26,16 +26,8 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     const [error,      setError]      = useState(null)
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
-    const [markersWidth, setMarkersWidth] = useState(() => loadLayout().markersWidth)
+    const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
     const viewHeightRef = useRef(0)
-
-    function handleMarkersResize(deltaX) {
-        setMarkersWidth(w => {
-            const next = clamp(w - deltaX, 150, 500)
-            saveLayoutValue('markersWidth', next)
-            return next
-        })
-    }
 
     // nextStidRef: first stid to load on forward scroll (exclusive upper bound of buffer)
     // prevStidRef: stid of the first chunk in the buffer (for backward scroll guard + fetch)
@@ -119,12 +111,12 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                 let targetByteOffset = null
                 let targetDirection = null
                 if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
-                    const direction = jumpTo.unit === 'chunks-c2s' ? 0 : 1
+                    const direction = jumpTo.unit === 'chunks-c2s' ? DIRNUM_C2S : DIRNUM_S2C
                     const result = await getChunkStid(s.session, s.id, direction, jumpTo.value)
                     if (generationRef.current !== gen) return
                     targetStid = result.stid
                 } else if (jumpTo.unit === 'offset-c2s' || jumpTo.unit === 'offset-s2c') {
-                    const direction = jumpTo.unit === 'offset-c2s' ? 0 : 1
+                    const direction = jumpTo.unit === 'offset-c2s' ? DIRNUM_C2S : DIRNUM_S2C
                     const result = await getByteStid(s.session, s.id, direction, jumpTo.value)
                     if (generationRef.current !== gen) return
                     targetStid = result.stid
@@ -296,8 +288,8 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
             <div class="stream-meta">
                 <span><span class="meta-label">src</span><span class="c2s">${stream.src}</span></span>
                 <span><span class="meta-label">dst</span>${stream.dst}</span>
-                <span><span class="meta-label">↑</span>${fmtBytes(up)}</span>
-                <span><span class="meta-label">↓</span>${fmtBytes(down)}</span>
+                <span><span class="meta-label">↑</span>${fmtByteSize(up)}</span>
+                <span><span class="meta-label">↓</span>${fmtByteSize(down)}</span>
                 <span><span class="meta-label">duration</span>${fmtDuration(stream.start, stream.end)}</span>
                 ${loading && html`<span class="meta-loading">loading…</span>`}
             </div>
@@ -376,20 +368,4 @@ function buildRows(chunks, streamStart) {
 function fmtRelTime(ms, base) {
     const d = ms - base
     return `+${Math.floor(d / 1000)}.${String(d % 1000).padStart(3, '0')}s`
-}
-
-function fmtBytes(n) {
-    if (n < 0)       return '?'
-    if (n < 1024)    return `${n} B`
-    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
-    return `${(n / 1048576).toFixed(1)} MB`
-}
-
-function fmtDuration(start, end) {
-    const d = (end || Date.now()) - start
-    let s
-    if (d < 1000)       s = `${d}ms`
-    else if (d < 60000) s = `${(d / 1000).toFixed(2)}s`
-    else                s = `${Math.floor(d / 60000)}m ${Math.floor((d % 60000) / 1000)}s`
-    return end ? s : `${s} (ongoing)`
 }

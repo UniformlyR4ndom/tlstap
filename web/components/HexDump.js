@@ -1,7 +1,8 @@
 import { h } from 'preact'
 import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
-import { fmtAsBase64, fmtAsHex, fmtAsAscii, fmtAsHexdump, mergeUint8Arrays } from '../format.js'
+import { fmtAsBase64, fmtAsHex, fmtAsAscii, fmtAsHexdump, mergeUint8Arrays, fmtByteSize } from '../format.js'
+import { dirClass, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -169,8 +170,8 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
     const topSpacer    = startIdx * ROW_HEIGHT
     const bottomSpacer = (rows.length - endIdx) * ROW_HEIGHT
 
-    const markedC2S = markers?.length ? new Set(markers.filter(m => m.direction === 0).map(m => m.offset)) : null
-    const markedS2C = markers?.length ? new Set(markers.filter(m => m.direction === 1).map(m => m.offset)) : null
+    const markedC2S = markers?.length ? new Set(markers.filter(m => m.direction === DIRNUM_C2S).map(m => m.offset)) : null
+    const markedS2C = markers?.length ? new Set(markers.filter(m => m.direction === DIRNUM_S2C).map(m => m.offset)) : null
 
     return html`
         <div class="hexdump-wrap">
@@ -207,7 +208,7 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
                     `}
                     ${menu.byteInfo && (onSetMarker || onClearMarker) && (() => {
                         const { direction, offset } = menu.byteInfo
-                        const markedSet = direction === 0 ? markedC2S : markedS2C
+                        const markedSet = direction === DIRNUM_C2S ? markedC2S : markedS2C
                         const isMarked = markedSet?.has(offset)
                         return html`
                             <div class="ctx-sep" />
@@ -224,22 +225,22 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
 }
 
 function ChunkHeader({ row }) {
-    const dir        = row.direction === 0 ? 'c2s' : 's2c'
-    const label      = row.direction === 0 ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
+    const dir        = dirClass(row.direction)
+    const label      = row.direction === DIRNUM_C2S ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
     const stidPart   = row.stid   != null ? ` [#${row.stid}]`   : ''
     const streamPart = row.stream != null ? `  stream ${row.stream}` : ''
     return html`
         <div class=${'chunk-hdr ' + dir}>
-            ${`[${row.relTime}]${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtBytes(row.size)}`}
+            ${`[${row.relTime}]${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
         </div>
     `
 }
 
 function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
     const { bytes, offset, localOffset, direction } = row
-    const dir      = direction === 0 ? 'c2s' : 's2c'
+    const dir      = dirClass(direction)
     const offStr   = (globalOffset ? offset : localOffset).toString(16).padStart(8, '0')
-    const markedSet = direction === 0 ? markedC2S : markedS2C
+    const markedSet = direction === DIRNUM_C2S ? markedC2S : markedS2C
 
     // Build hex section: '  ' leader + per-byte spans with spaces + padding + '  ' trailer.
     // Between group 1 (bytes 0-7) and group 2 (bytes 8-15) there is an extra space.
@@ -271,10 +272,4 @@ function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
     asciiContent.push('|')
 
     return html`<div class=${'hex-row ' + dir}><span class="hex-off">${offStr}</span>${hexContent}<span class="hex-asc">${asciiContent}</span></div>`
-}
-
-function fmtBytes(n) {
-    if (n < 1024)    return `${n} B`
-    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
-    return `${(n / 1048576).toFixed(1)} MB`
 }

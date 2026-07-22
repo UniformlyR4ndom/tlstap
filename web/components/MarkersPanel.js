@@ -1,22 +1,23 @@
 import { h } from 'preact'
 import { useState } from 'preact/hooks'
 import htm from 'htm'
+import { parseRaw, fmtAsRaw, fmtAsBase64, mergeUint8Arrays } from '../format.js'
+import { downloadBlob, acquireSaveHandle, writeToFileHandle } from '../download.js'
+import { dirClass, dirLabel } from '../direction.js'
 
 const html = htm.bind(h)
 
 // ── compress / decompress ─────────────────────────────────────────────────────
 
 async function compress(str) {
-    const bytes = new TextEncoder().encode(str)
+    const bytes = parseRaw(str)
     const cs    = new CompressionStream('deflate')
     const w     = cs.writable.getWriter()
     w.write(bytes); w.close()
     const chunks = []
     const r = cs.readable.getReader()
     for (;;) { const { done, value } = await r.read(); if (done) break; chunks.push(value) }
-    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
-    let off = 0; for (const c of chunks) { out.set(c, off); off += c.length }
-    return btoa(Array.from(out, b => String.fromCharCode(b)).join(''))
+    return fmtAsBase64(mergeUint8Arrays(chunks))
 }
 
 async function decompress(b64) {
@@ -27,9 +28,7 @@ async function decompress(b64) {
     const chunks = []
     const r = ds.readable.getReader()
     for (;;) { const { done, value } = await r.read(); if (done) break; chunks.push(value) }
-    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
-    let off = 0; for (const c of chunks) { out.set(c, off); off += c.length }
-    return new TextDecoder().decode(out)
+    return fmtAsRaw(mergeUint8Arrays(chunks))
 }
 
 function parseImport(text) {
@@ -71,14 +70,12 @@ export default function MarkersPanel({ markers, onRemove, onUpdateLabel, onJump,
         let fileHandle = null
         if (ioMethod === 'file' && window.showSaveFilePicker) {
             try {
-                fileHandle = await window.showSaveFilePicker({
-                    suggestedName: 'markers.tlstap-markers',
-                    types: [{ description: 'tlstap markers', accept: { 'text/plain': ['.tlstap-markers'] } }],
-                })
+                fileHandle = await acquireSaveHandle('markers.tlstap-markers', 'text/plain', '.tlstap-markers', 'tlstap markers')
             } catch (e) {
-                if (e.name !== 'AbortError') setStatus({ ok: false, msg: e.message })
+                setStatus({ ok: false, msg: e.message })
                 return
             }
+            if (!fileHandle) return // user dismissed the picker
         }
 
         let encoded
@@ -95,16 +92,10 @@ export default function MarkersPanel({ markers, onRemove, onUpdateLabel, onJump,
                 await navigator.clipboard.writeText(encoded)
                 setStatus({ ok: true, msg: 'Exported to clipboard' })
             } else if (fileHandle) {
-                const writable = await fileHandle.createWritable()
-                await writable.write(new Blob([encoded], { type: 'text/plain' }))
-                await writable.close()
+                await writeToFileHandle(fileHandle, encoded, 'text/plain')
                 setStatus({ ok: true, msg: 'Exported to file' })
             } else {
-                const url = URL.createObjectURL(new Blob([encoded], { type: 'text/plain' }))
-                const a   = document.createElement('a')
-                a.href = url; a.download = 'markers.tlstap-markers'
-                document.body.appendChild(a); a.click()
-                document.body.removeChild(a); URL.revokeObjectURL(url)
+                downloadBlob(encoded, 'markers.tlstap-markers', 'text/plain')
                 setStatus({ ok: true, msg: 'Exported to file' })
             }
         } catch (e) {
@@ -187,8 +178,8 @@ export default function MarkersPanel({ markers, onRemove, onUpdateLabel, onJump,
 function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
     const [editing, setEditing] = useState(false)
     const [draft,   setDraft]   = useState(marker.label)
-    const dir      = marker.direction === 0 ? 'c2s' : 's2c'
-    const dirLabel = marker.direction === 0 ? 'c→s' : 's→c'
+    const dir   = dirClass(marker.direction)
+    const label = dirLabel(marker.direction)
 
     function commitEdit() {
         setEditing(false)
@@ -200,7 +191,7 @@ function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
             <div class="marker-row-top">
                 <span class="marker-loc">
                     [${marker.stream}]
-                    <span class=${'marker-dir ' + dir}>${dirLabel}</span>
+                    <span class=${'marker-dir ' + dir}>${label}</span>
                     <span class="marker-off">0x${marker.offset.toString(16).padStart(8, '0')}</span>
                 </span>
                 <span class="marker-del" onclick=${e => { e.stopPropagation(); onRemove(marker.id) }} title="Delete">×</span>

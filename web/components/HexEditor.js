@@ -2,6 +2,7 @@ import { h } from 'preact'
 import { useState, useRef } from 'preact/hooks'
 import htm from 'htm'
 import { ROW_HEIGHT } from './HexDump.js'
+import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -165,7 +166,7 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction,
 
     // Direction is optional (e.g. TransformPanel has no notion of c2s/s2c); only the Tamper
     // detail panel passes it, to get the same green/blue direction tint HexDump.js uses.
-    const dirClass = direction === 0 ? 'c2s' : direction === 1 ? 's2c' : ''
+    const dirClass = direction === DIRNUM_C2S ? 'c2s' : direction === DIRNUM_S2C ? 's2c' : ''
 
     return html`
         <div

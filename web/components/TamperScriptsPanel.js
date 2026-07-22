@@ -4,11 +4,10 @@ import htm from 'htm'
 import { listScripts, getScript, putScript, deleteScript } from '../tamperApi.js'
 import ScriptEditor from './ScriptEditor.js'
 import ResizeHandle from './ResizeHandle.js'
-import { loadLayout, saveLayoutValue } from '../layout.js'
+import { useResizableLayout } from '../useResizableLayout.js'
+import { downloadBlob } from '../download.js'
 
 const html = htm.bind(h)
-
-function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 // "Scripts" sub-tab of the Tamper view: CRUD over the server-side script store (see
 // intercept/tamper/scripts.go) plus Run/Stop for the one script instance TamperView's
@@ -34,33 +33,17 @@ export default function TamperScriptsPanel({
     const [status,       setStatus]       = useState(null) // null | { ok, msg }
     const [creatingNew,  setCreatingNew]  = useState(false)
     const [newName,      setNewName]      = useState('')
-    const [listWidth,    setListWidth]    = useState(() => loadLayout().scriptsListWidth)
-    const [logHeight,    setLogHeight]    = useState(() => loadLayout().scriptsLogHeight)
+    // Handle sits after the list panel in DOM order, so a positive deltaX (dragging
+    // right) grows it — same convention as App.js's sidebar handle.
+    const [listWidth, handleListResize] = useResizableLayout('scriptsListWidth', { min: 150, max: 500 })
+    // Handle sits before the log panel (above it), so a negative deltaY (dragging up)
+    // grows it — same convention as App.js's bottom-panel handle.
+    const [logHeight, handleLogResize]  = useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     // Bumped exactly once per genuine external reset of the editor's content (initial
     // load, script switch, Reload) — see ScriptEditor.js's doc comment for why it must be
     // an explicit signal rather than inferred from `source` changing (ordinary typing also
     // changes `source`, via ScriptEditor's own onChange).
     const [loadVersion,  setLoadVersion]  = useState(0)
-
-    // Handle sits after the list panel in DOM order, so a positive deltaX (dragging
-    // right) grows it — same convention as App.js's sidebar handle.
-    function handleListResize(deltaX) {
-        setListWidth(w => {
-            const next = clamp(w + deltaX, 150, 500)
-            saveLayoutValue('scriptsListWidth', next)
-            return next
-        })
-    }
-
-    // Handle sits before the log panel (above it), so a negative deltaY (dragging up)
-    // grows it — same convention as App.js's bottom-panel handle.
-    function handleLogResize(deltaY) {
-        setLogHeight(h => {
-            const next = clamp(h - deltaY, 80, Math.floor(window.innerHeight * 0.7))
-            saveLayoutValue('scriptsLogHeight', next)
-            return next
-        })
-    }
 
     function refreshList() {
         listScripts().then(setScripts).catch(err => setStatus({ ok: false, msg: err.message }))
@@ -120,12 +103,7 @@ export default function TamperScriptsPanel({
     // with no error and no visible feedback; a plain download has no such failure mode.
     function handleDownloadLog() {
         const text = logLines.map(l => l.level === 'error' ? `[ERROR] ${l.text}` : l.text).join('\n')
-        const blob = new Blob([text], { type: 'text/plain' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url; a.download = 'tamper-script-log.txt'
-        document.body.appendChild(a); a.click()
-        document.body.removeChild(a); URL.revokeObjectURL(url)
+        downloadBlob(text, 'tamper-script-log.txt', 'text/plain')
     }
 
     function handleCreate() {

@@ -1,5 +1,6 @@
 import { h } from 'preact'
 import htm from 'htm'
+import { dirClass, dirLabel } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -31,7 +32,7 @@ export default function TamperQueueList({ queue, selectedKey, onSelect, pausedEn
                         <span class="tamper-queue-line">
                             ${pausedEntries?.has(`${entry.conn}:${entry.direction}`) && html`<span class="tamper-paused-dot" title="paused by script">⏸</span>`}
                             #${entry.conn} ·
-                            <span class=${entry.direction === 0 ? 'c2s' : 's2c'}>${entry.direction === 0 ? 'C→S' : 'S→C'}</span>
+                            <span class=${dirClass(entry.direction)}>${dirLabel(entry.direction)}</span>
                             · ${entry.chunks} chunk${entry.chunks === 1 ? '' : 's'} · ${entry.length} B ·
                             ${entry.src} ↔ ${entry.dst}
                         </span>

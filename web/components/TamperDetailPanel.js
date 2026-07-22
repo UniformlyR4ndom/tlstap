@@ -3,8 +3,9 @@ import { useState, useEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
 import HexEditor from './HexEditor.js'
 import { peekBuffer } from '../tamperApi.js'
-import { mergeUint8Arrays, parseHexdump } from '../format.js'
+import { mergeUint8Arrays, parseHexdump, parseRaw } from '../format.js'
 import { OPERATIONS } from '../transforms.js'
+import { dirClass, dirLabel } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -16,8 +17,8 @@ const html = htm.bind(h)
 // op, just this popover's way to round-trip HexDump's own "Copy as hexdump" output), so it
 // goes through format.js's parseHexdump directly.
 function decodeChunkText(text, format) {
-    if (format === 'plain') return new TextEncoder().encode(text)
-    const bytes = new TextEncoder().encode(text)
+    if (format === 'plain') return parseRaw(text)
+    const bytes = parseRaw(text)
     if (format === 'hex') return OPERATIONS['hex-decode'].run(bytes, { prefix: '', separator: ' ' })
     if (format === 'base64') return OPERATIONS['base64-decode'].run(bytes, { urlSafe: false })
     if (format === 'hexdump') return parseHexdump(text)
@@ -518,7 +519,7 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         <div class="tamper-detail-panel">
             <div class="tamper-detail-toolbar">
                 <span class="tamper-detail-title">
-                    #${entry.conn} · <span class=${entry.direction === 0 ? 'c2s' : 's2c'}>${entry.direction === 0 ? 'C→S' : 'S→C'}</span>
+                    #${entry.conn} · <span class=${dirClass(entry.direction)}>${dirLabel(entry.direction)}</span>
                     · ${entry.chunks} chunk${entry.chunks === 1 ? '' : 's'} · ${entry.length} B
                     ${paused && html`<span class="tamper-paused-tag">⏸ paused by script</span>`}
                 </span>

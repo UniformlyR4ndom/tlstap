@@ -3,6 +3,8 @@ import { useState } from 'preact/hooks'
 import htm from 'htm'
 import { openStidStream, getByteStid } from '../api.js'
 import { fmtAsRaw, fmtAsBase64, fmtAsHex, fmtAsHexdump, mergeUint8Arrays } from '../format.js'
+import { downloadBlob, acquireSaveHandle, writeToFileHandle } from '../download.js'
+import { DIR_C2S, DIR_S2C, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -30,12 +32,9 @@ const FILE_META = {
 }
 
 // Must be called while a user gesture is still active (before any unrelated awaits).
-async function acquireFileHandle(format) {
+function acquireFileHandle(format) {
     const { ext, mime, desc } = FILE_META[format] ?? FILE_META.raw
-    return window.showSaveFilePicker({
-        suggestedName: `extract${ext}`,
-        types: [{ description: desc, accept: { [mime]: [ext] } }],
-    })
+    return acquireSaveHandle(`extract${ext}`, mime, ext, desc)
 }
 
 async function writeToHandle(handle, bytes, format, baseOffset) {
@@ -47,10 +46,7 @@ async function writeToHandle(handle, bytes, format, baseOffset) {
         default:        content = bytes;                            break
     }
     const { mime } = FILE_META[format] ?? FILE_META.raw
-    const blob     = new Blob([content], { type: mime })
-    const writable = await handle.createWritable()
-    await writable.write(blob)
-    await writable.close()
+    await writeToFileHandle(handle, content, mime)
 }
 
 function downloadFallback(bytes, format, baseOffset) {
@@ -62,11 +58,7 @@ function downloadFallback(bytes, format, baseOffset) {
         default:        content = bytes;                            break
     }
     const { ext, mime } = FILE_META[format] ?? FILE_META.raw
-    const url = URL.createObjectURL(new Blob([content], { type: mime }))
-    const a   = document.createElement('a')
-    a.href = url; a.download = `extract${ext}`
-    document.body.appendChild(a); a.click()
-    document.body.removeChild(a); URL.revokeObjectURL(url)
+    downloadBlob(content, `extract${ext}`, mime)
 }
 
 async function fetchRange(session, stream, dir, fromOffset, toOffset) {
@@ -122,9 +114,10 @@ export default function ExtractPanel({ session, stream, direction, from, to, onD
             try {
                 fileHandle = await acquireFileHandle(format)
             } catch (err) {
-                if (err.name !== 'AbortError') setStatus({ ok: false, msg: err.message })
+                setStatus({ ok: false, msg: err.message })
                 return
             }
+            if (!fileHandle) return // user dismissed the picker
         }
 
         setWorking(true)
@@ -153,8 +146,8 @@ export default function ExtractPanel({ session, stream, direction, from, to, onD
         <form class="extract-form" onsubmit=${e => e.preventDefault()}>
             <span class="extract-stream-label">stream <span class="extract-stream-id">#${stream.id}</span></span>
             <select class="goto-select" value=${direction} onchange=${e => onDirectionChange(e.target.value)}>
-                <option value="0">c→s</option>
-                <option value="1">s→c</option>
+                <option value=${DIRNUM_C2S}>${DIR_C2S}</option>
+                <option value=${DIRNUM_S2C}>${DIR_S2C}</option>
             </select>
             <span class="extract-sep" />
             <label class="extract-field-label">From</label>

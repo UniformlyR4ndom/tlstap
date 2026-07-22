@@ -12,11 +12,10 @@ import TransformPanel from './TransformPanel.js'
 import TamperView from './TamperView.js'
 import ResizeHandle from './ResizeHandle.js'
 import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
-import { loadLayout, saveLayoutValue } from '../layout.js'
+import { useResizableLayout } from '../useResizableLayout.js'
+import { DIRNUM_C2S } from '../direction.js'
 
 const html = htm.bind(h)
-
-function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 export default function App() {
     const [view,         setView]         = useState('analysis') // 'analysis' | 'tamper'
@@ -32,29 +31,13 @@ export default function App() {
     const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
     const [jumpTo,       setJumpTo]       = useState(null)
     const [markers,      setMarkers]      = useState(() => loadMarkers())
-    const [extractDir,   setExtractDir]   = useState('0')
+    const [extractDir,   setExtractDir]   = useState(String(DIRNUM_C2S))
     const [extractFrom,  setExtractFrom]  = useState('')
     const [extractTo,    setExtractTo]    = useState('')
-    const [sidebarWidth, setSidebarWidth] = useState(() => loadLayout().sidebarWidth)
-    const [bottomHeight, setBottomHeight] = useState(() => loadLayout().bottomHeight)
+    const [sidebarWidth, handleSidebarResize] = useResizableLayout('sidebarWidth', { min: 180, max: 600 })
+    const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
     const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
-
-    function handleSidebarResize(deltaX) {
-        setSidebarWidth(w => {
-            const next = clamp(w + deltaX, 180, 600)
-            saveLayoutValue('sidebarWidth', next)
-            return next
-        })
-    }
-
-    function handleBottomResize(deltaY) {
-        setBottomHeight(h => {
-            const next = clamp(h - deltaY, 80, Math.floor(window.innerHeight * 0.7))
-            saveLayoutValue('bottomHeight', next)
-            return next
-        })
-    }
 
     useEffect(() => { saveMarkers(markers) }, [markers])
 
@@ -96,7 +79,7 @@ export default function App() {
 
     function jumpToOffset(streamObj, direction, offset) {
         if (stream?.id !== streamObj.id) setStream(streamObj)
-        const unit = direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        const unit = direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
         setJumpTo(prev => ({ value: offset, unit, version: (prev?.version ?? 0) + 1 }))
     }
 
@@ -111,7 +94,7 @@ export default function App() {
     }
 
     function handleMarkerTabJump(marker) {
-        const unit = marker.direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        const unit = marker.direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
         const doJump = (streamObj) => {
             setStream(streamObj)
             setJumpTo(prev => ({ value: marker.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
@@ -154,7 +137,7 @@ export default function App() {
         const target = ss.find(s => s.id === pending.streamId)
         if (!target) return
         pendingJumpRef.current = null
-        const unit = pending.direction === 0 ? 'offset-c2s' : 'offset-s2c'
+        const unit = pending.direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
         setStream(target)
         setJumpTo(prev => ({ value: pending.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
     }

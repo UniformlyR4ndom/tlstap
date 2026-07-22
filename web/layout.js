@@ -16,3 +16,7 @@ export function saveLayoutValue(key, value) {
     current[key] = value
     localStorage.setItem(STORAGE_KEY, JSON.stringify(current))
 }
+
+export function clamp(v, lo, hi) {
+    return Math.min(Math.max(v, lo), hi)
+}

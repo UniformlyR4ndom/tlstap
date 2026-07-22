@@ -57,8 +57,11 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
   tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, fs-root)
   format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
+  direction.js      ← direction constants/helpers (DIRNUM_C2S/DIRNUM_S2C, DIR_C2S/DIR_S2C, dirClass, dirLabel)
+  download.js       ← file-save helpers (downloadBlob anchor-click fallback; acquireSaveHandle/writeToFileHandle for the File System Access API)
   markers.js        ← marker localStorage helpers (loadMarkers, saveMarkers, makeMarkerId)
-  layout.js         ← panel-size localStorage helpers (loadLayout, saveLayoutValue)
+  layout.js         ← panel-size localStorage helpers (loadLayout, saveLayoutValue, clamp)
+  useResizableLayout.js ← hook backing every resizable-panel dimension (see "Resizable panels" below)
   transforms.js     ← aggregates transforms/* into OPERATIONS + ALGORITHM_SECTIONS for the Transform panel
   transforms/       ← one module per transform category (basic.js, numbers.js, compression.js, zip.js, ...); see "transforms.js" section below
   package.json      ← "type":"module" + `npm test` for the transforms/* unit tests (Node's built-in test runner; not embedded into the binary)
@@ -66,8 +69,9 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   vendor/           ← vendored ES modules (preact 10.25.4, htm 3.1.1, fflate 0.8.3)
   components/
     App.js          ← root; owns top-level view (Analysis/Tamper), session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
-    SessionList.js  ← sessions panel with sort toggle (asc/desc)
-    StreamList.js   ← streams panel with sort toggle (resets to asc on session change)
+    ListPanel.js    ← shared panel-header (title/badge/sort-toggle) + sorted/selectable item list, used by SessionList.js/StreamList.js
+    SessionList.js  ← sessions panel, built on ListPanel.js (sort toggle asc/desc)
+    StreamList.js   ← streams panel, built on ListPanel.js (sort toggle resets to asc on session change)
     TrafficView.js  ← single-stream view: metadata bar + stid-based chunk buffer + virtual scroll + markers-panel sizing
     CombinedView.js ← combined-stream view: sgid-based chunk buffer across all streams in a session
     HexDump.js      ← virtual-scroll hex dump with prefetch, scroll correction, byte selection, context menu (read-only, for captured traffic)
@@ -310,23 +314,26 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - Content area (`.bottom-content`, resizable — see "Resizable panels" below) renders `GoToPanel`, `SearchPanel`, `ExtractPanel`, or `TransformPanel` based on `bottomTab`.
 - A `ResizeHandle` (`orientation="h"`) sits at the top edge of `.bottom-panel`, shown only while `bottomTab` is set (nothing to resize when collapsed).
 
-**Session/stream sort toggles:**
-- `SessionList.js` — `desc` state (default `false` = ascending/oldest first); `▼`/`▲` button in panel header.
-- `StreamList.js` — same pattern; `desc` resets to `false` when the selected session changes (its own effect, kept separate from the fetch effect so a refresh doesn't reset sort order).
+**Session/stream list panels (`ListPanel.js`, `SessionList.js`, `StreamList.js`):**
+- `ListPanel.js` is the shared panel chrome: `<${ListPanel} title items error? emptyMessage selected onSelect renderItem resetSortKey? />`. It owns the `desc` sort state (default `false` = ascending/oldest first), the `▼`/`▲` toggle button in the panel header, the count badge, the sorted/mapped item list (`key`/`selected`-class/`onclick` wrapper), and the empty-state line (`error`, if passed and truthy, takes priority over `emptyMessage`). Callers own fetching the data, deciding what `error`/`emptyMessage` should say, and each item's actual row markup via `renderItem(item)`.
+- `SessionList.js` fetches via `getSessions()`, tracks its own `error` state, and never passes `resetSortKey` — matching its original never-reset-on-its-own sort behavior.
+- `StreamList.js` fetches via `getStreams(session.id)` (guarded on `!session`) and passes `resetSortKey=${session?.id}`, which `ListPanel.js` watches via its own effect to reset `desc` back to `false` on session change (kept as a `ListPanel`-internal effect, separate from the fetch effect, so a refresh doesn't reset sort order).
 - Both `SessionList.js` and `StreamList.js` re-fetch (`getSessions()` / `getStreams()`) whenever `refreshKey` changes, in addition to their own natural triggers (mount / session change) — this is what makes the Refresh button pick up newly-initiated streams and updated end-times/byte-counts in the sidebar.
 
 **Duration formatting:**
-- `fmtDuration(start, end)` (duplicated in `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh/Auto-Refresh) naturally advance this since it's computed fresh each render.
+- `fmtDuration(start, end)` (`format.js`, used by `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh/Auto-Refresh) naturally advance this since it's computed fresh each render.
 
-**Resizable panels (`ResizeHandle.js`, `layout.js`):**
-- `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow").
-- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` — reads/writes a single `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight }`, merged with defaults on load (same pattern as `markers.js`).
-- **Sidebar** (`App.js`): `sidebarWidth` (default 280, clamped 180–600), handle between `.sidebar` and `.main`.
-- **Bottom panel** (`App.js`): `bottomHeight` (default 160, clamped 80–70% of `window.innerHeight`), handle at the top of `.bottom-panel` (only rendered while a tab is open).
-- **Markers panel** (`TrafficView.js`): `markersWidth` (default 240, clamped 150–500), handle between `HexDump`/`HexEditor` and `MarkersPanel` (only rendered while not collapsed); width passed down as a `width` prop to `MarkersPanel`, applied via inline style on `.markers-side`.
-- **Transform panel** (`TransformPanel.js`): `encdecOptionsWidth` (default 160, clamped 100–400, handle between the options column and the input/output column) and `encdecInputHeight` (default 120, clamped 30–2000, handle between the input and output areas).
-- **Tamper detail panel** (`TamperView.js`): `tamperDetailHeight` (default 300, clamped 120–70% of `window.innerHeight`), handle above `.tamper-detail-wrap`, same `h - deltaY` sign convention as the bottom panel's handle (also placed before the sized element).
-- All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins; each resize handler both updates local state and calls `saveLayoutValue`.
+**Resizable panels (`ResizeHandle.js`, `layout.js`, `useResizableLayout.js`):**
+- `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow"). `onResize` is only ever read fresh from props at `mousedown` time (never captured in an effect's dependency array), so its identity doesn't need to be stable across renders — nothing memoizes it, deliberately.
+- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` — reads/writes a single `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight, scriptsListWidth, scriptsLogHeight }`, merged with defaults on load (same pattern as `markers.js`). Also exports `clamp(v, lo, hi)`, used both by the hook below and standalone by `TransformPanel.js` (for a step param's numeric bound, unrelated to layout).
+- `useResizableLayout(key, { sign = 1, min, max })` (`useResizableLayout.js`) is what every panel below actually calls — it's the one place that reads `loadLayout()[key]` for the initial value, applies `clamp(v + sign * delta, min, max)` on each `onResize(delta)`, and calls `saveLayoutValue(key, next)`, returning `[value, onResize]` (mirrors `useState`'s tuple shape). `max` may be a plain number or a thunk (`() => number`) — the three window-relative panels (bottom panel, tamper detail panel, scripts log panel) pass `() => Math.floor(window.innerHeight * 0.7)` so the bound is re-read at drag-time from whatever `window.innerHeight` currently is, not baked in at whatever render created the hook's return value (there's no `resize` listener anywhere forcing a re-render on browser-window resize, so a plain number captured at render time could go stale between an actual window resize and the next unrelated re-render).
+- **Sidebar** (`App.js`): `useResizableLayout('sidebarWidth', { min: 180, max: 600 })` (default 280), handle between `.sidebar` and `.main`.
+- **Bottom panel** (`App.js`): `useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160), handle at the top of `.bottom-panel` (only rendered while a tab is open).
+- **Markers panel** (`TrafficView.js`): `useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })` (default 240), handle between `HexDump`/`HexEditor` and `MarkersPanel` (only rendered while not collapsed); width passed down as a `width` prop to `MarkersPanel`, applied via inline style on `.markers-side`.
+- **Transform panel** (`TransformPanel.js`): `useResizableLayout('encdecOptionsWidth', { min: 100, max: 400 })` (default 160, handle between the options column and the input/output column) and `useResizableLayout('encdecInputHeight', { min: 30, max: 2000 })` (default 120, handle between the input and output areas).
+- **Tamper detail panel** (`TamperView.js`): `useResizableLayout('tamperDetailHeight', { sign: -1, min: 120, max: () => Math.floor(window.innerHeight * 0.7) })` (default 300), handle above `.tamper-detail-wrap`, same sign convention as the bottom panel's handle (also placed before the sized element).
+- **Tamper scripts sub-tab** (`TamperScriptsPanel.js`): `useResizableLayout('scriptsListWidth', { min: 150, max: 500 })` (default 220, handle between the script list and editor) and `useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160, handle above the log panel).
+- All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins.
 
 **Virtual scroll (`HexDump.js`):**
 - Exports `ROW_HEIGHT = 22`. Constants: `BUFFER = 8` (overdraw rows), `PREFETCH_FRACTION = 0.1`.
@@ -413,15 +420,21 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `App.js` wires `onJump` → `handleSearchJump`: finds the stream in `streamList`, switches to it if needed (sets `stream` state), then sets `jumpTo` with unit `offset-c2s` or `offset-s2c`.
 - `streamList` state in `App.js` is populated via `StreamList`'s `onLoad` prop (called after each fetch).
 
-**`format.js` (shared encoding helpers):**
-- `fmtAsRaw(bytes)` — UTF-8 decode (non-fatal).
+**`format.js` (shared encoding/formatting helpers):**
+- `fmtAsRaw(bytes)` / `parseRaw(text)` — UTF-8 decode (non-fatal) / encode.
 - `fmtAsBase64(bytes)` — standard base64 string.
 - `fmtAsHex(bytes)` — lowercase hex string (no separators).
 - `fmtAsAscii(bytes)` — printable ASCII, `.` for non-printable.
 - `fmtAsHexdump(bytes, baseOffset)` — `xxd`-style: `OOOOOOOO  gg gg … gg  gg gg … gg  |ascii|` per 16-byte line.
 - `parseHexdump(text)` — inverse of `fmtAsHexdump`: parses that same format back into bytes, ignoring the offset and `|ascii|` columns (both derived/lossy) and reading only the hex byte tokens between them; lenient about spacing. Covered by `format.test.js`.
+- `parseHexBytes(text, label, validLengths?)` — parses an optionally `0x`-prefixed hex string into bytes, with an optional byte-length check; used by the Transform panel's encryption/MAC ops (`transforms/encryption.js`, `transforms/mac.js`) to parse key/IV/nonce/AAD fields.
+- `bytesFromWordArray(wordArray)` — unpacks a crypto-js `WordArray`-shaped object into a `Uint8Array`; used by `transforms/hash.js`, `transforms/encryption.js`, `transforms/mac.js`.
+- `fmtUintHex(n, width)` / `parseUintField(text, label, width)` — fixed-width `0x`-hex formatting/parsing for a single integer param (`0x`/decimal/bare-hex accepted); used by `transforms/checksum.js`'s CRC variant fields.
+- `parseIntInRange(value, min, max, label)` — rounds and range-validates a numeric param; used by `transforms/basic.js`'s Base-N `base` field.
 - `mergeUint8Arrays(arrays)` — concatenates an array of `Uint8Array`s into one.
-- Imported by `HexDump.js` (context menu copy), `ExtractPanel.js` (extraction encoding), `transforms.js` (`fmtAsBase64` for the Base64 encode operation), and `TamperDetailPanel.js` (`parseHexdump`/`mergeUint8Arrays`, for the Hexdump-format chunk-creation popover — see "Creating a chunk" under the Tamper tab section below). **Must be listed in the `//go:embed` directive in `web/server.go` — any new top-level `.js` file added under `web/` must be added there explicitly.** The same applies to `transforms/*.js`: `web/server.go` lists each category source file individually (`transforms/basic.js`, `transforms/numbers.js`, `transforms/hash.js`, ...) rather than embedding the `transforms` directory wholesale — this is deliberate, so that `web/package.json` (Node test tooling, see "Testing" below) and any `transforms/*.test.js` file are never pulled into the binary. Any new category module must be added to that embed line by name; test files must not be.
+- `fmtByteSize(n)` — human-readable byte count (`B`/`KB`/`MB`; negative `n` formats as `'?'`, for a not-yet-known total). Used by `HexDump.js` (chunk header) and `TrafficView.js` (stream meta bar).
+- `fmtDuration(start, end)` — see "Duration formatting" below.
+- Imported by `HexDump.js` (context menu copy, chunk header size), `ExtractPanel.js` (extraction encoding), `transforms.js` (`fmtAsBase64` for the Base64 encode operation), `TamperDetailPanel.js` (`parseHexdump`/`mergeUint8Arrays`, for the Hexdump-format chunk-creation popover — see "Creating a chunk" under the Tamper tab section below), and others. **Must be listed in the `//go:embed` directive in `web/server.go` — any new top-level `.js` file added under `web/` must be added there explicitly.** The same applies to `transforms/*.js`: `web/server.go` lists each category source file individually (`transforms/basic.js`, `transforms/numbers.js`, `transforms/hash.js`, ...) rather than embedding the `transforms` directory wholesale — this is deliberate, so that `web/package.json` (Node test tooling, see "Testing" below) and any `transforms/*.test.js` file are never pulled into the binary. Any new category module must be added to that embed line by name; test files must not be.
 
 **Extract panel (`ExtractPanel.js`):**
 - Props (all controlled from `App.js`): `session`, `stream`, `direction` (string `'0'`/`'1'`), `from` (string), `to` (string), `onDirectionChange`, `onFromChange`, `onToChange`.
@@ -430,7 +443,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `parseOffset(s)`: accepts decimal or `0x`/`0X`-prefixed hex; returns `null` on invalid input.
 - `fetchRange(session, stream, dir, fromOffset, toOffset)`: resolves both offsets to stids via parallel `getByteStid` calls, fetches `endStid - startStid + 1` chunks via `openStidStream`, filters by direction, trims to exact byte boundaries.
 - **Extract button is `type="button"` with `onclick` handler** — NOT a form submit. This is required for `showSaveFilePicker` (Chrome/Edge File System Access API): the browser only grants a file-picker dialog from a direct click event, not from a form `submit` event.
-- For file method: `acquireFileHandle(format)` is called **before** `fetchRange` to preserve the transient user activation; Chrome consumes activation on the first relevant `await`.
+- For file method: `acquireFileHandle(format)` (thin wrapper over `download.js`'s shared `acquireSaveHandle`, see below) is called **before** `fetchRange` to preserve the transient user activation; Chrome consumes activation on the first relevant `await`.
 - Fallback for browsers without `showSaveFilePicker` (Firefox): uses an anchor-click download; status message notes "no save dialog in this browser".
 - File extensions/MIME: raw → `.bin`/`application/octet-stream`, base64 → `.b64`/`text/plain`, hex → `.hex`/`text/plain`, hexdump → `.txt`/`text/plain`.
 - `App.js` extract state: `extractDir` (useState `'0'`), `extractFrom`, `extractTo` (both useState `''`).
@@ -499,7 +512,7 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - **Import/export** (bottom bar of expanded panel): `[clipboard ▾] [Import] [Export]` + status line.
   - File format: deflate-compressed JSON, base64-encoded, extension `.tlstap-markers`. Content is the raw `tlstap-markers` localStorage JSON (`{ version: 1, markers: [{id, session, stream, direction, offset, label?}] }`).
   - `compress(str)` / `decompress(b64)`: use `CompressionStream`/`DecompressionStream` with `'deflate'` (Chrome 80+, Firefox 113+, Safari 16.4+).
-  - Export to file: `showSaveFilePicker` called **before** `compress()` to preserve user activation; falls back to anchor download.
+  - Export to file: `download.js`'s shared `acquireSaveHandle` called **before** `compress()` to preserve user activation; falls back to anchor download.
   - Import from file: programmatic `<input type="file" accept=".tlstap-markers,.txt">` click (no activation constraint on read).
   - Import replaces all markers (`onImport` prop wired to `setMarkers` in `App.js`).
   - `parseImport(text)`: validates JSON has `markers` array with required typed fields; returns `null` on invalid data.
@@ -980,3 +993,36 @@ during typing, regardless of scheduling order. `readOnly` is applied through a
 - `hash-wasm` 4.12.0 (JS+WASM, vendored under `web/vendor/hash-wasm-whirlpool.module.js`) — Whirlpool support in `web/transforms/hash.js` (the one hash algorithm `crypto-js` doesn't cover, and risky to hand-roll correctly given its S-box/MDS-matrix complexity). Unlike the other hash-wasm-adjacent dist artifacts, the per-algorithm builds (`dist/whirlpool.umd.min.js`) only ever ship pre-minified — the WASM binary is inlined as base64 only there and in the full `dist/index.esm.js` bundle, nowhere else. Vendored from that unminified `dist/index.esm.js` instead (real source, comments intact, unlike a minified UMD reformat) via an entry file re-exporting just `whirlpool`/`createWhirlpool`, tree-shaken down to Whirlpool alone (dropping argon2/bcrypt/scrypt/blake2/3/keccak/the other hash functions/...) with `esbuild --bundle --format=esm` (no `--minify`, same reasoning as CodeMirror below — ~21KB unminified vs. ~13KB a minified equivalent would be, judged worth it for debuggability). Exports both the original async `whirlpool()` convenience function and the lower-level `createWhirlpool()` hasher factory — a genuine public export, not an internal — whose returned `IHasher`'s `.init()/.update()/.digest()` are synchronous once created; this is what lets `transforms/hash.js` warm up a hasher once and compute every subsequent digest synchronously (see its "Implemented operations" entry above) instead of paying an async WASM-init cost on every call. The vendored file's header comment has the exact rebuild recipe.
 - `@noble/ciphers` 2.2.0 (JS, vendored under `web/vendor/noble-ciphers/`) — AES (CBC/CTR/GCM) and Salsa20/ChaCha20 support in `web/transforms/encryption.js`. Chosen over extending `crypto-js` (which does have its own `AES` module) specifically because crypto-js has no GCM/AEAD support at all — consolidating all of AES's modes (CBC/CTR/GCM) into one implementation was judged better than splitting the one algorithm across two libraries. MIT-licensed, zero runtime dependencies, audited (Cure53). Unlike every other vendored JS library here, it's already a native ES module with only relative imports among its own files (`aes.js`/`chacha.js`/`salsa.js` plus their shared `_arx.js`/`_poly1305.js`/`_polyval.js`/`utils.js`), so vendoring is a direct, unmodified copy of those seven files rather than an esbuild bundle — see `aes.js`'s header comment for the exact file list.
 - CodeMirror 6 (JS, vendored under `web/vendor/codemirror.module.js`) — the `web/components/ScriptEditor.js` editor for the Tamper "Scripts" sub-tab (see above): the `codemirror` convenience package (exporting `basicSetup` — history, bracket matching, line numbers, the default keymap, baseline keyword/local-variable completion, etc.) plus `@codemirror/lang-javascript`, bundled together via `esbuild --bundle --format=esm`. `@codemirror/autocomplete` is pulled in only transitively (as a dependency of `basicSetup` itself) — tlstap has no completion source of its own layered on top; an earlier attempt at one was removed after it caused a reproducible editor freeze while typing (see `ScriptEditor.js` above). Unlike crypto-js/hash-wasm, this is a real multi-package bundle (upstream ships many small packages with bare `import` specifiers needing actual dependency resolution, not just a UMD-to-ESM reformat). Left **unminified** (esbuild's own per-source-file `// node_modules/...` annotations included) — this was originally minified like `fflate.module.js`, but was de-minified specifically to make it possible to read/step through while chasing the editor-freeze issue referenced above; the size cost (roughly 2x) was judged not worth losing debuggability for actively-investigated code. The vendored file's own header comment has the exact entry-file contents and package versions needed to rebuild after upgrading.
+
+## TODO
+
+> **Delete each bullet below once its work item is resolved; delete this whole section once
+> the list is empty.** These are open follow-ups from a `web/components/` code-duplication
+> review (2026-07-21) — the low-risk items from that review (shared `clamp`/`fmtByteSize`/
+> `fmtDuration`/`dirClass`/`downloadBlob` helpers, `format.js` reuse; `web/direction.js`'s
+> `dirLabel()` plus the `DIR_C2S`/`DIR_S2C` label-string and `DIRNUM_C2S`/`DIRNUM_S2C`
+> numeric-direction constants, now used everywhere a direction was previously compared
+> against or displayed as a bare `0`/`1`/`'C→S'`/`'S→C'` literal; the `useResizableLayout`
+> hook; the shared `ListPanel.js` component factoring `SessionList.js`/`StreamList.js`'s
+> duplicated panel-header/sort-toggle/list-item chrome; and the shared `acquireSaveHandle`/
+> `writeToFileHandle` helpers (`web/download.js`) factoring `ExtractPanel.js`/`MarkersPanel.js`'s
+> duplicated showSaveFilePicker-acquire/createWritable-write logic) are already done; these are
+> the ones deferred as more labor-intensive or higher-risk to land without dedicated testing
+> time.
+
+- **Unify `TrafficView.js` / `CombinedView.js`.** The two implement essentially the same
+  windowed/paginated chunk-buffer logic (generation-guard refs, initial-load effect, refresh
+  top-up effect, `handleScrollEnd`, `buildRows`, `countChunks`, `findChunkBoundaryNearHalf`,
+  `fmtRelTime`) parameterized by `stid`/stream vs. `sgid`/session, with `TrafficView` also
+  bolting on jump-to and the markers panel. Biggest duplication in the directory; needs a
+  shared hook (e.g. `useChunkBuffer({fetch, idField, ...})`) and careful behavioral
+  verification of both scroll directions, refresh, and jump-to.
+- **Extract a `useDismissOnOutsideClick(ref, onClose, {escape})` hook** for the
+  outside-click/Escape dismiss pattern in `HexDump.js`, `TransformPanel.js`, and
+  `TamperDetailPanel.js` (x2: `ctxMenu` and `InsertChunkPopover`). Handle with care —
+  `TamperDetailPanel.js`'s dismiss handlers already carry a documented bug fix
+  (mousedown-vs-contains-check) that a naive generalization could regress.
+- **Consider splitting `TamperDetailPanel.js`** (~620 lines, the largest file in
+  `web/components/`) — it holds a floating popover component (`InsertChunkPopover`), several
+  pure chunk-editing helpers, and the main component's state/handlers all in one file. Not
+  urgent; worth revisiting if it grows further.

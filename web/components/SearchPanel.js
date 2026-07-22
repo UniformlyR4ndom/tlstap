@@ -2,6 +2,8 @@ import { h } from 'preact'
 import { useState } from 'preact/hooks'
 import htm from 'htm'
 import { searchText } from '../api.js'
+import { parseRaw, fmtAsBase64 } from '../format.js'
+import { dirClass, dirLabel, DIR_C2S, DIR_S2C, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -32,13 +34,9 @@ function toUtf16(s, littleEndian) {
     return bytes
 }
 
-function toBase64(bytes) {
-    return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
-}
-
 function decodePattern(pattern, format) {
     switch (format) {
-        case 'ascii':   return new TextEncoder().encode(unescapeAscii(pattern))
+        case 'ascii':   return parseRaw(unescapeAscii(pattern))
         case 'utf16le': return toUtf16(pattern, true)
         case 'utf16be': return toUtf16(pattern, false)
         case 'hex':     return parseHex(pattern)
@@ -59,7 +57,7 @@ const PLACEHOLDERS = {
 export default function SearchPanel({ session, stream, onJump }) {
     const [pattern,     setPattern]     = useState('')
     const [format,      setFormat]      = useState('ascii')
-    const [direction,   setDirection]   = useState('')   // '' = both, '0' = c→s, '1' = s→c
+    const [direction,   setDirection]   = useState('')   // '' = both, '0' = C→S, '1' = S→C
     const [contiguous,  setContiguous]  = useState(false)
     const [streamInput, setStreamInput] = useState('')   // empty = all streams
     const [results,     setResults]     = useState(null) // null = not yet searched
@@ -78,7 +76,7 @@ export default function SearchPanel({ session, stream, onJump }) {
             reqEncoding = 'regex'
         } else {
             try {
-                reqPattern  = toBase64(decodePattern(pattern, format))
+                reqPattern  = fmtAsBase64(decodePattern(pattern, format))
                 reqEncoding = 'base64'
             } catch (err) {
                 setError(err.message)
@@ -128,8 +126,8 @@ export default function SearchPanel({ session, stream, onJump }) {
                 </select>
                 <select class="goto-select" value=${direction} onchange=${e => setDirection(e.target.value)}>
                     <option value="">both</option>
-                    <option value="0">c→s</option>
-                    <option value="1">s→c</option>
+                    <option value=${DIRNUM_C2S}>${DIR_C2S}</option>
+                    <option value=${DIRNUM_S2C}>${DIR_S2C}</option>
                 </select>
                 <label class="search-check">
                     <input type="checkbox" checked=${contiguous} onchange=${e => setContiguous(e.target.checked)} />
@@ -160,8 +158,8 @@ export default function SearchPanel({ session, stream, onJump }) {
                                 <div key=${idx} class="search-result"
                                      onclick=${() => onJump?.({ streamId: m.stream, direction: m.direction, offset: m.offset })}>
                                     <span class="search-result-stream">stream ${m.stream}</span>
-                                    <span class=${'search-result-dir ' + (m.direction === 0 ? 'c2s' : 's2c')}>
-                                        ${m.direction === 0 ? 'c→s' : 's→c'}
+                                    <span class=${'search-result-dir ' + dirClass(m.direction)}>
+                                        ${dirLabel(m.direction)}
                                     </span>
                                     <span class="search-result-off">0x${m.offset.toString(16).padStart(8, '0')}</span>
                                 </div>

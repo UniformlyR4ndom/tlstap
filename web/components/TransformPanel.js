@@ -3,13 +3,12 @@ import { useState, useEffect, useMemo, useRef } from 'preact/hooks'
 import htm from 'htm'
 import ResizeHandle from './ResizeHandle.js'
 import HexEditor from './HexEditor.js'
-import { loadLayout, saveLayoutValue } from '../layout.js'
+import { clamp } from '../layout.js'
+import { useResizableLayout } from '../useResizableLayout.js'
 import { OPERATIONS, ALGORITHM_SECTIONS, sectionPrefix } from '../transforms.js'
-import { fmtAsHex } from '../format.js'
+import { fmtAsHex, fmtAsRaw, parseRaw } from '../format.js'
 
 const html = htm.bind(h)
-
-function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi) }
 
 // Groups a step's body params (i.e. excluding any `inHeader` ones) into render units: params
 // sharing the same `row` key render together on one labeled line (e.g. checksum.js's `init` and
@@ -74,8 +73,8 @@ export default function TransformPanel() {
     // every render. `bytes` is only updated from this buffer when it currently parses as valid
     // hex; resynced from `bytes` whenever the view switches into 'hex'.
     const [hexText, setHexText] = useState('')
-    const [optionsWidth, setOptionsWidth] = useState(() => loadLayout().encdecOptionsWidth)
-    const [inputHeight, setInputHeight] = useState(() => loadLayout().encdecInputHeight)
+    const [optionsWidth, handleOptionsResize] = useResizableLayout('encdecOptionsWidth', { min: 100, max: 400 })
+    const [inputHeight, handleInputResize]    = useResizableLayout('encdecInputHeight', { min: 30, max: 2000 })
     const [steps, setSteps] = useState([])
     const [menuOpen, setMenuOpen] = useState(false)
     const [collapsedSections, setCollapsedSections] = useState(() => new Set(ALGORITHM_SECTIONS.map(s => s.name)))
@@ -210,10 +209,10 @@ export default function TransformPanel() {
     // Decoding is non-fatal (invalid UTF-8 becomes U+FFFD) and only used for display/typing
     // in text mode — it's never written back into `bytes` except via the textarea's own
     // input, so merely viewing lossy text through the toggle doesn't destroy data.
-    const decodedText = useMemo(() => new TextDecoder('utf-8', { fatal: false }).decode(bytes), [bytes])
+    const decodedText = useMemo(() => fmtAsRaw(bytes), [bytes])
     const hasReplacementChars = decodedText.includes('�')
     const decodedOutputText = useMemo(
-        () => outputBytes ? new TextDecoder('utf-8', { fatal: false }).decode(outputBytes) : '',
+        () => outputBytes ? fmtAsRaw(outputBytes) : '',
         [outputBytes]
     )
 
@@ -231,22 +230,6 @@ export default function TransformPanel() {
             document.removeEventListener('keydown', onKey)
         }
     }, [menuOpen])
-
-    function handleOptionsResize(deltaX) {
-        setOptionsWidth(w => {
-            const next = clamp(w + deltaX, 100, 400)
-            saveLayoutValue('encdecOptionsWidth', next)
-            return next
-        })
-    }
-
-    function handleInputResize(deltaY) {
-        setInputHeight(h => {
-            const next = clamp(h + deltaY, 30, 2000)
-            saveLayoutValue('encdecInputHeight', next)
-            return next
-        })
-    }
 
     // `prefix` (from sectionPrefix(), based on the enclosing section/subsection name) is
     // applied only to the step's stored label, not to what's shown here in the menu itself —
@@ -415,7 +398,7 @@ export default function TransformPanel() {
                             placeholder="Input…"
                             spellcheck="false"
                             value=${decodedText}
-                            oninput=${e => setBytes(new TextEncoder().encode(e.target.value))}
+                            oninput=${e => setBytes(parseRaw(e.target.value))}
                             style=${`flex: 0 1 ${inputHeight}px`}
                         />`
                 }
