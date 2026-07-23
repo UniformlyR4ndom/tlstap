@@ -1,15 +1,21 @@
 package tamper
 
 import (
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"tlstap/logging"
 	"tlstap/proxy"
 )
 
@@ -138,10 +144,9 @@ func requireOK(t *testing.T, r replyMsg) {
 	}
 }
 
-// sendCommandOK writes msg to control and asserts the reply acknowledges success. Used
-// for set-mode/release/drop-connection commands that carry no trailing binary frame;
-// commands that do (an edited release) write the binary frame themselves and call
-// readAck directly.
+// sendCommandOK writes msg to control and asserts the reply acknowledges success. Only
+// for commands that carry no trailing binary frame; a command that does (an edited
+// release) must write the binary frame itself and call readAck directly instead.
 func sendCommandOK(t *testing.T, control *websocket.Conn, msg inboundMsg) {
 	t.Helper()
 	writeJSON(t, control, msg)
@@ -210,9 +215,8 @@ type peekReply struct {
 }
 
 // collectPeekReplies reads "pending" (+ its binary frame) messages until "peek-done" or
-// "error", returning whichever terminated the sequence. The new per-direction "peek"
-// always produces at most one "pending" entry (never a loop over several chunk ids, the
-// way the old per-chunk protocol did), but this stays generic over that count.
+// "error", returning whichever terminated the sequence. A "peek" always produces at
+// most one "pending" entry today, but this stays generic over that count.
 func collectPeekReplies(t *testing.T, watch *websocket.Conn) ([]peekReply, [][]byte, *peekReply) {
 	t.Helper()
 	var replies []peekReply
@@ -234,9 +238,8 @@ func collectPeekReplies(t *testing.T, watch *websocket.Conn) ([]peekReply, [][]b
 	}
 }
 
-// recvRelease reads exactly one value off a heldBuffer's release channel (as exposed via
-// ReleaseChannel), the async replacement for what interceptAsync/recvResult used to
-// synthesize around a blocking Intercept() call — Intercept() itself never blocks now.
+// recvRelease reads exactly one value off a heldBuffer's release channel, as exposed via
+// ReleaseChannel.
 func recvRelease(t *testing.T, ch <-chan proxy.ReleasedData) proxy.ReleasedData {
 	t.Helper()
 	select {
@@ -527,7 +530,7 @@ func TestSetMode_ForceReleasesPending(t *testing.T) {
 }
 
 // Direction is derived from comparing SrcEndpoint against the client endpoint recorded
-// on the first ConnectionEstablished call, exactly as dbdump does it.
+// on the first ConnectionEstablished call.
 func TestDirectionDetection(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	up := &proxy.ConnInfo{ConnID: 1, SrcEndpoint: "client:1000", DstEndpoint: "server:443"}
@@ -607,11 +610,9 @@ func TestStreamList_PendingInfo(t *testing.T) {
 	recvRelease(t, ti.ReleaseChannel(info))
 }
 
-// A direction's held buffer can hold more than one chunk at once — the core capability
-// this conversion enables (the old per-chunk protocol could only ever hold one chunk per
-// direction, since a second couldn't even be read off the socket while the first was
-// blocking Intercept()). Releasing both chunks together forwards them as one contiguous
-// blob, and peek's bounds reflect both original chunk boundaries.
+// A direction's held buffer can hold more than one chunk at once. Releasing both chunks
+// together forwards them as one contiguous blob, and peek's bounds reflect both original
+// chunk boundaries.
 func TestHold_MultipleChunksSameDirection(t *testing.T) {
 	ti, wsURL := newTestServerWithConfig(t, TamperConfig{HoldUntilConnected: true})
 	info := fakeConnInfo(1)
@@ -628,7 +629,7 @@ func TestHold_MultipleChunksSameDirection(t *testing.T) {
 	waitForHeldChunks(t, ti, 1, directionC2S, 2)
 
 	watch := dialWatch(t, wsURL, 1)
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionC2S)})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -670,7 +671,7 @@ func TestWatchPeek_Direction(t *testing.T) {
 
 	watch := dialWatch(t, wsURL, 1)
 
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionC2S)})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -679,7 +680,7 @@ func TestWatchPeek_Direction(t *testing.T) {
 		t.Fatalf("unexpected c2s peek result: replies=%+v datas=%q", replies, datas)
 	}
 
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionS2C})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionS2C)})
 	replies, datas, errReply = collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -710,7 +711,7 @@ func TestWatchPeek_OffsetLength(t *testing.T) {
 
 	watch := dialWatch(t, wsURL, 1)
 
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S, Offset: 3, Length: 4})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionC2S), Offset: 3, Length: 4})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -723,7 +724,7 @@ func TestWatchPeek_OffsetLength(t *testing.T) {
 	}
 
 	// Length omitted (0) means "to the end of the buffer".
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S, Offset: 8})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionC2S), Offset: 8})
 	replies, datas, errReply = collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -744,7 +745,22 @@ func TestWatchPeek_InvalidDirection(t *testing.T) {
 	ti.ConnectionEstablished(info)
 
 	watch := dialWatch(t, wsURL, 1)
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: 99})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(99)})
+	replies, _, errReply := collectPeekReplies(t, watch)
+	if errReply == nil {
+		t.Fatalf("expected an error reply, got replies=%+v", replies)
+	}
+}
+
+// Peeking with the "direction" field omitted entirely returns an error rather than
+// silently defaulting to directionC2S.
+func TestWatchPeek_MissingDirection(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	info := fakeConnInfo(1)
+	ti.ConnectionEstablished(info)
+
+	watch := dialWatch(t, wsURL, 1)
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek})
 	replies, _, errReply := collectPeekReplies(t, watch)
 	if errReply == nil {
 		t.Fatalf("expected an error reply, got replies=%+v", replies)
@@ -752,15 +768,14 @@ func TestWatchPeek_InvalidDirection(t *testing.T) {
 }
 
 // Peeking a valid direction with nothing currently held returns a zero-length reply, not
-// an error — unlike the old per-chunk protocol, where an unknown/absent id was always an
-// error, an empty direction is a perfectly normal state (e.g. a watch-mode stream).
+// an error: an empty direction is a perfectly normal state (e.g. a watch-mode stream).
 func TestWatchPeek_EmptyDirection(t *testing.T) {
 	ti, wsURL := newTestServer(t, 0)
 	info := fakeConnInfo(1)
 	ti.ConnectionEstablished(info)
 
 	watch := dialWatch(t, wsURL, 1)
-	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionC2S})
+	writeJSON(t, watch, watchInboundMsg{Type: cmdPeek, Direction: directionPtr(directionC2S)})
 	replies, datas, errReply := collectPeekReplies(t, watch)
 	if errReply != nil {
 		t.Fatalf("unexpected error reply: %+v", errReply)
@@ -920,6 +935,46 @@ func TestRelease_StalePrefixLength_ReturnsError(t *testing.T) {
 	}
 }
 
+// A "release" with edited:true but an invalid action must still consume the promised
+// binary frame and reply with a clean error, rather than leaving the frame unread and
+// desyncing (and silently killing) the control connection.
+func TestRelease_InvalidActionWithEditedFrame_DoesNotDesyncControl(t *testing.T) {
+	ti, wsURL := newTestServer(t, 0)
+	info := fakeConnInfo(1)
+
+	control := dialControl(t, ti, wsURL)
+	ti.ConnectionEstablished(info)
+	var created streamCreatedMsg
+	readJSON(t, control, &created)
+	sendCommandOK(t, control, inboundMsg{Type: cmdSetMode, Conn: u32Ptr(1), Intercepting: boolPtr(true)})
+
+	out, err := ti.Intercept(info, []byte("original"))
+	if err != nil || out != nil {
+		t.Fatalf("expected held (nil, nil), got (%q, %v)", out, err)
+	}
+	var held heldMsg
+	readJSON(t, control, &held)
+
+	writeJSON(t, control, inboundMsg{
+		Type: cmdRelease, Conn: u32Ptr(1), Direction: directionPtr(directionC2S),
+		Edited: boolPtr(true), PrefixLength: len("original"), Bounds: []int{0}, ReleaseChunks: 1, Action: "not-a-real-action",
+	})
+	if err := control.WriteMessage(websocket.BinaryMessage, []byte("edited")); err != nil {
+		t.Fatal(err)
+	}
+	if r := readAck(t, control); r.Type != "error" {
+		t.Fatalf("expected an error reply for an invalid action, got %+v", r)
+	}
+
+	// The control connection must still be usable after the malformed command.
+	writeJSON(t, control, inboundMsg{Type: cmdListStreams})
+	var list streamListMsg
+	readJSON(t, control, &list)
+	if findStreamInfo(&list, 1) == nil {
+		t.Fatal("control connection appears desynced: list-streams failed after the invalid release")
+	}
+}
+
 // drop-connection against an unknown stream returns an error instead of silently
 // no-op'ing.
 func TestDropConnection_UnknownStream_ReturnsError(t *testing.T) {
@@ -964,4 +1019,58 @@ func TestHasPending(t *testing.T) {
 	if ti.HasPending(info) {
 		t.Fatal("expected HasPending false after release")
 	}
+}
+
+// Init assigns i.logFile concurrently with handleLogFileInfo reading it — both must go
+// through logFileMu, or this is a data race under -race.
+func TestLogFile_InitRaceWithHandleLogFileInfo(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "tamper.log")
+	ti, wsURL := newTestServerWithConfig(t, TamperConfig{LogFile: logPath})
+	base := "http" + strings.TrimPrefix(wsURL, "ws") + "/api/i/tamper/log-file"
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := ti.Init(net.TCPAddr{}); err != nil {
+			t.Error(err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			resp := httpDo(t, http.MethodGet, base, nil)
+			resp.Body.Close()
+		}
+	}()
+	wg.Wait()
+	t.Cleanup(func() { ti.Finalize(net.TCPAddr{}) })
+}
+
+// Finalize closes i.logFile concurrently with writeScriptLog writing to it — both must
+// go through logFileMu, or this is a data race (and a use-after-close) under -race.
+func TestLogFile_FinalizeRaceWithWriteScriptLog(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "tamper.log")
+	logger := logging.NewLogger(io.Discard, &slog.HandlerOptions{}, false)
+	ti, err := NewTamperInterceptor(&TamperConfig{LogFile: logPath}, &logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ti.Init(net.TCPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			ti.writeScriptLog("log", "line")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		ti.Finalize(net.TCPAddr{})
+	}()
+	wg.Wait()
 }

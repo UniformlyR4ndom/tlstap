@@ -97,26 +97,7 @@ func (s *scriptStore) Put(name string, content []byte) error {
 	if err := validateScriptName(name); err != nil {
 		return err
 	}
-
-	tmp, err := os.CreateTemp(s.dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, s.path(name)); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicWriteFile(s.dir, s.path(name), content)
 }
 
 func (s *scriptStore) Delete(name string) error {
@@ -127,12 +108,21 @@ func (s *scriptStore) Delete(name string) error {
 }
 
 // ── REST handlers ───────────────────────────────────────────────────────────────────
-// Registered by RegisterRoutes (api.go). Content is transferred as a raw body, not
-// JSON/base64-wrapped, since it's always UTF-8 JS text.
+// Content is transferred as a raw body, not JSON/base64-wrapped, since it's always
+// UTF-8 JS text.
+
+// requireScripts reports whether scripts-dir is configured, writing the standard 501
+// otherwise. Callers should return immediately on false.
+func (i *TamperInterceptor) requireScripts(w http.ResponseWriter) bool {
+	if i.scripts != nil {
+		return true
+	}
+	writeErrorResponse(w, http.StatusNotImplemented, "scripts-dir not configured")
+	return false
+}
 
 func (i *TamperInterceptor) handleScriptsList(w http.ResponseWriter, r *http.Request) {
-	if i.scripts == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "scripts-dir not configured")
+	if !i.requireScripts(w) {
 		return
 	}
 
@@ -145,8 +135,7 @@ func (i *TamperInterceptor) handleScriptsList(w http.ResponseWriter, r *http.Req
 }
 
 func (i *TamperInterceptor) handleScriptGet(w http.ResponseWriter, r *http.Request) {
-	if i.scripts == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "scripts-dir not configured")
+	if !i.requireScripts(w) {
 		return
 	}
 
@@ -164,8 +153,7 @@ func (i *TamperInterceptor) handleScriptGet(w http.ResponseWriter, r *http.Reque
 }
 
 func (i *TamperInterceptor) handleScriptPut(w http.ResponseWriter, r *http.Request) {
-	if i.scripts == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "scripts-dir not configured")
+	if !i.requireScripts(w) {
 		return
 	}
 
@@ -183,8 +171,7 @@ func (i *TamperInterceptor) handleScriptPut(w http.ResponseWriter, r *http.Reque
 }
 
 func (i *TamperInterceptor) handleScriptDelete(w http.ResponseWriter, r *http.Request) {
-	if i.scripts == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "scripts-dir not configured")
+	if !i.requireScripts(w) {
 		return
 	}
 
@@ -198,6 +185,31 @@ func (i *TamperInterceptor) handleScriptDelete(w http.ResponseWriter, r *http.Re
 	}
 	i.sendEvent(scriptUpdatedMsg{Type: msgScriptUpdated, Name: r.PathValue("name")})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// atomicWriteFile creates or overwrites target with content via write-to-temp-file (in
+// tmpDir) + rename, so a concurrent reader can never observe a partial write. tmpDir
+// must already exist.
+func atomicWriteFile(tmpDir, target string, content []byte) error {
+	tmp, err := os.CreateTemp(tmpDir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func writeJSONResponse(w http.ResponseWriter, v any) {

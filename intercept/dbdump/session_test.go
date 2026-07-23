@@ -9,12 +9,15 @@ import (
 
 func newTestInterceptor(t *testing.T) *DbDumpInterceptor {
 	t.Helper()
-	d := NewDbDumpInterceptor(":memory:", false, proxy.ResolvedProxyConfig{Name: "test"}, nil)
+	d, err := NewDbDumpInterceptor(":memory:", false, proxy.ResolvedProxyConfig{Name: "test"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := d.Init(net.TCPAddr{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Finalize(net.TCPAddr{}) })
-	return &d
+	return d
 }
 
 func sessionCount(t *testing.T, d *DbDumpInterceptor) int {

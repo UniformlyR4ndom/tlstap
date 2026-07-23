@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// errOutsidefsRoot is returned by fsStore.resolve when a path, once cleaned, would land
+// errOutsideFsRoot is returned by fsStore.resolve when a path, once cleaned, would land
 // outside the configured root.
 var errOutsideFsRoot = errors.New("path escapes fs-root")
 
@@ -24,25 +24,23 @@ type fsEntry struct {
 	Size int64  `json:"size"`
 }
 
-// fsStore exposes read/write/list access to one host directory (fs-root), scoped to
-// scripts. Unlike scriptStore, names are arbitrary slash-separated paths (files can live
-// in subdirectories), so containment is enforced structurally — see resolve — rather
-// than by restricting the charset of a single path segment. Deliberately does not
-// resolve symlinks: a symlink planted inside fs-root escaping it is a host filesystem
-// concern, not this store's problem to solve.
+// fsStore exposes read/write/list access to one host directory (fs-root). Names are
+// arbitrary slash-separated paths (files can live in subdirectories), so containment is
+// enforced structurally rather than by restricting the charset of a single path segment.
+// Deliberately does not resolve symlinks: a symlink planted inside fs-root escaping it
+// is a host filesystem concern, not this store's problem to solve.
 type fsStore struct {
 	root string // absolute, cleaned
 }
 
-// newFsStore requires dir to already exist and be a directory — unlike scriptStore, this
-// exposes a directory the operator chose, so a typo'd path should fail interceptor
-// construction loudly rather than silently creating one.
+// newFsStore requires dir to already exist and be a directory: this exposes a directory
+// the operator chose, so a typo'd path should fail interceptor construction loudly
+// rather than silently creating one.
 func newFsStore(dir string) (*fsStore, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
-	abs = filepath.Clean(abs)
 
 	fi, err := os.Stat(abs)
 	if err != nil {
@@ -59,9 +57,8 @@ func newFsStore(dir string) (*fsStore, error) {
 // step: prefixing with "/" before cleaning means any leading ".." components are eaten
 // against that synthetic root rather than able to walk above it, so the result can never
 // climb outside relPath's own tree — no symlink resolution needed to make this safe. The
-// suffix check after Join is a second, independent belt-and-suspenders guard against the
-// same class of escape, matching the boundary-aware form used elsewhere in this codebase
-// (not a bare strings.HasPrefix, which would wrongly accept a sibling like
+// suffix check after Join is a second, independent guard against the same class of
+// escape (not a bare strings.HasPrefix, which would wrongly accept a sibling like
 // "<root>-evil").
 func (s *fsStore) resolve(relPath string) (string, error) {
 	clean := path.Clean("/" + relPath)
@@ -104,11 +101,11 @@ func (s *fsStore) Get(relPath string) ([]byte, error) {
 	return os.ReadFile(full)
 }
 
-// Put atomically creates or overwrites a file via write-to-temp-file + rename, mirroring
-// scriptStore.Put — except the temp file lives alongside the target (which may be in a
-// subdirectory of root, not root itself), and missing parent directories are created
-// first, since a script writing to a new subdirectory shouldn't have to create it first
-// via a separate call this store doesn't offer.
+// Put atomically creates or overwrites a file via write-to-temp-file + rename. The temp
+// file lives alongside the target (which may be in a subdirectory of root, not root
+// itself), and missing parent directories are created first, since a script writing to
+// a new subdirectory shouldn't have to create it via a separate call this store doesn't
+// offer.
 func (s *fsStore) Put(relPath string, content []byte) error {
 	full, err := s.resolve(relPath)
 	if err != nil {
@@ -120,37 +117,16 @@ func (s *fsStore) Put(relPath string, content []byte) error {
 		return err
 	}
 
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, full); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicWriteFile(dir, full, content)
 }
 
 // Append adds content to the end of a file, creating it (and any missing parent
 // directories) if it doesn't exist yet. Deliberately not implemented as a client-side
-// Get+concatenate+Put: two scripts appending to the same file around the same time run
-// on independent per-connection goroutines (see CLAUDE.md's "Per-connection event
-// serialization" note), so a read-modify-write from the caller's side would be racy —
-// one append could silently clobber the other. Opening with O_APPEND instead delegates
-// the seek-to-end-and-write to the kernel, which performs it atomically per Write call
-// (the same mechanism the interceptor's own log-file already relies on — see
-// writeScriptLog/Init in tamper.go), so concurrent appends to the same file are safe
-// without any locking of our own.
+// Get+concatenate+Put: two callers appending to the same file around the same time
+// would otherwise race, silently losing one side's data. Opening with O_APPEND instead
+// delegates the seek-to-end-and-write to the kernel, which performs it atomically per
+// Write call, so concurrent appends to the same file are safe without any locking of
+// our own.
 func (s *fsStore) Append(relPath string, content []byte) error {
 	full, err := s.resolve(relPath)
 	if err != nil {
@@ -173,13 +149,21 @@ func (s *fsStore) Append(relPath string, content []byte) error {
 }
 
 // ── REST handlers ───────────────────────────────────────────────────────────────────
-// Registered by RegisterRoutes (api.go). File content is transferred as a raw body
-// (application/octet-stream), unlike scripts' raw-text convention, since fs-root content
-// is arbitrary binary, not always UTF-8 JS.
+// File content is transferred as a raw body (application/octet-stream), since fs-root
+// content is arbitrary binary, not always UTF-8 JS.
+
+// requireFsRoot reports whether fs-root is configured, writing the standard 501
+// otherwise. Callers should return immediately on false.
+func (i *TamperInterceptor) requireFsRoot(w http.ResponseWriter) bool {
+	if i.fsRoot != nil {
+		return true
+	}
+	writeErrorResponse(w, http.StatusNotImplemented, "fs-root not configured")
+	return false
+}
 
 func (i *TamperInterceptor) handleFsList(w http.ResponseWriter, r *http.Request) {
-	if i.fsRoot == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "fs-root not configured")
+	if !i.requireFsRoot(w) {
 		return
 	}
 
@@ -196,8 +180,7 @@ func (i *TamperInterceptor) handleFsList(w http.ResponseWriter, r *http.Request)
 }
 
 func (i *TamperInterceptor) handleFsGet(w http.ResponseWriter, r *http.Request) {
-	if i.fsRoot == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "fs-root not configured")
+	if !i.requireFsRoot(w) {
 		return
 	}
 
@@ -215,8 +198,7 @@ func (i *TamperInterceptor) handleFsGet(w http.ResponseWriter, r *http.Request) 
 }
 
 func (i *TamperInterceptor) handleFsPut(w http.ResponseWriter, r *http.Request) {
-	if i.fsRoot == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "fs-root not configured")
+	if !i.requireFsRoot(w) {
 		return
 	}
 
@@ -237,8 +219,7 @@ func (i *TamperInterceptor) handleFsPut(w http.ResponseWriter, r *http.Request) 
 // the generic "process this at the target resource, non-idempotent" verb, so it's the
 // better fit here despite every other fs-root endpoint being GET/PUT.
 func (i *TamperInterceptor) handleFsAppend(w http.ResponseWriter, r *http.Request) {
-	if i.fsRoot == nil {
-		writeErrorResponse(w, http.StatusNotImplemented, "fs-root not configured")
+	if !i.requireFsRoot(w) {
 		return
 	}
 

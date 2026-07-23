@@ -59,8 +59,8 @@ type heldMsg struct {
 }
 
 // pendingInfo summarizes one direction's currently-held buffer as a chunk count + byte
-// length — chunk boundaries themselves aren't reported here (see heldMsg/"peek" for
-// those); embedded in streamInfo so "list-streams" alone is a full resync.
+// length — chunk boundaries aren't reported here; embedded in streamInfo so
+// "list-streams" alone is a full resync.
 type pendingInfo struct {
 	Direction direction `json:"direction"`
 	Chunks    int       `json:"chunks"`
@@ -104,7 +104,7 @@ type errorMsg struct {
 // ── Inbound: control channel ────────────────────────────────────────────────────────
 
 // inboundMsg is a flexible container for every control-channel command, discriminated by
-// Type; only the fields relevant to that Type are populated (see the per-field comments).
+// Type; only the fields relevant to that Type are populated.
 //
 // A "release" with Edited=true must be immediately followed by a binary frame carrying
 // the replacement bytes for the buffer's first PrefixLength bytes; Edited=false releases
@@ -132,11 +132,9 @@ type inboundMsg struct {
 	ReleaseChunks int    `json:"release_chunks,omitempty"`
 	Action        action `json:"action,omitempty"`
 
-	// script-log: one already-formatted line from the browser's own script log panel
-	// (see TamperView.js's onLog), pushed here purely for optional server-side
-	// persistence (see TamperInterceptor.writeScriptLog) — Level is "log" or "error";
-	// Text may itself span multiple lines (a ctx.log call's connection-summary prefix
-	// plus its formatted args).
+	// script-log: one already-formatted line, pushed here purely for optional
+	// server-side persistence. Level is "log" or "error"; Text may itself span
+	// multiple lines.
 	Level string `json:"level,omitempty"`
 	Text  string `json:"text,omitempty"`
 }
@@ -144,9 +142,8 @@ type inboundMsg struct {
 // ── Outbound: watch channel ─────────────────────────────────────────────────────────
 
 // watchFrameMsg precedes a binary frame with the mirrored chunk's bytes, sent for every
-// chunk actually forwarded on the stream (live mirror; see pendingChunkMsg for reading
-// currently-held, not-yet-forwarded bytes instead). No Type field: a /watch connection
-// has exactly one unsolicited shape, so there's nothing to discriminate.
+// chunk actually forwarded on the stream. No Type field: a /watch connection has
+// exactly one unsolicited shape, so there's nothing to discriminate.
 type watchFrameMsg struct {
 	Direction direction `json:"direction"`
 	Time      int64     `json:"time"`
@@ -175,10 +172,11 @@ type peekDoneMsg struct {
 // ── Inbound: watch channel ──────────────────────────────────────────────────────────
 
 // watchInboundMsg is the one command a /watch client may send: read the bytes of one
-// direction's currently-held buffer (the only way to read held bytes at all — see heldMsg).
+// direction's currently-held buffer. Direction is a pointer so a request that omits it
+// is rejected rather than silently defaulting to directionC2S.
 type watchInboundMsg struct {
-	Type      cmdType   `json:"type"`
-	Direction direction `json:"direction"`
-	Offset    int64     `json:"offset,omitempty"`
-	Length    int64     `json:"length,omitempty"` // 0 = to the end of the buffer
+	Type      cmdType    `json:"type"`
+	Direction *direction `json:"direction"`
+	Offset    int64      `json:"offset,omitempty"`
+	Length    int64      `json:"length,omitempty"` // 0 = to the end of the buffer
 }

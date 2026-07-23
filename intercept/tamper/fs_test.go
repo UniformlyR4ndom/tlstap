@@ -231,9 +231,7 @@ func TestFsStore_Append(t *testing.T) {
 
 // TestFsStore_Append_ConcurrentSafe exercises the actual reason Append opens the file
 // with O_APPEND instead of being implemented as a client-side Get+concatenate+Put: many
-// concurrent appends (as would happen from different connections' independent script
-// handlers — see CLAUDE.md's "Per-connection event serialization" note) must not lose
-// or interleave-corrupt any writer's data.
+// concurrent appends must not lose or interleave-corrupt any writer's data.
 func TestFsStore_Append_ConcurrentSafe(t *testing.T) {
 	dir := t.TempDir()
 	s, err := newFsStore(dir)

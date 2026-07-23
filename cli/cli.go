@@ -357,8 +357,11 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 			return nil, err
 		}
 
-		i := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, *pConfig, logger)
-		interceptor = &i
+		i, err := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, *pConfig, logger)
+		if err != nil {
+			return nil, err
+		}
+		interceptor = i
 	case InterceptorTamper:
 		var tamperConf tamper.TamperConfig
 		if err := json.Unmarshal(iConfig.ArgsJson, &tamperConf); err != nil {

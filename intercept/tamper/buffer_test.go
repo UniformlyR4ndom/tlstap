@@ -260,10 +260,10 @@ func TestHeldBuffer_ReleaseAll(t *testing.T) {
 	}
 }
 
-// TestHeldBuffer_ConcurrentAppendAndReleaseAll is the race scenario the onTimeout/releaseAll split
-// was designed to make safe: one goroutine keeps appending while another keeps calling
-// releaseAll(), and every value that comes out on relCh must be a well-formed, non-empty prefix —
-// run with -race to catch any data race, not just logical corruption.
+// TestHeldBuffer_ConcurrentAppendAndReleaseAll checks that one goroutine appending while
+// another keeps calling releaseAll() never corrupts the buffer: every value that comes
+// out on relCh must be a well-formed, non-empty prefix — run with -race to catch any
+// data race, not just logical corruption.
 func TestHeldBuffer_ConcurrentAppendAndReleaseAll(t *testing.T) {
 	b := newHeldBuffer(0)
 	const n = 500
@@ -342,8 +342,8 @@ func TestHeldBuffer_Timeout_AutoReleasesAll(t *testing.T) {
 
 func TestHeldBuffer_Timeout_ResetOnAppend(t *testing.T) {
 	// Generous margins: each check-then-wait cycle below costs up to ~150ms (100ms sleep +
-	// expectNoRelease's own 50ms wait), well under the 300ms timeout, so there's no risk of the
-	// timer firing mid-check the way a tighter margin did before.
+	// expectNoRelease's own 50ms wait), well under the 300ms timeout, so there's no risk of
+	// the timer firing mid-check.
 	b := newHeldBuffer(300 * time.Millisecond)
 	b.appendChunk([]byte("a"))
 

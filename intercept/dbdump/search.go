@@ -3,10 +3,10 @@ package dbdump
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 )
 
 const searchBatchSize = 1 << 20 // 1 MB
@@ -65,18 +65,16 @@ type chunkPos struct {
 // within batchBuf, not counting any prepended overlap). The posns slice must be
 // sorted by bufStart ascending.
 func findStidForPos(posns []chunkPos, batchPos int) int64 {
-	for j := len(posns) - 1; j >= 0; j-- {
-		if posns[j].bufStart <= batchPos {
-			return posns[j].stid
-		}
+	idx := sort.Search(len(posns), func(j int) bool { return posns[j].bufStart > batchPos })
+	if idx == 0 {
+		return posns[0].stid
 	}
-	return posns[0].stid
+	return posns[idx-1].stid
 }
 
 func (i *DbDumpInterceptor) handleSearchText(w http.ResponseWriter, r *http.Request) {
 	var req searchTextRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Pattern == "" {

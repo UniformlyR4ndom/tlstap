@@ -71,8 +71,7 @@ func (i *DbDumpInterceptor) handleStreams(w http.ResponseWriter, r *http.Request
 	var req struct {
 		SessionID int64 `json:"session"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -125,8 +124,7 @@ func (i *DbDumpInterceptor) handleChunk(w http.ResponseWriter, r *http.Request) 
 		Direction int     `json:"direction"`
 		Chunks    []int64 `json:"chunks"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -195,8 +193,7 @@ func (i *DbDumpInterceptor) handleChunkList(w http.ResponseWriter, r *http.Reque
 		Session int64 `json:"session"`
 		Stream  int64 `json:"stream"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -252,8 +249,7 @@ func (i *DbDumpInterceptor) handleChunkStid(w http.ResponseWriter, r *http.Reque
 		Direction int   `json:"direction"`
 		ID        int64 `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -280,8 +276,7 @@ func (i *DbDumpInterceptor) handleByteStid(w http.ResponseWriter, r *http.Reques
 		Direction int   `json:"direction"`
 		Offset    int64 `json:"offset"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -332,15 +327,7 @@ func (i *DbDumpInterceptor) streamChunksByStid(conn *websocket.Conn, session, st
 		q += ` LIMIT ?`
 		args = append(args, n)
 	}
-	rows, err := i.db.Query(q, args...)
-	if err != nil {
-		msg, _ := json.Marshal(map[string]string{"error": err.Error()})
-		conn.WriteMessage(websocket.TextMessage, msg)
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
+	return i.streamRows(conn, q, args, func(rows *sql.Rows) error {
 		var stid, chunkID, offset, ts int64
 		var direction int
 		var data []byte
@@ -357,16 +344,8 @@ func (i *DbDumpInterceptor) streamChunksByStid(conn *websocket.Conn, session, st
 		if err := conn.WriteMessage(websocket.TextMessage, meta); err != nil {
 			return err
 		}
-		if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-			return err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	done, _ := json.Marshal(struct{ Done bool `json:"done"` }{true})
-	return conn.WriteMessage(websocket.TextMessage, done)
+		return conn.WriteMessage(websocket.BinaryMessage, data)
+	})
 }
 
 func (i *DbDumpInterceptor) handleSgidStream(w http.ResponseWriter, r *http.Request) {
@@ -399,15 +378,7 @@ func (i *DbDumpInterceptor) streamChunksBySgid(conn *websocket.Conn, session, st
 		q += ` LIMIT ?`
 		args = append(args, n)
 	}
-	rows, err := i.db.Query(q, args...)
-	if err != nil {
-		msg, _ := json.Marshal(map[string]string{"error": err.Error()})
-		conn.WriteMessage(websocket.TextMessage, msg)
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
+	return i.streamRows(conn, q, args, func(rows *sql.Rows) error {
 		var sgid, stream, chunkID, offset, ts int64
 		var direction int
 		var data []byte
@@ -425,7 +396,23 @@ func (i *DbDumpInterceptor) streamChunksBySgid(conn *websocket.Conn, session, st
 		if err := conn.WriteMessage(websocket.TextMessage, meta); err != nil {
 			return err
 		}
-		if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		return conn.WriteMessage(websocket.BinaryMessage, data)
+	})
+}
+
+// streamRows writes an error frame only for a query failure; an emit error
+// (scan/write) is returned without one, since a frame may already be mid-write.
+func (i *DbDumpInterceptor) streamRows(conn *websocket.Conn, query string, args []any, emit func(*sql.Rows) error) error {
+	rows, err := i.db.Query(query, args...)
+	if err != nil {
+		msg, _ := json.Marshal(map[string]string{"error": err.Error()})
+		conn.WriteMessage(websocket.TextMessage, msg)
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		if err := emit(rows); err != nil {
 			return err
 		}
 	}
@@ -437,6 +424,14 @@ func (i *DbDumpInterceptor) streamChunksBySgid(conn *websocket.Conn, session, st
 		Done bool `json:"done"`
 	}{true})
 	return conn.WriteMessage(websocket.TextMessage, done)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

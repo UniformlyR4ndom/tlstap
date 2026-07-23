@@ -22,21 +22,12 @@ const (
 	directionS2C direction = 1 // server -> client
 )
 
-// valid reports whether d is one of the two legal direction values — every place a
-// direction arrives off the wire (release/drop-connection/peek) needs this same check.
+// valid reports whether d is one of the two legal direction values.
 func (d direction) valid() bool {
 	return d == directionC2S || d == directionS2C
 }
 
-// action is the "action" field of a "release" command — what to do with the bytes being
-// released. Unlike the old per-chunk protocol, dropping the connection is its own command
-// (see "drop-connection" in protocol.go), not a value of this type, since it isn't
-// parameterized by a buffer prefix the way forward/drop are.
-//
-// Deliberately a separate type from buffer.go's releaseAct, which is iota-based and used
-// internally by heldBuffer: buffer.go is protocol-agnostic and independently unit-tested,
-// so it never sees these wire string values directly — handleRelease is what translates
-// one into the other.
+// action is the "action" field of a "release" command.
 type action string
 
 const (
@@ -56,23 +47,20 @@ type TamperConfig struct {
 	// client attaching after traffic has already started flowing.
 	HoldUntilConnected bool `json:"hold-until-connected"`
 
-	// Directory user-editable/CLI-pushed scripts are stored in and served from (see
-	// scripts.go). Empty disables the scripts feature entirely — the REST endpoints
-	// still exist but reject every request with 501, rather than silently defaulting to
-	// some implicit directory.
+	// Directory user-editable/CLI-pushed scripts are stored in and served from. Empty
+	// disables the scripts feature entirely — the REST endpoints still exist but reject
+	// every request with 501, rather than silently defaulting to some implicit directory.
 	ScriptsDir string `json:"scripts-dir"`
 
-	// Directory scripts get read/write/list access to, via the /fs/* REST endpoints (see
-	// fs.go). Empty disables the feature entirely — the REST endpoints still exist but
-	// reject every request with 501. Unlike ScriptsDir, this must already exist: it
-	// exposes a directory the operator chose (e.g. test fixtures), so a typo'd path
-	// should fail interceptor construction loudly rather than silently creating one.
+	// Directory scripts get read/write/list access to via REST. Empty disables the
+	// feature entirely, same as ScriptsDir. Unlike ScriptsDir, this must already exist:
+	// it exposes a directory the operator chose (e.g. test fixtures), so a typo'd path
+	// fails interceptor construction loudly rather than silently creating one.
 	FsRoot string `json:"fs-root"`
 
 	// Path a connected control client's script log (tamper.log/ctx.log calls) is
-	// persisted to, in addition to the browser's own in-memory log panel. Empty
-	// disables persistence entirely. Always appended to (existing content is kept);
-	// there is no truncate option, unlike PcapConfig/DbDumpConfig's file args.
+	// persisted to, in addition to the browser's own in-memory log panel. Empty disables
+	// persistence entirely. Always appended to; there is no truncate option.
 	LogFile string `json:"log-file"`
 }
 
@@ -89,10 +77,9 @@ type watcher struct {
 	ch   chan mirrorFrame // buffered; Intercept() sends non-blocking, drops on overflow
 	stop chan struct{}    // closed exactly once to tear down the write loop; never sent to
 
-	// writeMu serializes every write to conn: both watcherWriteLoop's mirror frames and
-	// handlePeek's replies write to the same connection from different goroutines, and
-	// gorilla websocket does not support concurrent writers (same reason
-	// TamperInterceptor.controlWriteMu exists for the control connection).
+	// writeMu serializes every write to conn: mirror frames and peek replies write to
+	// the same connection from different goroutines, and gorilla websocket does not
+	// support concurrent writers.
 	writeMu sync.Mutex
 }
 
@@ -118,7 +105,7 @@ type streamState struct {
 }
 
 // directionOf classifies which direction info belongs to, by comparing against the client
-// endpoint recorded on first sight of the stream — same technique dbdump uses.
+// endpoint recorded on first sight of the stream.
 func directionOf(st *streamState, info *proxy.ConnInfo) direction {
 	if info.SrcEndpoint == st.clientEndpoint {
 		return directionC2S
@@ -149,12 +136,10 @@ type TamperInterceptor struct {
 
 	controlWriteMu sync.Mutex
 
-	// logFile persists a connected control client's script log (see handleScriptLog).
-	// Opened in Init/closed in Finalize (unlike scripts, which has to be ready the
-	// moment RegisterRoutes runs — see NewTamperInterceptor's doc comment); nil if
-	// LogFile wasn't configured. logFileMu is its own lock, held only around the
-	// actual file write, and never together with mu/controlWriteMu — same "no I/O
-	// while holding the state lock" discipline as the rest of the codebase.
+	// logFile persists a connected control client's script log. Opened in Init and
+	// closed in Finalize; nil if LogFile wasn't configured. logFileMu guards every
+	// read/write of logFile itself (not just the file write), and is never held
+	// together with mu/controlWriteMu.
 	logFilePath string
 	logFile     *os.File
 	logFileMu   sync.Mutex
@@ -209,11 +194,15 @@ func (i *TamperInterceptor) Init(addr net.TCPAddr) error {
 	if err != nil {
 		return err
 	}
+	i.logFileMu.Lock()
 	i.logFile = f
+	i.logFileMu.Unlock()
 	return nil
 }
 
 func (i *TamperInterceptor) Finalize(addr net.TCPAddr) {
+	i.logFileMu.Lock()
+	defer i.logFileMu.Unlock()
 	if i.logFile != nil {
 		i.logFile.Close()
 	}
@@ -224,9 +213,8 @@ func (i *TamperInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
 }
 
 // ConnectionEstablished is called once per direction for "any" interceptors; the first
-// call arrives with src=client, dst=server, which is what we record. This mirrors
-// dbdump's exact technique for deriving the client endpoint used for direction
-// detection in Intercept (see intercept/dbdump/dbdump.go).
+// call arrives with src=client, dst=server, which is what we record as the stream's
+// client endpoint for later direction detection.
 func (i *TamperInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	i.mu.Lock()
 	_, exists := i.streams[info.ConnID]
@@ -253,9 +241,8 @@ func (i *TamperInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	return nil
 }
 
-// ConnectionTerminated is called once per direction; the exists-check guard (mirroring
-// dbdump's INSERT OR IGNORE pattern) ensures only the first call does the actual
-// cleanup and notification.
+// ConnectionTerminated is called once per direction; the exists-check guard ensures
+// only the first call does the actual cleanup and notification.
 func (i *TamperInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	i.mu.Lock()
 	st, exists := i.streams[info.ConnID]
@@ -285,10 +272,10 @@ func (i *TamperInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 	return nil
 }
 
-// Intercept never blocks: when a chunk needs to be held, it's appended to that direction's
-// heldBuffer and Intercept returns immediately with (nil, nil). Release — forwarding, dropping,
-// or aborting the connection — happens later, asynchronously, via ConnHandler reading
-// ReleaseChannel (see proxy.BufferingInterceptor and HasPending/ReleaseChannel below).
+// Intercept never blocks: when a chunk needs to be held, it's appended to that
+// direction's heldBuffer and Intercept returns immediately with (nil, nil). Release —
+// forwarding, dropping, or aborting the connection — happens later, asynchronously, via
+// ConnHandler reading ReleaseChannel.
 func (i *TamperInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {
 	// data is a view into the proxy's shared read buffer; copy it before the caller's
 	// next Read() can overwrite it (both for mirroring and for a potential hold).
@@ -392,8 +379,8 @@ func (i *TamperInterceptor) setMode(connID uint32, intercepting bool) bool {
 }
 
 // detachWatcher removes a watcher from its stream and tears down its write loop.
-// Guarded so that concurrent callers (the /watch handler's own read-loop exit, and
-// ConnectionTerminated) can never both try to close the same watcher's stop channel.
+// Guarded so that two concurrent callers can never both try to close the same watcher's
+// stop channel.
 func (i *TamperInterceptor) detachWatcher(st *streamState, conn *websocket.Conn) {
 	i.mu.Lock()
 	w, existed := st.watchers[conn]
@@ -408,18 +395,10 @@ func (i *TamperInterceptor) detachWatcher(st *streamState, conn *websocket.Conn)
 }
 
 // writeScriptLog appends one script-log line to logFile, if configured; a no-op
-// otherwise. text is the already-formatted line as the browser's log panel rendered it
-// (ctx.log's connection-summary prefix and formatted args already folded in, possibly
-// spanning multiple lines) — this deliberately reuses that formatting rather than
-// reconstructing it from raw args server-side. The timestamp is the server's own
-// receipt time, not anything embedded in text: a plain tamper.log call carries no
-// timestamp of its own at all, so without this, half the persisted lines would be
-// untimed.
+// otherwise. text is already fully formatted (prefix and args folded in, possibly
+// multi-line) and is persisted as-is. The timestamp is the server's own receipt time,
+// not anything embedded in text — a plain log call carries no timestamp of its own.
 func (i *TamperInterceptor) writeScriptLog(level, text string) {
-	if i.logFile == nil {
-		return
-	}
-
 	header := "[" + time.Now().Format("2006-01-02 15:04:05.000") + "]"
 	if level == "error" {
 		header += " [ERROR]"
@@ -439,6 +418,9 @@ func (i *TamperInterceptor) writeScriptLog(level, text string) {
 
 	i.logFileMu.Lock()
 	defer i.logFileMu.Unlock()
+	if i.logFile == nil {
+		return
+	}
 	if _, err := i.logFile.WriteString(b.String()); err != nil {
 		i.logger.Warn("tamper: failed to write script log: %v", err)
 	}

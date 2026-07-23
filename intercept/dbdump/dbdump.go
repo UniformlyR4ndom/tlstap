@@ -135,34 +135,27 @@ type DbDumpInterceptor struct {
 	logger *logging.Logger
 }
 
-func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) DbDumpInterceptor {
-	return DbDumpInterceptor{
-		filePath:        path,
-		truncate:        truncate,
-		proxyConfig:     proxyConfig,
-		clientEndpoints: make(map[uint32]string),
-		chunkStates:     make(map[chunkKey]chunkState),
-		streamNextSTID:  make(map[uint32]int64),
-		logger:          logger,
-	}
-}
-
-func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
-	if i.truncate {
-		_ = os.Remove(i.filePath)
+// NewDbDumpInterceptor opens (creating if needed) the SQLite file at path and
+// ensures its schema exists. Done here rather than in Init so that RegisterRoutes'
+// API handlers, wired up synchronously right after this returns, never see a nil
+// or partially-schema'd i.db — Init itself runs later, asynchronously, from the
+// proxy's own start goroutine. No session/stream/chunk row is written here; that
+// stays deferred to the first Intercept call (see ensureSession).
+func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) (*DbDumpInterceptor, error) {
+	if truncate {
+		_ = os.Remove(path)
 	}
 
-	db, err := sql.Open("sqlite", i.filePath)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Serialize all writes through a single connection to avoid SQLite locking errors.
 	db.SetMaxOpenConns(1)
-	i.db = db
 
 	if _, err = db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err = db.Exec(`
@@ -172,7 +165,7 @@ func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 			config TEXT    NOT NULL
 		)
 	`); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err = db.Exec(`
@@ -186,7 +179,7 @@ func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 			PRIMARY KEY (session, id)
 		)
 	`); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err = db.Exec(`
@@ -203,21 +196,34 @@ func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 			PRIMARY KEY (session, stream, direction, id)
 		)
 	`); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err = db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_chunks_sgid ON chunks (session, sgid)
 	`); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err = db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_chunks_stid ON chunks (session, stream, stid)
 	`); err != nil {
-		return err
+		return nil, err
 	}
 
+	return &DbDumpInterceptor{
+		filePath:        path,
+		truncate:        truncate,
+		proxyConfig:     proxyConfig,
+		db:              db,
+		clientEndpoints: make(map[uint32]string),
+		chunkStates:     make(map[chunkKey]chunkState),
+		streamNextSTID:  make(map[uint32]int64),
+		logger:          logger,
+	}, nil
+}
+
+func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 	cfgJSON, err := i.marshalConfig()
 	if err != nil {
 		return err
@@ -227,8 +233,6 @@ func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {
 	i.sessionStart = time.Now().UnixMilli()
 	i.pendingConfig = cfgJSON
 
-	// cond must be initialised here (not in NewDbDumpInterceptor) so it points to
-	// the final address of mu rather than a field of a temporary value copy.
 	i.cond = sync.NewCond(&i.mu)
 	i.flushCh = make(chan struct{}, 1)
 	i.stopCh = make(chan struct{})
@@ -280,16 +284,17 @@ func (i *DbDumpInterceptor) ensureSession() error {
 			return
 		}
 
-		// Flush pending stream rows while holding mu so that concurrent
-		// ConnectionEstablished / ConnectionTerminated calls see a consistent
-		// sessionCreated state only after all rows are in the DB.
+		// Flush pending stream rows while holding mu so that concurrent callers see
+		// a consistent sessionCreated state only after all rows are in the DB.
 		i.mu.Lock()
 		defer i.mu.Unlock()
 		for _, ps := range i.pendingStreams {
-			i.db.Exec(
+			if _, err := i.db.Exec(
 				`INSERT OR IGNORE INTO stream (id, session, src, dst, start) VALUES (?, ?, ?, ?, ?)`,
 				ps.id, id, ps.src, ps.dst, ps.at,
-			)
+			); err != nil {
+				i.logger.Error("dbdump: flush pending stream %d: %v", ps.id, err)
+			}
 		}
 		i.pendingStreams = nil
 		i.sessionID = id

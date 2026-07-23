@@ -33,18 +33,20 @@ func (i *TamperInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 }
 
 // logFileInfoResponse is the reply to GET .../log-file — static for the interceptor's
-// whole lifetime (set once in Init), so a plain REST GET is enough; no push event is
-// needed the way script-updated exists for the scripts store.
+// whole lifetime, so a plain REST GET is enough; no push event needed.
 type logFileInfoResponse struct {
 	Enabled  bool   `json:"enabled"`
 	Filename string `json:"filename"` // basename only (not the full configured path); "" if !Enabled
 }
 
 // handleLogFileInfo reports whether a script log file is configured, and its display
-// name, so the frontend can show "Logged to <name>" in place of the manual Download
-// button (see TamperScriptsPanel.js) — see writeScriptLog for the actual persistence.
+// name, so the frontend can show "Logged to <name>" in place of a manual download button.
 func (i *TamperInterceptor) handleLogFileInfo(w http.ResponseWriter, r *http.Request) {
-	resp := logFileInfoResponse{Enabled: i.logFile != nil}
+	i.logFileMu.Lock()
+	enabled := i.logFile != nil
+	i.logFileMu.Unlock()
+
+	resp := logFileInfoResponse{Enabled: enabled}
 	if resp.Enabled {
 		resp.Filename = filepath.Base(i.logFilePath)
 	}
@@ -80,9 +82,8 @@ func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request
 		}
 		i.mu.Unlock()
 
-		// Nothing blocks waiting for the control connection anymore (Intercept never blocks),
-		// so unlike before, releasing everything on disconnect has to be done explicitly here
-		// rather than falling out of every held call waking on a closed controlDone channel.
+		// Intercept never blocks waiting on the control connection, so releasing
+		// everything held has to happen explicitly here on disconnect.
 		for _, st := range streams {
 			st.held[directionC2S].releaseAll()
 			st.held[directionS2C].releaseAll()
@@ -135,9 +136,9 @@ func (i *TamperInterceptor) handleControl(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// lookupHeld resolves (conn, direction) from an inboundMsg to a *heldBuffer, sending conn the
-// appropriate error and returning nil if either field is missing/invalid or the stream is unknown.
-// Shared by handleRelease and handleDropConnection, which both need exactly this lookup.
+// lookupHeld resolves (conn, direction) from an inboundMsg to a *heldBuffer, sending conn
+// the appropriate error and returning nil if either field is missing/invalid or the
+// stream is unknown.
 func (i *TamperInterceptor) lookupHeld(conn *websocket.Conn, msg inboundMsg, command string) *heldBuffer {
 	if msg.Conn == nil || msg.Direction == nil {
 		i.sendEventTo(conn, errorMsg{Type: msgError, Message: command + " requires conn and direction"})
@@ -160,25 +161,14 @@ func (i *TamperInterceptor) lookupHeld(conn *websocket.Conn, msg inboundMsg, com
 	return st.held[dir]
 }
 
-// handleRelease implements the "release" command: an optional edit (Edited=true) of the buffer's
-// first PrefixLength bytes, combined with releasing the resulting buffer's first ReleaseChunks
-// chunks — see performAction and inboundMsg's doc comment for the exact semantics.
+// handleRelease implements the "release" command: an optional edit (Edited=true) of the
+// buffer's first PrefixLength bytes, combined with releasing the resulting buffer's
+// first ReleaseChunks chunks.
 func (i *TamperInterceptor) handleRelease(conn *websocket.Conn, msg inboundMsg) {
-	if msg.Action == "" {
-		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "release requires action"})
-		return
-	}
-	var act releaseAct
-	switch msg.Action {
-	case actionForward:
-		act = actForward
-	case actionDrop:
-		act = actDrop
-	default:
-		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "invalid action"})
-		return
-	}
-
+	// The binary frame (if edited) is always consumed first, before any other
+	// validation: a client that set edited:true has already committed to sending it, so
+	// bailing out early here would leave it unread and desync the next ReadJSON call in
+	// handleControl's loop, silently tearing down the whole control connection.
 	edited := msg.Edited != nil && *msg.Edited
 	var newData []byte
 	prefixLen := 0
@@ -195,6 +185,21 @@ func (i *TamperInterceptor) handleRelease(conn *websocket.Conn, msg inboundMsg) 
 		newData = data
 		prefixLen = msg.PrefixLength
 		newBounds = msg.Bounds
+	}
+
+	if msg.Action == "" {
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "release requires action"})
+		return
+	}
+	var act releaseAct
+	switch msg.Action {
+	case actionForward:
+		act = actForward
+	case actionDrop:
+		act = actDrop
+	default:
+		i.sendEventTo(conn, errorMsg{Type: msgError, Message: "invalid action"})
+		return
 	}
 
 	buf := i.lookupHeld(conn, msg, "release")
@@ -297,18 +302,19 @@ func watcherWriteLoop(w *watcher) {
 	}
 }
 
-// handlePeek replies to a "peek" command with a (possibly sliced) snapshot of one direction's
-// held buffer, terminated by a peekDoneMsg. This is the only way to read held bytes — "held" on
-// the control channel is metadata-only. Unlike the old per-chunk protocol, an empty buffer isn't
-// an error: a direction can legitimately have nothing held (e.g. the stream is in watch mode), so
-// the reply is just a zero-length one.
+// handlePeek replies to a "peek" command with a (possibly sliced) snapshot of one
+// direction's held buffer, terminated by a peekDoneMsg. This is the only way to read
+// held bytes — "held" on the control channel is metadata-only. An empty buffer isn't an
+// error: a direction can legitimately have nothing held (e.g. the stream is in watch
+// mode), so the reply is just a zero-length one.
 func (i *TamperInterceptor) handlePeek(st *streamState, w *watcher, msg watchInboundMsg) {
-	if !msg.Direction.valid() {
+	if msg.Direction == nil || !msg.Direction.valid() {
 		w.writeJSON(errorMsg{Type: msgError, Message: "invalid direction"})
 		return
 	}
+	dir := *msg.Direction
 
-	data, bounds, lastActivity := st.held[msg.Direction].snapshot()
+	data, bounds, lastActivity := st.held[dir].snapshot()
 
 	offset := msg.Offset
 	if offset < 0 {
@@ -325,7 +331,7 @@ func (i *TamperInterceptor) handlePeek(st *streamState, w *watcher, msg watchInb
 
 	meta := pendingChunkMsg{
 		Type:        msgPending,
-		Direction:   msg.Direction,
+		Direction:   dir,
 		Time:        lastActivity,
 		Offset:      offset,
 		Length:      len(slice),
@@ -358,27 +364,18 @@ func (i *TamperInterceptor) sendEventTo(conn *websocket.Conn, msg any) {
 	conn.WriteJSON(msg)
 }
 
-// sendHeld announces that a new chunk was appended to one direction's held buffer. It carries only
-// that chunk's own metadata — the bytes are fetched on demand via "peek" on that stream's /watch
-// connection (see protocol.go).
+// sendHeld announces that a new chunk was appended to one direction's held buffer. It
+// carries only that chunk's own metadata — the bytes are fetched on demand via "peek"
+// on that stream's /watch connection.
 func (i *TamperInterceptor) sendHeld(connID uint32, dir direction, offset int, length int) {
-	i.mu.Lock()
-	conn := i.control
-	i.mu.Unlock()
-	if conn == nil {
-		return
-	}
-
-	meta := heldMsg{
+	i.sendEvent(heldMsg{
 		Type:      msgHeld,
 		Conn:      connID,
 		Direction: dir,
 		Offset:    offset,
 		Length:    length,
 		Time:      time.Now().UnixMilli(),
-	}
-
-	i.sendEventTo(conn, meta)
+	})
 }
 
 func (i *TamperInterceptor) sendStreamList() {
