@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"math"
 	"os"
+	"regexp"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -219,6 +220,32 @@ func TestSearchContiguous_CrossBatchMatch(t *testing.T) {
 		t.Fatalf("expected offset %d, got %d", wantOff, ms[0].Offset)
 	}
 	// 'H' is in the big chunk (stid=20)
+	if ms[0].Stid != 20 {
+		t.Fatalf("expected stid 20, got %d", ms[0].Stid)
+	}
+}
+
+func TestSearchContiguous_RegexCrossBatchWithinOverlap(t *testing.T) {
+	d := setupDB(t)
+	// Split "HELLO" 3 bytes before the batch boundary — well within regexOverlapSize
+	// (4 KB) of it, so the fixed regex overlap should still catch it.
+	bigData := make([]byte, searchBatchSize)
+	copy(bigData[searchBatchSize-3:], []byte("HEL"))
+	insertChunk(t, d.db, 1, 1, 0, 0, 0, 20, bigData)
+	insertChunk(t, d.db, 1, 1, 0, 1, int64(searchBatchSize), 21, []byte("LO_world"))
+
+	re := regexp.MustCompile("HELLO")
+	ms, err := d.searchContiguous(1, 1, 0, regexFinder(re), regexOverlapSize, 0, math.MaxInt64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 1 {
+		t.Fatalf("expected 1 cross-batch match, got %d: %v", len(ms), ms)
+	}
+	wantOff := int64(searchBatchSize - 3)
+	if ms[0].Offset != wantOff {
+		t.Fatalf("expected offset %d, got %d", wantOff, ms[0].Offset)
+	}
 	if ms[0].Stid != 20 {
 		t.Fatalf("expected stid 20, got %d", ms[0].Stid)
 	}

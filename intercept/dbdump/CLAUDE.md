@@ -110,8 +110,8 @@ Done signal: `{"done":true}`
   "contiguous": bool    // optional; if true, chunks are concatenated before searching
 }
 ```
-- `pattern_encoding` `""` / `"text"` — raw UTF-8 literal.
-- `pattern_encoding` `"base64"` — arbitrary bytes base64-encoded (frontend always uses this for non-regex formats to support binary/UTF-16/hex patterns).
-- `pattern_encoding` `"regex"` — Go `regexp` syntax; invalid pattern → 400. `contiguous` flag still applies (chunks concatenated per 1 MB batch), but no cross-batch overlap since minimum match length is unknown.
+- `pattern_encoding` `""` / `"text"` — raw UTF-8 literal; decoded pattern capped at `maxPatternLen` (4 KB) → 400 if exceeded, regardless of `contiguous`.
+- `pattern_encoding` `"base64"` — arbitrary bytes base64-encoded (frontend always uses this for non-regex formats to support binary/UTF-16/hex patterns); same `maxPatternLen` cap applies to the decoded bytes.
+- `pattern_encoding` `"regex"` — Go `regexp` syntax; invalid pattern → 400. `contiguous` flag still applies (chunks concatenated per `searchBatchSize` batch, 2 MB); cross-batch overlap is a fixed `regexOverlapSize` (4 KB) rather than pattern-length-based, since minimum match length is unknown — a match spanning further than that across a batch boundary is still missed.
 - Non-contiguous mode: each chunk searched independently; cross-chunk matches not found.
-- Contiguous mode (literal): chunks accumulated into 1 MB batches; `len(pattern)-1` byte overlap between batches catches cross-batch splits. Implemented in `search.go` via `matchFinder` abstraction (`literalFinder` / `regexFinder`).
+- Contiguous mode (literal): chunks accumulated into `searchBatchSize` batches (2 MB); `len(pattern)-1` byte overlap between batches catches cross-batch splits. Implemented in `search.go` via `matchFinder` abstraction (`literalFinder` / `regexFinder`).

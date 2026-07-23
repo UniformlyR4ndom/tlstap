@@ -210,6 +210,40 @@ func TestEncoding_RegexInvalid(t *testing.T) {
 	}
 }
 
+func TestEncoding_TextPatternTooLong(t *testing.T) {
+	d := setupDB(t)
+	pattern := strings.Repeat("x", maxPatternLen+1)
+	body := fmt.Sprintf(`{"session":1,"stream":1,"direction":0,"pattern":%q,"pattern_encoding":"text"}`, pattern)
+	req := httptest.NewRequest(http.MethodPost, "/search-text", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	d.handleSearchText(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEncoding_Base64PatternTooLong(t *testing.T) {
+	d := setupDB(t)
+	body := searchBodyBase64(1, 1, 0, make([]byte, maxPatternLen+1))
+	req := httptest.NewRequest(http.MethodPost, "/search-text", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	d.handleSearchText(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEncoding_TextPatternAtMaxLen(t *testing.T) {
+	d := setupDB(t)
+	pattern := strings.Repeat("x", maxPatternLen)
+	insertChunk(t, d.db, 1, 1, 0, 0, 0, 10, []byte(pattern))
+	body := fmt.Sprintf(`{"session":1,"stream":1,"direction":0,"pattern":%q,"pattern_encoding":"text"}`, pattern)
+	ms := doSearch(t, d, body)
+	if len(ms) != 1 || ms[0].Offset != 0 {
+		t.Fatalf("expected 1 match at offset 0, got %v", matchOffsets(ms))
+	}
+}
+
 // ── error cases ───────────────────────────────────────────────────────────────
 
 func TestEncoding_InvalidBase64(t *testing.T) {

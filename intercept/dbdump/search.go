@@ -3,13 +3,18 @@ package dbdump
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"math"
 	"net/http"
 	"regexp"
 	"sort"
 )
 
-const searchBatchSize = 1 << 20 // 1 MB
+const (
+	searchBatchSize  = 2 << 20 // 2 MB: chunks are accumulated into batches of this size for contiguous search
+	regexOverlapSize = 4 << 10 // 4 KB: fixed cross-batch overlap for regex search (minimum match length is unknown, so this is a best-effort bound, not exact)
+	maxPatternLen    = 4 << 10 // 4 KB: hard cap on literal/base64 pattern length, since it drives ovlLen and thus a per-request buffer allocation
+)
 
 type searchTextRequest struct {
 	Session         int64  `json:"session"`
@@ -134,12 +139,20 @@ func (i *DbDumpInterceptor) handleSearchText(w http.ResponseWriter, r *http.Requ
 	switch req.PatternEncoding {
 	case "", "text":
 		p := []byte(req.Pattern)
+		if len(p) > maxPatternLen {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("pattern exceeds maximum length of %d bytes", maxPatternLen))
+			return
+		}
 		find = literalFinder(p)
 		ovlLen = len(p) - 1
 	case "base64":
 		p, err := base64.StdEncoding.DecodeString(req.Pattern)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid base64 pattern: "+err.Error())
+			return
+		}
+		if len(p) > maxPatternLen {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("pattern exceeds maximum length of %d bytes", maxPatternLen))
 			return
 		}
 		find = literalFinder(p)
@@ -151,7 +164,7 @@ func (i *DbDumpInterceptor) handleSearchText(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		find = regexFinder(re)
-		ovlLen = 0 // minimum match length is unknown; no cross-batch overlap
+		ovlLen = regexOverlapSize
 	default:
 		writeError(w, http.StatusBadRequest, "unknown pattern_encoding: "+req.PatternEncoding)
 		return
@@ -232,12 +245,12 @@ func (i *DbDumpInterceptor) searchNonContiguous(session, stream int64, direction
 	return matches, rows.Err()
 }
 
-// searchContiguous accumulates chunks into a 1 MB batch buffer so that the
-// matcher operates on a large contiguous slice, and patterns split across chunk
-// boundaries are still found. An overlap of ovlLen bytes is carried from the
-// end of each batch into the next to catch cross-batch splits. For regex,
-// ovlLen is 0 (minimum match length is unknown) so patterns spanning a 1 MB
-// batch boundary will not be found.
+// searchContiguous accumulates chunks into a searchBatchSize batch buffer so that
+// the matcher operates on a large contiguous slice, and patterns split across
+// chunk boundaries are still found. An overlap of ovlLen bytes is carried from
+// the end of each batch into the next to catch cross-batch splits. For regex,
+// ovlLen is the fixed regexOverlapSize (minimum match length is unknown), so a
+// match spanning further than that across a batch boundary will still be missed.
 func (i *DbDumpInterceptor) searchContiguous(session, stream int64, direction int, find matchFinder, ovlLen int, start, end int64) ([]searchMatch, error) {
 	// Extend the left SQL bound so we can load the chunk that contributes the
 	// overlap bytes preceding 'start'.
