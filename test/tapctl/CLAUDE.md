@@ -173,6 +173,7 @@ tapctl dbdump status [--api URL]
 tapctl dbdump sessions [--api URL]
 tapctl dbdump streams --session N [--api URL]
 tapctl dbdump chunklist --session N --stream N [--api URL]
+tapctl dbdump latest [--session N] [--stream N] [--api URL]
 tapctl dbdump chunk --session N --stream N --direction N --chunks 0,1,2 [--api URL]
 tapctl dbdump chunk-stid --session N --stream N --direction N --id N [--api URL]
 tapctl dbdump byte-stid --session N --stream N --direction N --offset N [--api URL]
@@ -203,6 +204,11 @@ tapctl dbdump sessions
 # Streams within session 1, and what's been captured on stream 0 so far.
 tapctl dbdump streams --session 1
 tapctl dbdump chunklist --session 1 --stream 0
+
+# Consolidated cheap "anything new?" check: latest session id, plus (since both are
+# given) latest sgid/streams_version for session 1 and latest stid for its stream 0.
+# Omit --session/--stream to narrow which fields come back non-(-1).
+tapctl dbdump latest --session 1 --stream 0
 
 # Fetch specific chunks (client->server, chunk ids 0-2) of that stream.
 tapctl dbdump chunk --session 1 --stream 0 --direction 0 --chunks 0,1,2

@@ -27,6 +27,8 @@ func dbdumpMain(args []string) {
 		cmdDbdumpStreams(args[1:])
 	case "chunklist":
 		cmdDbdumpChunkList(args[1:])
+	case "latest":
+		cmdDbdumpLatest(args[1:])
 	case "chunk":
 		cmdDbdumpChunk(args[1:])
 	case "chunk-stid":
@@ -56,6 +58,7 @@ Usage:
   tapctl dbdump sessions [--api URL]
   tapctl dbdump streams --session N [--api URL]
   tapctl dbdump chunklist --session N --stream N [--api URL]
+  tapctl dbdump latest [--session N] [--stream N] [--api URL]
   tapctl dbdump chunk --session N --stream N --direction N --chunks 0,1,2 [--api URL]
   tapctl dbdump chunk-stid --session N --stream N --direction N --id N [--api URL]
   tapctl dbdump byte-stid --session N --stream N --direction N --offset N [--api URL]
@@ -79,6 +82,11 @@ type sessionScopedRequest struct {
 type streamScopedRequest struct {
 	Session int64 `json:"session"`
 	Stream  int64 `json:"stream"`
+}
+
+type latestRequest struct {
+	Session *int64 `json:"session,omitempty"`
+	Stream  *int64 `json:"stream,omitempty"`
 }
 
 type directionScopedRequest struct {
@@ -207,6 +215,28 @@ func cmdDbdumpChunkList(args []string) {
 	}
 
 	data, err := httpPostJSON(*api, "/api/i/dbdump/chunklist", streamScopedRequest{Session: *session, Stream: *stream})
+	if err != nil {
+		fail("%v", err)
+	}
+	printRawJSON(data)
+}
+
+func cmdDbdumpLatest(args []string) {
+	fs := flag.NewFlagSet("dbdump latest", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "restrict to one session (omit for latest_session_id only)")
+	stream := fs.Int64("stream", 0, "restrict to one stream within --session (omit for no latest_stid)")
+	fs.Parse(args)
+
+	var req latestRequest
+	if flagWasSet(fs, "session") {
+		req.Session = session
+	}
+	if flagWasSet(fs, "stream") {
+		req.Stream = stream
+	}
+
+	data, err := httpPostJSON(*api, "/api/i/dbdump/latest", req)
 	if err != nil {
 		fail("%v", err)
 	}

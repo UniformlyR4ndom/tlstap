@@ -40,7 +40,7 @@ function buildRows(chunks, sessionStart) {
     return rows
 }
 
-export default function CombinedView({ session, globalOffset, refreshKey }) {
+export default function CombinedView({ session, globalOffset, refreshKey, latestSgid }) {
     const { display, loading, error, handleScrollEnd } = useChunkBuffer({
         entity: session,
         refreshKey,
@@ -48,6 +48,7 @@ export default function CombinedView({ session, globalOffset, refreshKey }) {
         fetchPage,
         getId,
         buildRows,
+        latestId: latestSgid,
     })
 
     if (!session) return html`<div class="placeholder">Select a session to view combined traffic</div>`

@@ -158,6 +158,47 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/i/dbdump/latest:
+    post:
+      tags: [chunks]
+      summary: Consolidated cheap "has anything changed" check
+      description: |
+        Cheap check for whether anything new has happened, scoped to whatever of
+        `session`/`stream` (both optional and independent) the caller currently has
+        selected — one request per live-poll tick instead of one per concern (a global
+        latest session id, a session's latest sgid/streams_version, and a stream's latest
+        stid all in one response). Omit `session` for only `latest_session_id`; supply
+        `session` without `stream` to omit `latest_stid`. Carries no chunk/stream
+        payload; intended for a low-overhead live poll rather than as a data-fetching
+        endpoint.
+      operationId: getLatest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID; omit for latest_session_id only
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID; only meaningful together with session
+      responses:
+        '200':
+          description: Latest known ids/counters, scoped to whatever was supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Latest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/i/dbdump/chunk:
     post:
       tags: [chunks]
@@ -1108,6 +1149,31 @@ components:
           type: integer
           format: int64
           description: Total captured bytes in the server→client direction; -1 if no chunks exist
+
+    Latest:
+      type: object
+      required: [latest_session_id, latest_sgid, streams_version, latest_stid]
+      properties:
+        latest_session_id:
+          type: integer
+          format: int64
+          description: Highest session id across every capture session; -1 if none exist. Always computed, independent of the request body.
+        latest_sgid:
+          type: integer
+          format: int64
+          description: Highest sgid (direction-agnostic, session-global chunk counter) captured so far anywhere in the session; -1 if `session` was omitted or it has no chunks yet
+        streams_version:
+          type: integer
+          format: int64
+          description: |
+            In-memory counter bumped whenever a stream is added to the requested session
+            or an existing one closes. -1 if `session` was omitted, or isn't the one this
+            interceptor instance is actively capturing to (a past session's stream list
+            is immutable, so -1 is a stable, never-"changed" value for it).
+        latest_stid:
+          type: integer
+          format: int64
+          description: Highest stid (direction-agnostic, per-stream chunk counter) captured so far for the requested stream; -1 if `stream` (or `session`) was omitted, or the stream has no chunks yet
 
     SearchMatch:
       type: object

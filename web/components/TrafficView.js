@@ -48,7 +48,7 @@ function buildRows(chunks, streamStart) {
     return rows
 }
 
-export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
+export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
     const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
@@ -62,6 +62,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         getId,
         buildRows,
         isClosed,
+        latestId: latestStid,
     })
 
     // totalBytes is independent of the hook's fetch/display state, so it gets its own effect.

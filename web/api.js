@@ -30,6 +30,15 @@ export function getChunkList(sessionId, streamId) {
     return post('/chunklist', { session: sessionId, stream: streamId })
 }
 
+// `session`/`stream` are both optional and independent; see intercept/dbdump/CLAUDE.md's
+// `/latest` entry for exactly which response fields each one unlocks.
+export function getLatest({ session, stream } = {}) {
+    const body = {}
+    if (session != null) body.session = session
+    if (stream != null) body.stream = stream
+    return post('/latest', body)
+}
+
 export function getChunkStid(sessionId, streamId, direction, id) {
     return post('/chunk-stid', { session: sessionId, stream: streamId, direction, id })
 }

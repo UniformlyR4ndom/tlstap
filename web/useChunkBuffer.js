@@ -29,8 +29,11 @@ function findChunkBoundaryNearHalf(rows, fallback) {
 // connection. `fetchPage(ws, entity, startId, n)`: wraps the entity-specific fetch call.
 // `getId(obj)`: extracts the pagination id (same field name on a chunk and a header row
 // built from it). `buildRows(chunks, startMs)`: caller-owned row builder. `isClosed(entity)`:
-// optional; stops refresh top-up once true.
-export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed }) {
+// optional; stops refresh top-up (and live-poll top-up) once true. `latestId`: optional;
+// the latest id the caller already knows about from a centrally-polled `/latest` call
+// (`App.js`) — a plain number, not a function; the hook itself does no polling. Omit to
+// disable the live-poll reaction below for a given caller.
+export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId }) {
     const [display, setDisplay] = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading, setLoading] = useState(false)
     const [error,   setError]   = useState(null)
@@ -96,11 +99,10 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
         }
     }, [entity?.id])
 
-    // Refresh — tops up the buffer with newly available chunks, if there's room.
-    // Never evicts and never adjusts scroll; only appends to the tail.
-    useEffect(() => {
-        if (!hasMountedRef.current) { hasMountedRef.current = true; return }
-
+    // Tops up the buffer with newly available chunks, if there's room. Never evicts and
+    // never adjusts scroll; only appends to the tail. Shared by the refresh-button/
+    // Auto-Refresh path (refreshKey effect) and the live-poll effect below.
+    function topUp() {
         const e = entityRef.current
         if (!e) return
         if (isClosed?.(e)) return
@@ -134,7 +136,21 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
                 if (generationRef.current === capturedGen) setLoading(false)
             }
         })()
+    }
+
+    // Refresh button / Auto-Refresh — unconditional top-up attempt on every tick.
+    useEffect(() => {
+        if (!hasMountedRef.current) { hasMountedRef.current = true; return }
+        topUp()
     }, [refreshKey])
+
+    // Live-poll reaction — App.js's own poll (see its "latest" state) updates `latestId`
+    // whenever it re-fetches; this just reacts by calling topUp() when that's ahead of
+    // what's already buffered. No fetching, no interval, no isClosed/loadingMoreRef check
+    // here — topUp() already guards on all of that itself.
+    useEffect(() => {
+        if (latestId != null && latestId >= nextIdRef.current) topUp()
+    }, [latestId])
 
     // Stable callback — reads all mutable state via refs.
     const handleScrollEnd = useCallback(async (scrollDir) => {

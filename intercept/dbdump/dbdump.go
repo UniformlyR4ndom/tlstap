@@ -120,6 +120,7 @@ type DbDumpInterceptor struct {
 	chunkStates     map[chunkKey]chunkState
 	streamNextSTID  map[uint32]int64
 	nextSGID        int64
+	streamsVersion  int64 // bumped whenever a stream row is inserted or its end is set; cheap "did the stream list change" check
 	pendingChunks   []chunkRecord
 	pendingSize     int
 	mu              sync.RWMutex
@@ -289,11 +290,18 @@ func (i *DbDumpInterceptor) ensureSession() error {
 		i.mu.Lock()
 		defer i.mu.Unlock()
 		for _, ps := range i.pendingStreams {
-			if _, err := i.db.Exec(
+			result, err := i.db.Exec(
 				`INSERT OR IGNORE INTO stream (id, session, src, dst, start) VALUES (?, ?, ?, ?, ?)`,
 				ps.id, id, ps.src, ps.dst, ps.at,
-			); err != nil {
+			)
+			if err != nil {
 				i.logger.Error("dbdump: flush pending stream %d: %v", ps.id, err)
+				continue
+			}
+			// ConnectionEstablished is called once per direction, so a same-ConnID entry can
+			// appear here twice; OR IGNORE makes the second INSERT a no-op (RowsAffected == 0).
+			if n, _ := result.RowsAffected(); n > 0 {
+				i.streamsVersion++
 			}
 		}
 		i.pendingStreams = nil
@@ -333,11 +341,22 @@ func (i *DbDumpInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	}
 	i.mu.Unlock()
 
-	_, err := i.db.Exec(
+	result, err := i.db.Exec(
 		`INSERT OR IGNORE INTO stream (id, session, src, dst, start) VALUES (?, ?, ?, ?, ?)`,
 		info.ConnID, i.sessionID, info.SrcEndpoint, info.DstEndpoint, time.Now().UnixMilli(),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	// Called once per direction; only the call that actually inserted the row
+	// (RowsAffected == 1) should count as a stream-list change — OR IGNORE makes the
+	// other call's INSERT a no-op.
+	if n, _ := result.RowsAffected(); n > 0 {
+		i.mu.Lock()
+		i.streamsVersion++
+		i.mu.Unlock()
+	}
+	return nil
 }
 
 func (i *DbDumpInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
@@ -367,11 +386,21 @@ func (i *DbDumpInterceptor) ConnectionTerminated(info *proxy.ConnInfo) error {
 		return nil
 	}
 
-	_, err := i.db.Exec(
+	result, err := i.db.Exec(
 		`UPDATE stream SET end = ? WHERE session = ? AND id = ? AND end IS NULL`,
 		time.Now().UnixMilli(), i.sessionID, info.ConnID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	// Called once per direction; only the call that actually set end (RowsAffected == 1)
+	// should count as a stream-list change — the other call's WHERE guard makes it a no-op.
+	if n, _ := result.RowsAffected(); n > 0 {
+		i.mu.Lock()
+		i.streamsVersion++
+		i.mu.Unlock()
+	}
+	return nil
 }
 
 func (i *DbDumpInterceptor) Intercept(info *proxy.ConnInfo, data []byte) ([]byte, error) {

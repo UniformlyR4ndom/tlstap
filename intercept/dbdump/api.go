@@ -23,6 +23,7 @@ func (i *DbDumpInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	mux.HandleFunc(basePath+"/streams", i.handleStreams)
 	mux.HandleFunc(basePath+"/chunk", i.handleChunk)
 	mux.HandleFunc(basePath+"/chunklist", i.handleChunkList)
+	mux.HandleFunc(basePath+"/latest", i.handleLatest)
 	mux.HandleFunc(basePath+"/chunk-stid", i.handleChunkStid)
 	mux.HandleFunc(basePath+"/byte-stid", i.handleByteStid)
 	mux.HandleFunc(basePath+"/stid-stream", i.handleStidStream)
@@ -237,6 +238,82 @@ func (i *DbDumpInterceptor) handleChunkList(w http.ResponseWriter, r *http.Reque
 	if err := rows.Err(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	writeJSON(w, resp)
+}
+
+// handleLatest is a single consolidated cheap-check endpoint, folding together a
+// session's latest_sgid/streams_version, a stream's latest_stid, and a global latest
+// session id — the one thing a live-poll client calls per tick, carrying whichever of
+// session/stream it currently has selected. session and stream are both optional and
+// independent: omitting session yields only latest_session_id; supplying session
+// without stream omits latest_stid.
+func (i *DbDumpInterceptor) handleLatest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session *int64 `json:"session"`
+		Stream  *int64 `json:"stream"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	resp := struct {
+		LatestSessionID int64 `json:"latest_session_id"`
+		LatestSgid      int64 `json:"latest_sgid"`
+		StreamsVersion  int64 `json:"streams_version"`
+		LatestStid      int64 `json:"latest_stid"`
+	}{LatestSessionID: -1, LatestSgid: -1, StreamsVersion: -1, LatestStid: -1}
+
+	var latestSessionID sql.NullInt64
+	if err := i.db.QueryRow(`SELECT MAX(id) FROM sessions`).Scan(&latestSessionID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if latestSessionID.Valid {
+		resp.LatestSessionID = latestSessionID.Int64
+	}
+
+	if req.Session == nil {
+		writeJSON(w, resp)
+		return
+	}
+
+	var latestSgid sql.NullInt64
+	if err := i.db.QueryRow(
+		`SELECT MAX(sgid) FROM chunks WHERE session = ?`,
+		*req.Session,
+	).Scan(&latestSgid); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if latestSgid.Valid {
+		resp.LatestSgid = latestSgid.Int64
+	}
+
+	// streamsVersion is in-memory and only meaningful for the one session this
+	// interceptor instance is actively writing to — see handleSessionLatest above.
+	i.mu.RLock()
+	if i.sessionCreated && i.sessionID == *req.Session {
+		resp.StreamsVersion = i.streamsVersion
+	}
+	i.mu.RUnlock()
+
+	if req.Stream == nil {
+		writeJSON(w, resp)
+		return
+	}
+
+	var latestStid sql.NullInt64
+	if err := i.db.QueryRow(
+		`SELECT MAX(stid) FROM chunks WHERE session = ? AND stream = ?`,
+		*req.Session, *req.Stream,
+	).Scan(&latestStid); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if latestStid.Valid {
+		resp.LatestStid = latestStid.Int64
 	}
 
 	writeJSON(w, resp)

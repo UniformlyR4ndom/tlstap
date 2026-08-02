@@ -13,9 +13,13 @@ import TamperView from './TamperView.js'
 import ResizeHandle from './ResizeHandle.js'
 import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
 import { useResizableLayout } from '../useResizableLayout.js'
+import { usePoll } from '../usePoll.js'
+import { getLatest } from '../api.js'
 import { DIRNUM_C2S } from '../direction.js'
 
 const html = htm.bind(h)
+
+const POLL_INTERVAL_MS = 500
 
 export default function App() {
     const [view,         setView]         = useState('analysis') // 'analysis' | 'tamper'
@@ -34,6 +38,7 @@ export default function App() {
     const [extractDir,   setExtractDir]   = useState(String(DIRNUM_C2S))
     const [extractFrom,  setExtractFrom]  = useState('')
     const [extractTo,    setExtractTo]    = useState('')
+    const [latest,       setLatest]       = useState({ latest_session_id: -1, latest_sgid: -1, streams_version: -1, latest_stid: -1 })
     const [sidebarWidth, handleSidebarResize] = useResizableLayout('sidebarWidth', { min: 180, max: 600 })
     const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
@@ -46,6 +51,21 @@ export default function App() {
         const id = setInterval(() => setRefreshKey(k => k + 1), 1000)
         return () => clearInterval(id)
     }, [autoRefresh])
+
+    // Single central live poll for SessionList/StreamList/TrafficView/CombinedView — one
+    // request per tick instead of one per component. `stream` is only included while a
+    // specific stream is actually the visible view (single mode); CombinedView has no use
+    // for latest_stid, so there's no reason to compute it server-side while it's mounted.
+    usePoll(true, POLL_INTERVAL_MS, async () => {
+        try {
+            const params = {}
+            if (session) params.session = session.id
+            if (session && viewMode === 'single' && stream) params.stream = stream.id
+            setLatest(await getLatest(params))
+        } catch {
+            // Transient poll failures are silently ignored; the next tick retries.
+        }
+    })
 
     function addMarker(m) {
         setMarkers(prev => [...prev, { ...m, id: makeMarkerId() }])
@@ -188,6 +208,7 @@ export default function App() {
                         onSelect=${selectSession}
                         refreshKey=${refreshKey}
                         onLoad=${setSessions}
+                        latestSessionId=${latest.latest_session_id}
                     />
                     <${StreamList}
                         session=${session}
@@ -195,17 +216,19 @@ export default function App() {
                         onSelect=${setStream}
                         onLoad=${handleStreamLoad}
                         refreshKey=${refreshKey}
+                        streamsVersion=${latest.streams_version}
                     />
                 </aside>
                 <${ResizeHandle} orientation="v" onResize=${handleSidebarResize} />
                 <main class="main">
                     ${viewMode === 'combined'
-                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} />`
+                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} latestSgid=${latest.latest_sgid} />`
                         : html`<${TrafficView}
                             stream=${stream}
                             globalOffset=${globalOffset}
                             jumpTo=${jumpTo}
                             refreshKey=${refreshKey}
+                            latestStid=${latest.latest_stid}
                             markers=${markers}
                             onAddMarker=${addMarker}
                             onRemoveMarker=${removeMarker}

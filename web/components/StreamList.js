@@ -1,5 +1,5 @@
 import { h } from 'preact'
-import { useState, useEffect } from 'preact/hooks'
+import { useState, useEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
 import { getStreams } from '../api.js'
 import { fmtDuration } from '../format.js'
@@ -7,13 +7,30 @@ import ListPanel from './ListPanel.js'
 
 const html = htm.bind(h)
 
-export default function StreamList({ session, selected, onSelect, onLoad, refreshKey }) {
+export default function StreamList({ session, selected, onSelect, onLoad, refreshKey, streamsVersion }) {
     const [streams, setStreams] = useState([])
+    const lastSeenVersionRef = useRef(-1)
 
+    function load(sessionId) {
+        return getStreams(sessionId).then(ss => { setStreams(ss); onLoad?.(ss) }).catch(() => { setStreams([]); onLoad?.([]) })
+    }
+
+    // Seeding from `streamsVersion`'s current value (rather than a network round trip)
+    // is deliberately not in this effect's dependency array — it's read once per
+    // entity/refresh, not on every value it takes afterward; the poll-reaction effect
+    // below owns reacting to it changing.
     useEffect(() => {
+        lastSeenVersionRef.current = streamsVersion
         if (!session) { setStreams([]); onLoad?.([]); return }
-        getStreams(session.id).then(ss => { setStreams(ss); onLoad?.(ss) }).catch(() => { setStreams([]); onLoad?.([]) })
+        load(session.id)
     }, [session?.id, refreshKey])
+
+    // App.js's own poll updates `streamsVersion` centrally; just react when it moves.
+    useEffect(() => {
+        if (!session || streamsVersion === lastSeenVersionRef.current) return
+        lastSeenVersionRef.current = streamsVersion
+        load(session.id)
+    }, [streamsVersion])
 
     return html`
         <${ListPanel}

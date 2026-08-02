@@ -22,7 +22,13 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 **Refresh (`App.js`):**
 - The header's `↺` button (`.btn-refresh` — icon-only, ~34×30px, no label) increments `refreshKey` (a plain counter) on click.
 - `refreshKey` is threaded into `SessionList`, `StreamList`, `TrafficView`, and `CombinedView`; each re-fetches whatever it owns when the value changes (see their respective sections below).
-- **Auto-Refresh** (View menu toggle): while `autoRefresh` is true, a `setInterval` in `App.js` calls `setRefreshKey(k => k + 1)` every 1000ms — i.e. it's just a timer clicking the same button; no separate code path. Interval is cleared on toggle-off/unmount.
+- **Auto-Refresh** (View menu toggle): while `autoRefresh` is true, a `setInterval` in `App.js` calls `setRefreshKey(k => k + 1)` every 1000ms — i.e. it's just a timer clicking the same button; no separate code path. Interval is cleared on toggle-off/unmount. Independent of, and now largely redundant with, the central live poll below — kept as a manual/coarser fallback (e.g. to force-refresh sort order via `resetSortKey`, or if a poll tick was somehow missed), not the thing that keeps the UI current day-to-day anymore.
+
+**Central live poll (`App.js`):**
+- One `usePoll(true, POLL_INTERVAL_MS, tick)` call (`usePoll.js`, 500ms) is the single source of live-ness for the whole Analysis view — `SessionList`, `StreamList`, and whichever of `TrafficView`/`CombinedView` is mounted all react to its output rather than polling themselves. This replaced an earlier per-component design (each of those four independently called its own cheap-check endpoint every tick) once `intercept/dbdump` gained a single consolidated endpoint for exactly this purpose — see "`/latest`" in its `CLAUDE.md`.
+- Each tick calls `getLatest(params)` (`api.js`), building `params` from current selection: `{session: session.id}` if a session is selected, plus `stream: stream.id` only when `viewMode === 'single'` and a stream is selected too (`CombinedView` has no use for `latest_stid`, so it's left out server-side rather than fetched and ignored). The raw `{latest_session_id, latest_sgid, streams_version, latest_stid}` response is stored as-is in a `latest` state object (field names kept snake_case, matching the wire response directly — no camelCase translation layer) and passed down as four separately-named props: `latestSessionId` (`SessionList`), `streamsVersion` (`StreamList`), `latestStid` (`TrafficView`), `latestSgid` (`CombinedView`).
+- `tick`'s closure captures `session`/`stream`/`viewMode` fresh from each render (per `usePoll.js`'s contract — `tickRef.current = tick` is reassigned unconditionally every render, not gated behind a dependency array), so there's no separate ref-syncing needed for the poll to always act on the current selection.
+- A failed `getLatest` call (network hiccup, mid-restart of the proxy process — see `intercept/dbdump/CLAUDE.md`'s "Async write buffer" for why sub-second polling doesn't imply sub-second data anyway) is silently swallowed; the next tick just retries. Each downstream consumer's own "did this number change" comparison (below) naturally treats an unchanged `latest` as a no-op, so a missed tick is invisible rather than disruptive.
 
 **Bottom panel (`App.js`):**
 - `bottomTab` state: `null` (collapsed) | `'goto'` | `'search'` | `'extract'` | `'transform'`.
@@ -36,6 +42,11 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `SessionList.js` fetches via `getSessions()`, tracks its own `error` state, and never passes `resetSortKey` — matching its original never-reset-on-its-own sort behavior.
 - `StreamList.js` fetches via `getStreams(session.id)` (guarded on `!session`) and passes `resetSortKey=${session?.id}`, which `ListPanel.js` watches via its own effect to reset `desc` back to `false` on session change (kept as a `ListPanel`-internal effect, separate from the fetch effect, so a refresh doesn't reset sort order).
 - Both `SessionList.js` and `StreamList.js` re-fetch (`getSessions()` / `getStreams()`) whenever `refreshKey` changes, in addition to their own natural triggers (mount / session change) — this is what makes the Refresh button pick up newly-initiated streams and updated end-times/byte-counts in the sidebar.
+- **Reacting to the central live poll** (`App.js`'s `latest` state — see "Central live poll" above; each component here is a pure consumer, no polling of its own): `SessionList.js` takes a `latestSessionId` prop, `StreamList.js` a `streamsVersion` prop. Each owns a `lastSeenIdRef`/`lastSeenVersionRef` and two effects with the same shape:
+  - **Seed effect**, keyed on its own natural triggers (`SessionList.js`: `[refreshKey]`; `StreamList.js`: `[session?.id, refreshKey]`) — does the real fetch (`load()`), and also sets `lastSeen*Ref.current = <the prop's current value>`. Deliberately *reads* the prop without depending on it (only the entity/refresh change should reset the baseline; the prop moving on its own is the next effect's job) — same "read fresh, not a dependency" convention `ResizeHandle.js`'s `onResize` uses.
+  - **Poll-reaction effect**, keyed on `[latestSessionId]` / `[streamsVersion]` — compares the incoming value against `lastSeen*Ref.current`; only on a genuine difference does it update the ref and re-run `load()`.
+  - Seeding from the prop's already-available value (rather than an extra network round trip) means the very next poll tick can't spuriously see a stale baseline and re-trigger a redundant fetch of what the seed effect's own `load()` just fetched — the value being seeded from *is* what the next tick will be compared against.
+  - `SessionList.js` previously had no live-poll equivalent at all (new sessions were Refresh/Auto-Refresh-only); it now gets one for free from the same `latestSessionId` prop, no session/stream scoping needed since it's a global counter (see `intercept/dbdump/CLAUDE.md`'s `/latest`).
 
 **Duration formatting:**
 - `fmtDuration(start, end)` (`format.js`, used by `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh/Auto-Refresh) naturally advance this since it's computed fresh each render.
@@ -101,7 +112,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   `TrafficView.js` is keyed by stream/`stid`; `CombinedView.js` by session/`sgid`; a raw
   fetched chunk and a header row built from it always carry the same id field name
   within a given caller, so one `getId(obj)` accessor works on both shapes.
-- `useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed })`
+- `useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId })`
   → `{ display, loading, error, setError, handleScrollEnd, reloadFrom }`. `entity` is the
   current stream or session (or null); `openStream` is `openStidStream`/`openSgidStream`
   (`api.js`, same `() => {fetch, close}` shape either way); `fetchPage(ws, entity, startId, n)`
@@ -110,8 +121,10 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   startMs)` stays caller-owned (row shape genuinely differs — `CombinedView.js` adds a
   `stream` field per row) and is only ever *invoked* by the hook, not defined in it;
   `isClosed(entity)` is optional — `TrafficView.js` passes `s => !!s.end` so refresh
-  top-up stops once a stream closes, `CombinedView.js` omits it (a session has no such
-  concept).
+  top-up (and the live-poll reaction below) stops once a stream closes, `CombinedView.js`
+  omits it (a session has no such concept); `latestId` is optional too — see "Live-poll
+  reaction" below — a plain number from `App.js`'s central poll (`TrafficView.js`:
+  `latestStid`; `CombinedView.js`: `latestSgid`), not a function the hook calls itself.
 - `display = {rows, scrollAdjust, adjustVersion, scrollTo, scrollToVersion}` — single
   state object for atomic render, prevents split-render glitch.
 - `BATCH = 50` chunks fetched per request (exported, since `TrafficView.js`'s jump-to —
@@ -140,20 +153,38 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
     positive `scrollAdjust`.
   - `findChunkBoundaryNearHalf(rows, fallback)` (hook-internal): scans forward from
     midpoint for a `header` row, falls back to scanning backward.
+- **`topUp()`** (hook-internal function, not a `useCallback`): skip if no entity,
+  `isClosed?.(entity)` is true, a scroll-triggered load is already in flight
+  (`loadingMoreRef.current`), or the buffer has no spare room (`room =
+  MAX_BUFFERED_CHUNKS - countChunks(...) <= 0`, checked via `displayRef` so it doesn't
+  need `display` in a dependency array). Otherwise it fetches exactly `room` chunks from
+  `nextIdRef.current` onward. Unlike `handleScrollEnd`, this path **never evicts and
+  never touches `scrollAdjust`/`adjustVersion`** — new rows are appended straight to the
+  end of `display.rows`. Since virtualization only cares about total row count, appending
+  below the viewport doesn't move anything already on screen; this is what makes a
+  top-up visually silent when new data isn't currently visible. Once the cap is hit,
+  top-up goes inert until the user scrolls forward (which evicts via the normal path and
+  frees up room). Same `generationRef`/`loadingMoreRef` race-safety pattern as
+  `handleScrollEnd`. Called from both places below.
 - **Refresh top-up**: a `useEffect` keyed on `refreshKey` (guarded by `hasMountedRef` so
-  the initial mount is a no-op) does the top-up: skip if no entity, `isClosed?.(entity)`
-  is true, a scroll-triggered load is already in flight (`loadingMoreRef.current`), or
-  the buffer has no spare room (`room = MAX_BUFFERED_CHUNKS - countChunks(...) <= 0`,
-  checked via `displayRef` so the effect doesn't need `display` in its deps). Otherwise
-  it fetches exactly `room` chunks from `nextIdRef.current` onward. Unlike
-  `handleScrollEnd`, this path **never evicts and never touches
-  `scrollAdjust`/`adjustVersion`** — new rows are appended straight to the end of
-  `display.rows`. Since virtualization only cares about total row count, appending below
-  the viewport doesn't move anything already on screen; this is what makes
-  Refresh/Auto-Refresh visually silent when new data isn't currently visible. Once the
-  cap is hit, top-up goes inert until the user scrolls forward (which evicts via the
-  normal path and frees up room). Same `generationRef`/`loadingMoreRef` race-safety
-  pattern as `handleScrollEnd`.
+  the initial mount is a no-op) calls `topUp()` unconditionally on every tick — this is
+  the Refresh-button/Auto-Refresh path.
+- **Live-poll reaction**: a plain `useEffect(() => { if (latestId != null && latestId >=
+  nextIdRef.current) topUp() }, [latestId])` — no fetching, no interval, no `isClosed`/
+  `loadingMoreRef` check here, since `topUp()` already guards on all of that itself. The
+  hook does no polling of its own; `latestId` arrives already fetched, from `App.js`'s
+  single central poll (see its "Central live poll" section) via `getLatest()`
+  (`intercept/dbdump`'s consolidated `/latest` endpoint — see its `CLAUDE.md`), which is
+  what makes a poll tick with nothing new cost one shared indexed query server-side and
+  zero chunk fetches, rather than one query per mounted view. This is what actually keeps
+  the currently-open view live without the user touching Refresh/Auto-Refresh.
+  Note: `dbdump`'s chunk writes are themselves buffered and flushed at most once/second
+  (see its `CLAUDE.md`'s "Async write buffer"), so polling faster than that narrows the
+  average wait but doesn't make new data appear before the next flush.
+  (This hook previously polled itself, one `usePoll.js` call per mounted view, each hitting
+  its own cheap-check endpoint — collapsed into `App.js`'s single poll once `/latest`
+  existed to serve every consumer from one request; see `usePoll.js`'s own header comment
+  for why it's a thin, reusable `setInterval` wrapper regardless of caller count.)
 
 **`TrafficView.js`-specific layer on top of the hook:**
 - Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`.
@@ -311,6 +342,7 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - `openStidStream()` → `{ fetch(sessionId, streamId, start, n), close() }`: persistent WS to `/stid-stream`.
 - `openSgidStream()` → `{ fetch(session, start, n), close() }`: persistent WS to `/sgid-stream`.
 - `getSessions()`, `getStreams(sessionId)`, `getChunkList(sessionId, streamId)`.
+- `getLatest({session, stream} = {})`: POST `/latest` — `App.js`'s central live poll; both fields optional/independent, omitted entirely when falsy/nullish rather than sent as `0`/`null`. See "Central live poll" above and `intercept/dbdump/CLAUDE.md`'s `/latest` entry.
 - `getChunkStid(sessionId, streamId, direction, id)`: POST `/chunk-stid`.
 - `getByteStid(sessionId, streamId, direction, offset)`: POST `/byte-stid`.
 - `searchText(req)`: POST `/search-text`; `req` is the full request object.
