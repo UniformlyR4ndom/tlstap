@@ -124,15 +124,19 @@ target chunk is already buffered.
 
 **Editable hex grid (`HexEditor.js`):**
 - Small, non-virtualized hex/ASCII editor (all rows render directly — no windowing), unlike the read-only `HexDump.js` which is built for large captured-traffic streams. Reuses `HexDump.js`'s exported `ROW_HEIGHT` constant for visual consistency only; otherwise fully independent.
-- Controlled component: `<${HexEditor} bytes=${Uint8Array} onChange=${bytes => ...} readOnly? style? direction? onContextMenu? />`.
+- Controlled component: `<${HexEditor} bytes=${Uint8Array} onChange=${bytes => ...} readOnly? style? direction? onContextMenu? overwrite? />`.
 - `onContextMenu` (optional): fires `{index, x, y}` on right-click instead of rendering any menu itself — `index` is the byte position under the cursor (`null` if the click didn't land on a real byte or the trailing insertion cell, e.g. a filler cell or empty space), `x`/`y` are `e.clientX`/`e.clientY` for positioning. HexEditor stays completely generic/menu-agnostic (it's shared with `TransformPanel`, which has no notion of what a menu here would mean) — ownership of the menu's content and behavior lives entirely with the caller; only `TamperDetailPanel.js` passes this prop today, see below.
 - **Cursor model**: `cursor = { index, area }` — `index` is a byte position `0..bytes.length` (an insertion point *before* that byte, like a text cursor), `area` is `'hex'` or `'ascii'`. `pendingNibble` holds a single typed hex character awaiting its pair (shown as a half-entered `hexed-pending` cell); cleared by Backspace, arrow movement, Tab, or clicking elsewhere.
-- **Typing inserts, never overwrites** (this is the "arbitrary insertion/deletion" requirement it was built for):
-  - Hex column: only `[0-9a-fA-F]` accepted (guarded against `Ctrl`/`Cmd`/`Alt` so shortcuts like Ctrl+C aren't swallowed, even though `c`/`d`/`e`/`f` are valid hex chars); two nibbles combine into one inserted byte, cursor advances by one byte.
-  - ASCII column: any single printable keystroke inserts one byte (`charCodeAt(0) & 0xFF`), same modifier guard.
-  - Backspace removes the byte before the cursor (or just cancels a pending nibble); Delete removes the byte at the cursor; both shift subsequent bytes.
+- **Typing inserts by default; `overwrite` prop (bool, default falsy) switches every mutating
+  path except Backspace/Delete to overwrite** (this is the "arbitrary insertion/deletion"
+  requirement it was built for, plus the typewriter-style alternative `TamperDetailPanel.js`'s
+  settings panel exposes — see below):
+  - Hex column: only `[0-9a-fA-F]` accepted (guarded against `Ctrl`/`Cmd`/`Alt` so shortcuts like Ctrl+C aren't swallowed, even though `c`/`d`/`e`/`f` are valid hex chars); two nibbles combine into one byte, cursor advances by one byte.
+  - ASCII column: any single printable keystroke produces one byte (`charCodeAt(0) & 0xFF`), same modifier guard.
+  - Backspace removes the byte before the cursor (or just cancels a pending nibble); Delete removes the byte at the cursor; both shift subsequent bytes — unaffected by `overwrite`, which only changes how a *typed/pasted* byte lands, not how one is removed.
   - Arrow keys move by one byte (Up/Down by one row = 16 bytes); Home/End jump to row start/end, Ctrl+Home/End to buffer start/end; Tab toggles `area` at the same `index`; click on any byte/char cell sets the cursor directly.
-  - Paste: clipboard text is filtered per the active column's rules (hex chars paired up in the hex column; every character mapped to a byte in the ASCII column) and inserted in one `onChange` call.
+  - Paste: clipboard text is filtered per the active column's rules (hex chars paired up in the hex column; every character mapped to a byte in the ASCII column) and applied in one `onChange` call.
+  - **`insertBytes(bytes, index, newBytes)` vs. `overwriteBytes(bytes, index, newBytes)`**: every one of the mutating paths above (hex nibble-pair, ASCII keystroke, paste) funnels its produced `newBytes` through `(overwrite ? overwriteBytes : insertBytes)(bytes, index, newBytes)` rather than branching per-path — one shared choice-of-splice-function, not duplicated per caller. `insertBytes` shifts everything at/after `index` forward by `newBytes.length` (unconditionally grows the buffer); `overwriteBytes` writes `newBytes` directly into `bytes[index:index+newBytes.length]` in place, growing the buffer only if that range runs past the current end (`Math.max(bytes.length, index + newBytes.length)`) — which is what makes "cursor at end" naturally append under both functions with no special-casing needed at the call site.
 - Row layout mirrors `fmtAsHexdump`'s conventions (16 bytes/row, 8-hex-digit offset, `|ascii|` column) via `.hexed-*` CSS classes — deliberately distinct from `HexDump.js`'s `.hex-*` classes so nothing is shared/at risk between the two components.
 - A synthetic trailing cell (`byte === null`) exists at `bufferLength` within the last row so the cursor can be positioned after the last byte, whenever that row isn't already completely full. An empty buffer gets exactly one row (holding just that synthetic cell) since the normal per-row loop produces none. When the buffer length is a non-zero exact multiple of 16, no extra row is added purely to hold the cursor — that would render as an empty hexdump line with no bytes on it; the cursor position past the last byte is still reachable (e.g. via arrow keys), just without a dedicated rendered cell to click on in that one case.
 - `readOnly` prop: every mutating path (hex/ASCII insert, Backspace, Delete, paste) becomes a no-op; navigation (arrows/Home/End/Tab) and click-to-position still work. Used for `TransformPanel`'s output panel so it can reuse the same grid without being editable.
@@ -509,7 +513,20 @@ natural place inside the history-browsing view anyway. Scoped to a single proxy'
 - **`TamperDetailPanel.js`**: placeholder when nothing selected; otherwise fetches the
   *whole* buffer via `peekBuffer` in an effect keyed on `[entry.conn, entry.direction,
   entry.length, entry.chunks]`, plus **Forward** / **Drop** / **Drop Connection** / **New
-  Chunk…** and a **Continuous view** toggle (default off — segmented).
+  Chunk…** and a cog-icon **Settings** button. The settings button toggles a small
+  floating panel (`.tamper-settings-wrap`/`.tamper-settings-panel`, CSS-anchored below
+  the button — same `position: relative` parent + `position: absolute` child pattern as
+  `TransformPanel.js`'s `.algo-menu`, not click-coordinate-positioned like `ctxMenu`/
+  `InsertChunkPopover` below) dismissed via `useDismissOnOutsideClick`
+  (`settingsRef`/`settingsOpen`), same mechanism as `ctxMenu`. Holds two controls — a
+  settings panel rather than lone toolbar controls specifically so more panel-scoped
+  options have somewhere to live without crowding the toolbar: the **Continuous view**
+  toggle (default off — segmented), and a **Hex editor mode** select (`editMode` state,
+  `'insert'` default | `'overwrite'`) forwarded as the `overwrite` prop (`editMode ===
+  'overwrite'`) to every editable `<${HexEditor}>` this panel renders — both the
+  continuous-view instance and each segmented-view per-chunk instance — so switching it
+  takes effect immediately regardless of which view is active. See `HexEditor.js`'s
+  "Typing inserts by default" entry above for what `overwrite` actually changes.
   - **Canonical state is `chunks: Uint8Array[]`, not a flat byte array** — one entry per
     original chunk boundary. Both view modes are projections of it: `splitByBounds(data,
     bounds)` builds it from a `peek` reply, `mergeUint8Arrays(chunks)` (from `format.js`)

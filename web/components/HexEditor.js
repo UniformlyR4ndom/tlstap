@@ -16,6 +16,17 @@ function insertBytes(bytes, index, newBytes) {
     return out
 }
 
+// Replaces bytes[index:index+newBytes.length] in place; if that range runs past the end of
+// bytes, the buffer grows to fit (the "cursor at end appends" case), same as insertBytes
+// would — the two only differ on the byte range they land within the existing buffer.
+function overwriteBytes(bytes, index, newBytes) {
+    const end = index + newBytes.length
+    const out = new Uint8Array(Math.max(bytes.length, end))
+    out.set(bytes, 0)
+    out.set(newBytes, index)
+    return out
+}
+
 function removeByte(bytes, index) {
     const out = new Uint8Array(bytes.length - 1)
     out.set(bytes.subarray(0, index), 0)
@@ -28,7 +39,7 @@ function rowStart(index) { return index - (index % ROW_BYTES) }
 // A small, non-virtualized hex/ASCII editor for typed or pasted input. Distinct from the
 // read-only, virtualized HexDump.js (built for large captured traffic) — this widget only
 // needs to handle modest, user-entered buffers, with a real insertion cursor.
-export default function HexEditor({ bytes, onChange, style, readOnly, direction, onContextMenu }) {
+export default function HexEditor({ bytes, onChange, style, readOnly, direction, onContextMenu, overwrite }) {
     const [cursor, setCursor] = useState({ index: 0, area: 'hex' })
     const [pendingNibble, setPendingNibble] = useState(null)
     const containerRef = useRef(null)
@@ -72,7 +83,7 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction,
                 setPendingNibble(e.key)
             } else {
                 const value = parseInt(pendingNibble + e.key, 16)
-                onChange(insertBytes(bytes, index, new Uint8Array([value])))
+                onChange((overwrite ? overwriteBytes : insertBytes)(bytes, index, new Uint8Array([value])))
                 setPendingNibble(null)
                 setCursor({ index: index + 1, area })
             }
@@ -82,7 +93,7 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction,
             e.preventDefault()
             if (readOnly) return
             const value = e.key.charCodeAt(0) & 0xFF
-            onChange(insertBytes(bytes, index, new Uint8Array([value])))
+            onChange((overwrite ? overwriteBytes : insertBytes)(bytes, index, new Uint8Array([value])))
             setCursor({ index: index + 1, area })
             return
         }
@@ -149,7 +160,7 @@ export default function HexEditor({ bytes, onChange, style, readOnly, direction,
             newBytes = new Uint8Array(Array.from(text, ch => ch.charCodeAt(0) & 0xFF))
         }
         if (newBytes.length === 0) return
-        onChange(insertBytes(bytes, index, newBytes))
+        onChange((overwrite ? overwriteBytes : insertBytes)(bytes, index, newBytes))
         setCursor({ index: index + newBytes.length, area })
         setPendingNibble(null)
     }

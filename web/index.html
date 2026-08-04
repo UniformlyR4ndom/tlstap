@@ -782,6 +782,25 @@ body {
     flex-shrink: 0;
 }
 .tamper-detail-title { font-size: 12px; color: var(--text-dim); margin-right: auto; }
+.tamper-settings-wrap { position: relative; }
+.tamper-settings-panel {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    min-width: 200px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.5);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.tamper-settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.tamper-settings-row label { color: var(--text-dim); font-size: 12px; }
 .tamper-chunks-list {
     flex: 1;
     min-height: 0;
