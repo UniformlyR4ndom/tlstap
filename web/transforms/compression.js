@@ -1,4 +1,4 @@
-import { gzipSync, gunzipSync, deflateSync, inflateSync } from '../vendor/fflate.module.js'
+import { gzipSync, gunzipSync, deflateSync, inflateSync, zlibSync, unzlibSync } from '../vendor/fflate.module.js'
 
 function decompress(fn, format, bytes) {
     try {
@@ -16,14 +16,18 @@ export const OPERATIONS = {
     'gzip-decompress':    { label: 'Gzip',    run: bytes => decompress(gunzipSync, 'gzip', bytes) },
     'deflate-compress':   { label: 'Deflate', run: bytes => deflateSync(bytes) },
     'deflate-decompress': { label: 'Deflate', run: bytes => decompress(inflateSync, 'deflate', bytes) },
+    'zlib-compress':      { label: 'Zlib',    run: bytes => zlibSync(bytes) },
+    'zlib-decompress':    { label: 'Zlib',    run: bytes => decompress(unzlibSync, 'zlib', bytes) },
 }
 
 export const COMPRESS_ALGORITHMS = [
     { label: 'Gzip', op: 'gzip-compress' },
     { label: 'Deflate', op: 'deflate-compress' },
+    { label: 'Zlib', op: 'zlib-compress' },
 ]
 
 export const UNCOMPRESS_ALGORITHMS = [
     { label: 'Gzip', op: 'gzip-decompress' },
     { label: 'Deflate', op: 'deflate-decompress' },
+    { label: 'Zlib', op: 'zlib-decompress' },
 ]
