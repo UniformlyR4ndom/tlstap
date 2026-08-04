@@ -100,8 +100,8 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
     }, [entity?.id])
 
     // Tops up the buffer with newly available chunks, if there's room. Never evicts and
-    // never adjusts scroll; only appends to the tail. Shared by the refresh-button/
-    // Auto-Refresh path (refreshKey effect) and the live-poll effect below.
+    // never adjusts scroll; only appends to the tail. Shared by the refresh-button path
+    // (refreshKey effect) and the live-poll effect below.
     function topUp() {
         const e = entityRef.current
         if (!e) return
@@ -138,7 +138,7 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
         })()
     }
 
-    // Refresh button / Auto-Refresh — unconditional top-up attempt on every tick.
+    // Refresh button — unconditional top-up attempt on every tick.
     useEffect(() => {
         if (!hasMountedRef.current) { hasMountedRef.current = true; return }
         topUp()

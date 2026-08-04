@@ -30,7 +30,6 @@ export default function App() {
     const [refreshKey,   setRefreshKey]   = useState(0)
     const [openMenu,     setOpenMenu]     = useState(null)
     const [globalOffset, setGlobalOffset] = useState(true)
-    const [autoRefresh,  setAutoRefresh]  = useState(false)
     const [viewMode,     setViewMode]     = useState('single')
     const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
     const [jumpTo,       setJumpTo]       = useState(null)
@@ -45,12 +44,6 @@ export default function App() {
     const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
 
     useEffect(() => { saveMarkers(markers) }, [markers])
-
-    useEffect(() => {
-        if (!autoRefresh) return
-        const id = setInterval(() => setRefreshKey(k => k + 1), 1000)
-        return () => clearInterval(id)
-    }, [autoRefresh])
 
     // Single central live poll for SessionList/StreamList/TrafficView/CombinedView — one
     // request per tick instead of one per component. `stream` is only included while a
@@ -191,11 +184,6 @@ export default function App() {
                             <div class="menu-item" onclick=${() => { setViewMode('combined'); setOpenMenu(null) }}>
                                 <span class="menu-check">${viewMode === 'combined' ? '✓' : ''}</span>
                                 Combined streams
-                            </div>
-                            <div class="menu-sep" />
-                            <div class="menu-item" onclick=${() => { setAutoRefresh(v => !v); setOpenMenu(null) }}>
-                                <span class="menu-check">${autoRefresh ? '✓' : ''}</span>
-                                Auto-Refresh
                             </div>
                         </div>
                     `}

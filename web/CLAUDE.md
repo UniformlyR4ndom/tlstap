@@ -14,15 +14,15 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 **Layout:** Header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
 
 **Menu bar (`App.js`, `index.html`):**
-- `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), and `autoRefresh` (bool, default `false`).
+- `App.js` owns `openMenu` (null | `'view'`) and `globalOffset` (bool, default `true`).
 - A `mousedown` listener on `document` (active only while a menu is open) closes the menu when clicking outside the `.menubar` element.
-- Currently one menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), and **Auto-Refresh** toggle, each a separate separator-delimited group. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
+- Currently one menu: **View** → **Global offset** toggle and **View mode** (Single stream / Combined streams), each a separate separator-delimited group. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
 - `globalOffset` is passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` → `HexRow`.
 
 **Refresh (`App.js`):**
 - The header's `↺` button (`.btn-refresh` — icon-only, ~34×30px, no label) increments `refreshKey` (a plain counter) on click.
 - `refreshKey` is threaded into `SessionList`, `StreamList`, `TrafficView`, and `CombinedView`; each re-fetches whatever it owns when the value changes (see their respective sections below).
-- **Auto-Refresh** (View menu toggle): while `autoRefresh` is true, a `setInterval` in `App.js` calls `setRefreshKey(k => k + 1)` every 1000ms — i.e. it's just a timer clicking the same button; no separate code path. Interval is cleared on toggle-off/unmount. Independent of, and now largely redundant with, the central live poll below — kept as a manual/coarser fallback (e.g. to force-refresh sort order via `resetSortKey`, or if a poll tick was somehow missed), not the thing that keeps the UI current day-to-day anymore.
+- There used to be an Auto-Refresh toggle (View menu) that just clicked this button on a 1s timer; removed once the central live poll below made it fully redundant — every field the toggle used to keep fresh is already covered by the poll's counters.
 
 **Central live poll (`App.js`):**
 - One `usePoll(true, POLL_INTERVAL_MS, tick)` call (`usePoll.js`, 500ms) is the single source of live-ness for the whole Analysis view — `SessionList`, `StreamList`, and whichever of `TrafficView`/`CombinedView` is mounted all react to its output rather than polling themselves. This replaced an earlier per-component design (each of those four independently called its own cheap-check endpoint every tick) once `intercept/dbdump` gained a single consolidated endpoint for exactly this purpose — see "`/latest`" in its `CLAUDE.md`.
@@ -46,10 +46,10 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   - **Seed effect**, keyed on its own natural triggers (`SessionList.js`: `[refreshKey]`; `StreamList.js`: `[session?.id, refreshKey]`) — does the real fetch (`load()`), and also sets `lastSeen*Ref.current = <the prop's current value>`. Deliberately *reads* the prop without depending on it (only the entity/refresh change should reset the baseline; the prop moving on its own is the next effect's job) — same "read fresh, not a dependency" convention `ResizeHandle.js`'s `onResize` uses.
   - **Poll-reaction effect**, keyed on `[latestSessionId]` / `[streamsVersion]` — compares the incoming value against `lastSeen*Ref.current`; only on a genuine difference does it update the ref and re-run `load()`.
   - Seeding from the prop's already-available value (rather than an extra network round trip) means the very next poll tick can't spuriously see a stale baseline and re-trigger a redundant fetch of what the seed effect's own `load()` just fetched — the value being seeded from *is* what the next tick will be compared against.
-  - `SessionList.js` previously had no live-poll equivalent at all (new sessions were Refresh/Auto-Refresh-only); it now gets one for free from the same `latestSessionId` prop, no session/stream scoping needed since it's a global counter (see `intercept/dbdump/CLAUDE.md`'s `/latest`).
+  - `SessionList.js` previously had no live-poll equivalent at all (new sessions were Refresh-only); it now gets one for free from the same `latestSessionId` prop, no session/stream scoping needed since it's a global counter (see `intercept/dbdump/CLAUDE.md`'s `/latest`).
 
 **Duration formatting:**
-- `fmtDuration(start, end)` (`format.js`, used by `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh/Auto-Refresh) naturally advance this since it's computed fresh each render.
+- `fmtDuration(start, end)` (`format.js`, used by `StreamList.js` and `TrafficView.js`) — for finished streams (`end` set) formats `end - start`; for ongoing streams (`end` falsy) formats `Date.now() - start` the same way and appends `" (ongoing)"`, e.g. `12.34s (ongoing)`. Re-renders (including ones triggered by Refresh) naturally advance this since it's computed fresh each render.
 
 **Resizable panels (`ResizeHandle.js`, `layout.js`, `useResizableLayout.js`):**
 - `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the duration of the drag (removed on `mouseup`); each `mousemove` calls `onResize(ev.movementX)` (orientation `v`) or `onResize(ev.movementY)` (orientation `h`). The caller owns the resulting size state, clamping and sign convention (a handle placed *after* the sized element in DOM order treats a positive delta as "grow"; a handle placed *before* it treats a negative delta as "grow"). `onResize` is only ever read fresh from props at `mousedown` time (never captured in an effect's dependency array), so its identity doesn't need to be stable across renders — nothing memoizes it, deliberately.
@@ -168,7 +168,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   `handleScrollEnd`. Called from both places below.
 - **Refresh top-up**: a `useEffect` keyed on `refreshKey` (guarded by `hasMountedRef` so
   the initial mount is a no-op) calls `topUp()` unconditionally on every tick — this is
-  the Refresh-button/Auto-Refresh path.
+  the Refresh-button path.
 - **Live-poll reaction**: a plain `useEffect(() => { if (latestId != null && latestId >=
   nextIdRef.current) topUp() }, [latestId])` — no fetching, no interval, no `isClosed`/
   `loadingMoreRef` check here, since `topUp()` already guards on all of that itself. The
@@ -177,7 +177,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   (`intercept/dbdump`'s consolidated `/latest` endpoint — see its `CLAUDE.md`), which is
   what makes a poll tick with nothing new cost one shared indexed query server-side and
   zero chunk fetches, rather than one query per mounted view. This is what actually keeps
-  the currently-open view live without the user touching Refresh/Auto-Refresh.
+  the currently-open view live without the user touching Refresh.
   Note: `dbdump`'s chunk writes are themselves buffered and flushed at most once/second
   (see its `CLAUDE.md`'s "Async write buffer"), so polling faster than that narrows the
   average wait but doesn't make new data appear before the next flush.
