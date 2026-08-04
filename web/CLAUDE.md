@@ -42,6 +42,20 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - `refreshKey` is threaded into `SessionList`, `StreamList`, `TrafficView`, and `CombinedView`; each re-fetches whatever it owns when the value changes (see their respective sections below).
 - There used to be an Auto-Refresh toggle (View menu) that just clicked this button on a 1s timer; removed once the central live poll below made it fully redundant — every field the toggle used to keep fresh is already covered by the poll's counters.
 
+**Jump to top / jump to bottom (`App.js`, `.btn-icon`):** two icon buttons (SVG, `fill:
+currentColor`, same solid-glyph language as `↺`/`✓`/`▲`/`▼` — bar+arrow, mirror-symmetric)
+placed left of Refresh. `App.js` owns one ref, `viewJumpRef = useRef({jumpToTop: () => {},
+jumpToBottom: () => {}})` (no-op defaults so the buttons can never throw before a view
+registers) — passed as `jumpRef` to both `TrafficView`/`CombinedView`, which are mounted
+mutually-exclusively under `viewMode`, so there's only ever one live writer. Each view
+registers via `useEffect(() => { jumpRef.current = { jumpToTop, jumpToBottom } })` (no
+dependency array — see their respective sections). The buttons themselves just call
+`viewJumpRef.current.jumpToTop()`/`.jumpToBottom()`; the actual work (`jumpToTop`/
+`jumpToBottom`) lives in `useChunkBuffer.js` — see "Jump to top/bottom" under the hook's
+section below. These are genuine reloads of the chunk buffer via `reloadFrom` (same as
+every other jump in this app), not a scroll over already-loaded rows — nothing assumes the
+target chunk is already buffered.
+
 **Central live poll (`App.js`):**
 - One `usePoll(true, POLL_INTERVAL_MS, tick)` call (`usePoll.js`, 500ms) is the single source of live-ness for the whole Analysis view — `SessionList`, `StreamList`, and whichever of `TrafficView`/`CombinedView` is mounted all react to its output rather than polling themselves. This replaced an earlier per-component design (each of those four independently called its own cheap-check endpoint every tick) once `intercept/dbdump` gained a single consolidated endpoint for exactly this purpose — see "`/latest`" in its `CLAUDE.md`.
 - Each tick calls `getLatest(params)` (`api.js`), building `params` from current selection: `{session: session.id}` if a session is selected, plus `stream: stream.id` only when `viewMode === 'single'` and a stream is selected too (`CombinedView` has no use for `latest_stid`, so it's left out server-side rather than fetched and ignored). The raw `{latest_session_id, latest_sgid, streams_version, latest_stid}` response is stored as-is in a `latest` state object (field names kept snake_case, matching the wire response directly — no camelCase translation layer) and passed down as four separately-named props: `latestSessionId` (`SessionList`), `streamsVersion` (`StreamList`), `latestStid` (`TrafficView`), `latestSgid` (`CombinedView`).
@@ -95,7 +109,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 - A `ResizeObserver` tracks container height; `onScroll` tracks `scrollTop`. Visible window is `[startIdx, endIdx)`. Inner div height = `rows.length * ROW_HEIGHT`; top/bottom spacer divs fill the rest.
 - **Prefetch trigger** (`scrollend` event): fires `onScrollEnd(1)` when fewer than `rows.length * PREFETCH_FRACTION` rows remain below the viewport; `onScrollEnd(-1)` when fewer remain above.
 - **Scroll correction** (`useLayoutEffect([adjustVersion])`): applies signed `scrollAdjust` to `scrollTop` synchronously before paint. Negative = scroll up (after front eviction); positive = scroll down (after prepend).
-- **Absolute scroll** (`useLayoutEffect([scrollToVersion])`): sets `scrollTop = scrollTo` synchronously before paint. Used by jump-to. `scrollToVersion` must change to trigger even if `scrollTo` value is the same.
+- **Absolute scroll** (`useLayoutEffect([scrollToVersion])`): clamps `scrollTo` to `[0, el.scrollHeight - el.clientHeight]` (the DOM's own real scrollable range) and sets both `scrollTop` and internal `scrollTop` state to that clamped value, synchronously before paint. Used by jump-to. `scrollToVersion` must change to trigger even if `scrollTo` value is the same. The clamp is what lets `jumpToBottom()` (`useChunkBuffer.js`) pass a deliberately-oversized `scrollTo` and land exactly at the true end without the caller needing to know its own viewport height; it's also a correctness fix in general — without it, a `scrollTo` outside the legal range would still get silently clamped at the DOM level by the browser, but the React-side `scrollTop` state would keep the raw unclamped value, diverging from the real DOM and corrupting the virtualization math (`startIdx`/`endIdx`) that reads from that state.
 - **Global/local offset**: `HexRow` displays `row.offset` (stream-global byte offset) when `globalOffset` is true, or `row.localOffset` (offset within the chunk, resets to 0 at each chunk start) when false.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
 - **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
@@ -131,7 +145,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   fetched chunk and a header row built from it always carry the same id field name
   within a given caller, so one `getId(obj)` accessor works on both shapes.
 - `useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId })`
-  → `{ display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef }`. `entity` is the
+  → `{ display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom }`. `entity` is the
   current stream or session (or null); `openStream` is `openStidStream`/`openSgidStream`
   (`api.js`, same `() => {fetch, close}` shape either way); `fetchPage(ws, entity, startId, n)`
   wraps whatever entity-specific args `ws.fetch(...)` needs (`TrafficView.js`:
@@ -203,9 +217,35 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   its own cheap-check endpoint — collapsed into `App.js`'s single poll once `/latest`
   existed to serve every consumer from one request; see `usePoll.js`'s own header comment
   for why it's a thin, reusable `setInterval` wrapper regardless of caller count.)
+- **`jumpToTop()` / `jumpToBottom()`** (back `App.js`'s header buttons — see "Jump to
+  top/bottom" above): both a genuine `reloadFrom` (a fresh window fetch, not a scroll over
+  already-loaded rows), same as every other jump in this app. `jumpToTop()` is just
+  `reloadFrom(0, {computeExtra: () => ({scrollTo: 0, scrollToVersion})})`. `jumpToBottom()`
+  is a no-op if `latestId` is unset/`-1` (nothing loaded yet — same failure mode Refresh
+  already has, no `disabled`-button plumbing added since this codebase doesn't use one
+  anywhere); otherwise it fetches a `BATCH`-sized window ending at `latestId`
+  (`startId = max(0, latestId - BATCH + 1)`) and sets `scrollTo: Number.MAX_SAFE_INTEGER`
+  — `HexDump.js`'s scroll-to effect (see its section) clamps that against the DOM's real
+  `scrollHeight`/`clientHeight`, landing exactly at the true end without either view
+  needing to track its own viewport height.
+  `scrollToVersion` in both is computed as `(displayRef.current.scrollToVersion ?? 0) + 1`
+  rather than a separate counter owned by the hook. This matters specifically for
+  `TrafficView.js`: its own jump effect (search/marker/remember-position jumps, sourced
+  from `App.js`'s independent `jumpTo.version` counter) writes into this same
+  `display.scrollToVersion` field through a different path. Two independently-incrementing
+  counters feeding one field risks landing on the same number by coincidence, which would
+  make `HexDump.js`'s `[scrollToVersion]`-keyed effect silently miss the jump (no value
+  change → no re-fire). Reading the live value and incrementing it sidesteps that —
+  the next version is always based on whatever `HexDump` currently actually holds,
+  regardless of which of the two paths last wrote it. `CombinedView.js` has no competing
+  writer today, but both call sites use the same hook function for consistency.
 
 **`TrafficView.js`-specific layer on top of the hook:**
-- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`.
+- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`, `jumpRef`.
+- `jumpRef`: a ref `App.js` owns (see "Jump to top/bottom" above); a dependency-array-free
+  `useEffect(() => { if (jumpRef) jumpRef.current = { jumpToTop, jumpToBottom } })` keeps
+  it pointed at the hook's current `jumpToTop`/`jumpToBottom` every render, since neither
+  is a stable identity from the hook. `CombinedView.js` has the identical effect.
 - `handleSetMarker` / `handleClearMarker` are local (not lifted); `onSetExtractStart/End/Range` are forwarded directly to `HexDump`.
 - `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state,
   independent of the hook's `display` — its own small effect mirrors it on `stream?.id`.
@@ -244,8 +284,12 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   scroll/resize tick — cheap ref writes only; the row lookup itself only ever runs once, at
   leave time, not on every tick.
 
-**`CombinedView.js`-specific layer on top of the hook:** none beyond the hook call and
-the `<HexDump>` render — no jump-to, no markers, no extract-selection, no `totalBytes`.
+**`CombinedView.js`-specific layer on top of the hook:** almost none — no markers, no
+extract-selection, no `totalBytes`, and no `jumpTo`-driven byte/chunk-offset jump effect
+(`TrafficView.js`-only). The one thing it does have is the `jumpRef` registration effect
+described above, and (unlike `TrafficView.js`) it's the only place `scrollTo`/
+`scrollToVersion` get threaded to `<HexDump>` at all, since jump-to-top/bottom was
+`CombinedView.js`'s first use of absolute scroll positioning.
 
 **Goto panel (`GoToPanel.js`):**
 - Text input (accepts decimal or `0x`-prefixed hex).

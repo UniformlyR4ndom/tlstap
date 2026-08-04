@@ -1,4 +1,5 @@
 import { h } from 'preact'
+import { useEffect } from 'preact/hooks'
 import htm from 'htm'
 import { openSgidStream } from '../api.js'
 import HexDump from './HexDump.js'
@@ -40,8 +41,8 @@ function buildRows(chunks, sessionStart) {
     return rows
 }
 
-export default function CombinedView({ session, globalOffset, refreshKey, latestSgid }) {
-    const { display, loading, error, handleScrollEnd } = useChunkBuffer({
+export default function CombinedView({ session, globalOffset, refreshKey, latestSgid, jumpRef }) {
+    const { display, loading, error, handleScrollEnd, jumpToTop, jumpToBottom } = useChunkBuffer({
         entity: session,
         refreshKey,
         openStream: openSgidStream,
@@ -50,6 +51,9 @@ export default function CombinedView({ session, globalOffset, refreshKey, latest
         buildRows,
         latestId: latestSgid,
     })
+
+    // See TrafficView.js's identical effect for why this has no dependency array.
+    useEffect(() => { if (jumpRef) jumpRef.current = { jumpToTop, jumpToBottom } })
 
     if (!session) return html`<div class="placeholder">Select a session to view combined traffic</div>`
 
@@ -66,6 +70,8 @@ export default function CombinedView({ session, globalOffset, refreshKey, latest
                 onScrollEnd=${handleScrollEnd}
                 scrollAdjust=${display.scrollAdjust}
                 adjustVersion=${display.adjustVersion}
+                scrollTo=${display.scrollTo}
+                scrollToVersion=${display.scrollToVersion}
                 globalOffset=${globalOffset}
             />
         </div>

@@ -42,11 +42,16 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
         }
     }, [adjustVersion])
 
-    // Set absolute scroll position synchronously before paint (used by jump-to).
+    // Set absolute scroll position synchronously before paint (used by jump-to). Clamped
+    // against the DOM's own scrollable range so an intentionally-oversized `scrollTo`
+    // (jump-to-bottom) lands exactly at the true end, and so React's `scrollTop` state
+    // never drifts from what the browser actually applied.
     useLayoutEffect(() => {
         if (scrollToVersion > 0 && containerRef.current) {
-            containerRef.current.scrollTop = scrollTo
-            setScrollTop(scrollTo)
+            const el = containerRef.current
+            const clamped = Math.max(0, Math.min(scrollTo, el.scrollHeight - el.clientHeight))
+            el.scrollTop = clamped
+            setScrollTop(clamped)
         }
     }, [scrollToVersion])
 

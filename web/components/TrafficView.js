@@ -48,14 +48,14 @@ function buildRows(chunks, streamStart) {
     return rows
 }
 
-export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream }) {
+export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
     const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
     const viewHeightRef = useRef(0)
     const scrollTopRef = useRef(0)
 
-    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef } = useChunkBuffer({
+    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom } = useChunkBuffer({
         entity: stream,
         refreshKey,
         openStream: openStidStream,
@@ -70,6 +70,11 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     useEffect(() => {
         setTotalBytes(stream ? { up: stream.length0 ?? -1, down: stream.length1 ?? -1 } : { up: -1, down: -1 })
     }, [stream?.id])
+
+    // Exposes the hook's jump functions to App.js's header buttons. No dependency array —
+    // jumpToTop/jumpToBottom aren't stable identities from the hook, so this just re-runs
+    // every render rather than risk going stale behind a gated dependency array.
+    useEffect(() => { if (jumpRef) jumpRef.current = { jumpToTop, jumpToBottom } })
 
     // Jump effect — resolves jumpTo to a target stid, then calls the hook's reloadFrom.
     // `cancelled` guards against a stale resolution superseding a newer jump.

@@ -152,6 +152,28 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
         if (latestId != null && latestId >= nextIdRef.current) topUp()
     }, [latestId])
 
+    // Jump-to-top/bottom (App.js's header buttons, via each caller's own jumpRef wiring).
+    // Both go through reloadFrom — a genuine reload of the buffer window, not a scroll
+    // over already-loaded rows. The version passed to computeExtra is read fresh off
+    // displayRef rather than kept as a separate counter here, since TrafficView.js's own
+    // jump effect (search/marker/remember-position jumps) writes into this same
+    // display.scrollToVersion field through a different path — always basing the next
+    // version off whatever's currently there (regardless of which path wrote it last)
+    // avoids two independent counters coincidentally landing on the same number, which
+    // would make HexDump.js's version-keyed effect silently miss the jump.
+    function jumpToTop() {
+        if (!entityRef.current) return
+        const version = (displayRef.current.scrollToVersion ?? 0) + 1
+        reloadFrom(0, { computeExtra: () => ({ scrollTo: 0, scrollToVersion: version }) })
+    }
+
+    function jumpToBottom() {
+        if (!entityRef.current || latestId == null || latestId < 0) return
+        const version = (displayRef.current.scrollToVersion ?? 0) + 1
+        const startId = Math.max(0, latestId - BATCH + 1)
+        reloadFrom(startId, { computeExtra: () => ({ scrollTo: Number.MAX_SAFE_INTEGER, scrollToVersion: version }) })
+    }
+
     // Stable callback — reads all mutable state via refs.
     const handleScrollEnd = useCallback(async (scrollDir) => {
         const goingForward = scrollDir === 1
@@ -220,5 +242,5 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
     // setError lets a caller's own async work surface a failure before reloadFrom is
     // even called. displayRef lets a caller read current rows without needing its own
     // mirroring effect.
-    return { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef }
+    return { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom }
 }

@@ -47,6 +47,7 @@ export default function App() {
     const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
     const positionsRef       = useRef(new Map())  // posKey(stream) -> { direction, offset }, in-memory only
     const rememberPositionRef = useRef(rememberPosition)
+    const viewJumpRef    = useRef({ jumpToTop: () => {}, jumpToBottom: () => {} })  // whichever of TrafficView/CombinedView is mounted registers here
 
     useEffect(() => { saveMarkers(markers) }, [markers])
     useEffect(() => { rememberPositionRef.current = rememberPosition }, [rememberPosition])
@@ -177,6 +178,12 @@ export default function App() {
         <div class="layout">
             <header class="header">
                 <span class="title">tlstap · Traffic Analyzer</span>
+                <button class="btn btn-icon" onclick=${() => viewJumpRef.current.jumpToTop()} title="Jump to top">
+                    <svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="2" rx="1" /><polygon points="12,9 17,15 14,15 14,20 10,20 10,15 7,15" /></svg>
+                </button>
+                <button class="btn btn-icon" onclick=${() => viewJumpRef.current.jumpToBottom()} title="Jump to bottom">
+                    <svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="17" width="14" height="2" rx="1" /><polygon points="12,15 17,9 14,9 14,4 10,4 10,9 7,9" /></svg>
+                </button>
                 <button class="btn btn-refresh" onclick=${() => setRefreshKey(k => k + 1)} title="Refresh">↺</button>
             </header>
             <div class="top-tabs">
@@ -233,9 +240,10 @@ export default function App() {
                 <${ResizeHandle} orientation="v" onResize=${handleSidebarResize} />
                 <main class="main">
                     ${viewMode === 'combined'
-                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} latestSgid=${latest.latest_sgid} />`
+                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} latestSgid=${latest.latest_sgid} jumpRef=${viewJumpRef} />`
                         : html`<${TrafficView}
                             stream=${stream}
+                            jumpRef=${viewJumpRef}
                             globalOffset=${globalOffset}
                             jumpTo=${jumpTo}
                             refreshKey=${refreshKey}
