@@ -48,13 +48,14 @@ function buildRows(chunks, streamStart) {
     return rows
 }
 
-export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange }) {
+export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
     const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
     const viewHeightRef = useRef(0)
+    const scrollTopRef = useRef(0)
 
-    const { display, loading, error, setError, handleScrollEnd, reloadFrom } = useChunkBuffer({
+    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef } = useChunkBuffer({
         entity: stream,
         refreshKey,
         openStream: openStidStream,
@@ -130,7 +131,23 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
 
     const handleViewportChange = useCallback((scrollTop, height) => {
         viewHeightRef.current = height
+        scrollTopRef.current = scrollTop
     }, [])
+
+    // Reports the byte position at the top of the viewport when leaving a stream, for
+    // "remember stream position" (App.js). Resolved lazily here (not on every scroll
+    // tick) since it's only ever needed once, at leave time.
+    useEffect(() => {
+        const leavingStream = stream
+        return () => {
+            if (!leavingStream) return
+            const rows = displayRef.current.rows
+            let i = Math.floor(scrollTopRef.current / ROW_HEIGHT)
+            while (i < rows.length && rows[i].type === 'header') i++
+            const row = rows[i]
+            if (row?.type === 'hex') onLeaveStream?.(leavingStream, { direction: row.direction, offset: row.offset })
+        }
+    }, [stream?.id])
 
     const handleSetMarker = useCallback((direction, offset) => {
         if (!stream) return

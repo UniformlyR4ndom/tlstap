@@ -14,10 +14,28 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 **Layout:** Header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
 
 **Menu bar (`App.js`, `index.html`):**
-- `App.js` owns `openMenu` (null | `'view'`) and `globalOffset` (bool, default `true`).
+- `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), and `rememberPosition` (bool, default `false`).
 - A `mousedown` listener on `document` (active only while a menu is open) closes the menu when clicking outside the `.menubar` element.
-- Currently one menu: **View** → **Global offset** toggle and **View mode** (Single stream / Combined streams), each a separate separator-delimited group. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
+- Currently one menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), and **Remember stream position** toggle, each a separate separator-delimited group. The checkmark (✓) uses `.menu-check` styled with `var(--accent)`.
 - `globalOffset` is passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` → `HexRow`.
+- **Remember stream position** (single-stream view only, no `CombinedView.js` equivalent):
+  while on, `App.js` remembers the byte offset/direction at the top of the viewport for
+  each stream visited — in-memory only (a plain `positionsRef = useRef(new Map())`, never
+  persisted, cleared on reload), keyed by `` `${session}:${id}` `` (`posKey(s)`) since
+  stream `id` is only unique within a session (`PRIMARY KEY (session, id)` in
+  `intercept/dbdump`'s schema — same reason `markers.js`-backed markers key on
+  `{session, stream}` too). `selectStream(s)` (wired as `StreamList`'s `onSelect`, replacing
+  a bare `setStream`) looks up a saved position and, if found, calls `jumpToOffset(s,
+  direction, offset, 'top')` instead of `setStream(s)` — reusing the same
+  select-a-stream-and-scroll-to-a-byte-offset path `handleSearchJump` already uses, just
+  with `align: 'top'` so the restored view matches what was actually captured (top of
+  viewport) rather than centering. Re-clicking the already-selected stream is a no-op
+  (guarded explicitly), so it can't clobber wherever the user has since scrolled to with a
+  stale remembered position. `TrafficView.js`'s save side is documented below.
+  Toggling **View mode** away from Single and back (same stream still selected) does
+  record a position on the way out but does not auto-restore on the way back in, since
+  that transition doesn't go through `selectStream`/`jumpToOffset` — only reselecting via
+  the Streams list triggers a restore.
 
 **Refresh (`App.js`):**
 - The header's `↺` button (`.btn-refresh` — icon-only, ~34×30px, no label) increments `refreshKey` (a plain counter) on click.
@@ -113,7 +131,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   fetched chunk and a header row built from it always carry the same id field name
   within a given caller, so one `getId(obj)` accessor works on both shapes.
 - `useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId })`
-  → `{ display, loading, error, setError, handleScrollEnd, reloadFrom }`. `entity` is the
+  → `{ display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef }`. `entity` is the
   current stream or session (or null); `openStream` is `openStidStream`/`openSgidStream`
   (`api.js`, same `() => {fetch, close}` shape either way); `fetchPage(ws, entity, startId, n)`
   wraps whatever entity-specific args `ws.fetch(...)` needs (`TrafficView.js`:
@@ -187,7 +205,7 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
   for why it's a thin, reusable `setInterval` wrapper regardless of caller count.)
 
 **`TrafficView.js`-specific layer on top of the hook:**
-- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`.
+- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`.
 - `handleSetMarker` / `handleClearMarker` are local (not lifted); `onSetExtractStart/End/Range` are forwarded directly to `HexDump`.
 - `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state,
   independent of the hook's `display` — its own small effect mirrors it on `stream?.id`.
@@ -208,12 +226,23 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
     directions); otherwise finds the header row with `row.stid === targetStid` — then
     returns `{scrollTo, scrollToVersion: jumpTo.version}`. Default (Goto/Search jumps)
     centers the row in the viewport (`targetRowPx - viewHeight/2`); if `jumpTo.align ===
-    'top'` (set only by marker jumps — see `App.js`'s `handleMarkerTabJump`/
-    `handleStreamLoad`), the row is instead placed at the very top of the viewport
+    'top'` (set by marker jumps — `App.js`'s `handleMarkerTabJump`/`handleStreamLoad` — and
+    by a remembered-position restore — `App.js`'s `selectStream`, see "Remember stream
+    position" above), the row is instead placed at the very top of the viewport
     (`scrollTo = targetRowPx` directly).
   - A resolution failure (the `getChunkStid`/`getByteStid` call itself throwing) calls
     the hook's `setError` directly, since `reloadFrom` is never reached in that case.
 - `buildRows(chunks, streamStart)`: each hex row carries both `offset` (global stream byte offset) and `localOffset` (byte offset within the chunk).
+- **Leave effect** (`useEffect([stream?.id])`, save side of "Remember stream position"
+  above): does nothing on setup; its *cleanup* (fires on stream change or unmount, closing
+  over the stream being left) resolves the row at `Math.floor(scrollTopRef.current /
+  ROW_HEIGHT)` in `displayRef.current.rows` (the hook's own live-rows ref, returned
+  alongside `display`/`reloadFrom`/etc. specifically so callers don't need their own
+  mirroring effect), scanning forward past any `'header'` row to the next `'hex'` row, and
+  calls `onLeaveStream(leavingStream, {direction, offset})` if one was found. `scrollTopRef`
+  (alongside the pre-existing `viewHeightRef`) is stashed by `handleViewportChange` on every
+  scroll/resize tick — cheap ref writes only; the row lookup itself only ever runs once, at
+  leave time, not on every tick.
 
 **`CombinedView.js`-specific layer on top of the hook:** none beyond the hook call and
 the `<HexDump>` render — no jump-to, no markers, no extract-selection, no `totalBytes`.

@@ -218,6 +218,7 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
     }, [])
 
     // setError lets a caller's own async work surface a failure before reloadFrom is
-    // even called.
-    return { display, loading, error, setError, handleScrollEnd, reloadFrom }
+    // even called. displayRef lets a caller read current rows without needing its own
+    // mirroring effect.
+    return { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef }
 }

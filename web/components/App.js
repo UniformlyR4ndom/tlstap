@@ -21,6 +21,8 @@ const html = htm.bind(h)
 
 const POLL_INTERVAL_MS = 500
 
+function posKey(s) { return `${s.session}:${s.id}` }
+
 export default function App() {
     const [view,         setView]         = useState('analysis') // 'analysis' | 'tamper'
     const [session,      setSession]      = useState(null)
@@ -30,6 +32,7 @@ export default function App() {
     const [refreshKey,   setRefreshKey]   = useState(0)
     const [openMenu,     setOpenMenu]     = useState(null)
     const [globalOffset, setGlobalOffset] = useState(true)
+    const [rememberPosition, setRememberPosition] = useState(false)
     const [viewMode,     setViewMode]     = useState('single')
     const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
     const [jumpTo,       setJumpTo]       = useState(null)
@@ -42,8 +45,11 @@ export default function App() {
     const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
     const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
+    const positionsRef       = useRef(new Map())  // posKey(stream) -> { direction, offset }, in-memory only
+    const rememberPositionRef = useRef(rememberPosition)
 
     useEffect(() => { saveMarkers(markers) }, [markers])
+    useEffect(() => { rememberPositionRef.current = rememberPosition }, [rememberPosition])
 
     // Single central live poll for SessionList/StreamList/TrafficView/CombinedView — one
     // request per tick instead of one per component. `stream` is only included while a
@@ -90,10 +96,22 @@ export default function App() {
     }
     function handleGoTo(args) { setJumpTo(prev => ({ ...args, version: (prev?.version ?? 0) + 1 })) }
 
-    function jumpToOffset(streamObj, direction, offset) {
+    function jumpToOffset(streamObj, direction, offset, align) {
         if (stream?.id !== streamObj.id) setStream(streamObj)
         const unit = direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
-        setJumpTo(prev => ({ value: offset, unit, version: (prev?.version ?? 0) + 1 }))
+        setJumpTo(prev => ({ value: offset, unit, align, version: (prev?.version ?? 0) + 1 }))
+    }
+
+    function selectStream(s) {
+        if (stream?.session === s.session && stream?.id === s.id) return
+        const saved = rememberPosition ? positionsRef.current.get(posKey(s)) : null
+        if (saved) jumpToOffset(s, saved.direction, saved.offset, 'top')
+        else setStream(s)
+    }
+
+    function handleLeaveStream(streamObj, position) {
+        if (!rememberPositionRef.current || !position) return
+        positionsRef.current.set(posKey(streamObj), position)
     }
 
     function handleSearchJump({ streamId, direction, offset }) {
@@ -185,6 +203,11 @@ export default function App() {
                                 <span class="menu-check">${viewMode === 'combined' ? '✓' : ''}</span>
                                 Combined streams
                             </div>
+                            <div class="menu-sep" />
+                            <div class="menu-item" onclick=${() => { setRememberPosition(v => !v); setOpenMenu(null) }}>
+                                <span class="menu-check">${rememberPosition ? '✓' : ''}</span>
+                                Remember stream position
+                            </div>
                         </div>
                     `}
                 </div>
@@ -201,7 +224,7 @@ export default function App() {
                     <${StreamList}
                         session=${session}
                         selected=${stream}
-                        onSelect=${setStream}
+                        onSelect=${selectStream}
                         onLoad=${handleStreamLoad}
                         refreshKey=${refreshKey}
                         streamsVersion=${latest.streams_version}
@@ -226,6 +249,7 @@ export default function App() {
                             onSetExtractStart=${handleSetExtractStart}
                             onSetExtractEnd=${handleSetExtractEnd}
                             onSetExtractRange=${handleSetExtractRange}
+                            onLeaveStream=${handleLeaveStream}
                           />`
                     }
                 </main>
