@@ -3,11 +3,56 @@ import { useEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
 import {
     EditorState, EditorView, Compartment, basicSetup, keymap, indentWithTab,
-    javascript,
+    javascript, scopeCompletionSource,
     HighlightStyle, syntaxHighlighting, tags,
 } from '../vendor/codemirror.module.js'
+import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
+import { camelCaseOpId } from '../scriptRuntime.js'
 
 const html = htm.bind(h)
+
+// Reflection-only mirror of the real `self.tamper` API built by scriptRuntime.js's
+// BOOTSTRAP, for scopeCompletionSource to read property names/types off of — never called.
+// transform's shape is generated from OPERATIONS_BY_CATEGORY/camelCaseOpId, the same inputs
+// BOOTSTRAP itself uses, so a new transform op appears here without a separate update.
+const TAMPER_COMPLETION_SHAPE = {
+    register: () => {},
+    peek: () => {},
+    release: () => {},
+    dropConnection: () => {},
+    setIntercept: () => {},
+    listStreams: () => {},
+    fs: {
+        listFiles: () => {},
+        readFile: () => {},
+        writeFile: () => {},
+        appendFile: () => {},
+    },
+    transform: Object.fromEntries(Object.entries(OPERATIONS_BY_CATEGORY).map(([category, ops]) =>
+        [category, Object.fromEntries(Object.keys(ops).map(opId => [camelCaseOpId(opId), () => {}]))])),
+    encode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
+    decode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
+    log: () => {},
+}
+
+// Same idea as TAMPER_COMPLETION_SHAPE, mirroring makeCtx()'s return value in
+// scriptRuntime.js (minus __flush, internal-only there). scopeCompletionSource matches on
+// identifier text alone, not real lexical scope, so `ctx.` completes anywhere in the
+// document — including outside an onReceive callback, where no such binding exists. That's
+// a one-time, deliberate imprecision, not a per-keystroke computation: harmless since it
+// only ever adds unwanted suggestions, never blocks or slows typing.
+const CTX_COMPLETION_SHAPE = {
+    conn: 0,
+    direction: 'c2s',
+    newLength: 0,
+    get: () => {},
+    set: () => {},
+    append: () => {},
+    release: () => {},
+    drop: () => {},
+    pause: () => {},
+    log: () => {},
+}
 
 // Dark theme + syntax colors matching this app's own CSS variables (index.html) — kept
 // here rather than in index.html's CSS since CodeMirror styles its content via classed
@@ -65,13 +110,15 @@ export default function ScriptEditor({ value, onChange, loadVersion, readOnly = 
     useEffect(() => {
         const readOnlyCompartment = new Compartment()
         readOnlyCompartmentRef.current = readOnlyCompartment
+        const jsLanguage = javascript()
         const view = new EditorView({
             state: EditorState.create({
                 doc: value,
                 extensions: [
                     basicSetup,
                     keymap.of([indentWithTab]),
-                    javascript(),
+                    jsLanguage,
+                    jsLanguage.language.data.of({ autocomplete: scopeCompletionSource({ tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE }) }),
                     syntaxHighlighting(highlightStyle),
                     theme,
                     readOnlyCompartment.of(EditorState.readOnly.of(readOnly)),

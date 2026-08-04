@@ -17,7 +17,7 @@
 //   export { EditorState, Compartment } from '@codemirror/state'
 //   export { EditorView, keymap } from '@codemirror/view'
 //   export { basicSetup } from 'codemirror'
-//   export { javascript } from '@codemirror/lang-javascript'
+//   export { javascript, scopeCompletionSource } from '@codemirror/lang-javascript'
 //   export { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 //   export { tags } from '@lezer/highlight'
 //   export { indentWithTab } from '@codemirror/commands'
@@ -29,8 +29,10 @@
 // @lezer/highlight 1.2.3 (@codemirror/commands, @codemirror/autocomplete, and
 // @lezer/javascript pulled in transitively -- `codemirror`'s own `basicSetup` still
 // includes CodeMirror's baseline keyword/local-variable completion regardless of this
-// file's own export list; only the tlstap-specific completion source built on top of it
-// (formerly web/scriptCompletion.js) has been removed, not CodeMirror's own machinery).
+// file's own export list). `scopeCompletionSource` resolves only the exact dotted path
+// already typed by indexing straight into a given object and listing its own properties
+// plus prototype chain (bounded by that chain's length) -- no unbounded recursion --
+// which is what ScriptEditor.js uses for tamper.* completion in the Tamper scripting tab.
 // node_modules/@marijn/find-cluster-break/src/index.js
 var rangeFrom = [];
 var rangeTo = [];
@@ -25071,6 +25073,87 @@ function localCompletionSource(context) {
     validFor: Identifier
   };
 }
+function pathFor(read, member, name2) {
+  var _a2;
+  let path = [];
+  for (; ; ) {
+    let obj = member.firstChild, prop;
+    if ((obj === null || obj === void 0 ? void 0 : obj.name) == "VariableName") {
+      path.push(read(obj));
+      return { path: path.reverse(), name: name2 };
+    } else if ((obj === null || obj === void 0 ? void 0 : obj.name) == "MemberExpression" && ((_a2 = prop = obj.lastChild) === null || _a2 === void 0 ? void 0 : _a2.name) == "PropertyName") {
+      path.push(read(prop));
+      member = obj;
+    } else {
+      return null;
+    }
+  }
+}
+function completionPath(context) {
+  let read = (node) => context.state.doc.sliceString(node.from, node.to);
+  let inner = syntaxTree(context.state).resolveInner(context.pos, -1);
+  if (inner.name == "PropertyName") {
+    return pathFor(read, inner.parent, read(inner));
+  } else if ((inner.name == "." || inner.name == "?.") && inner.parent.name == "MemberExpression") {
+    return pathFor(read, inner.parent, "");
+  } else if (dontComplete.indexOf(inner.name) > -1) {
+    return null;
+  } else if (inner.name == "VariableName" || inner.to - inner.from < 20 && Identifier.test(read(inner))) {
+    return { path: [], name: read(inner) };
+  } else if (inner.name == "MemberExpression") {
+    return pathFor(read, inner, "");
+  } else {
+    return context.explicit ? { path: [], name: "" } : null;
+  }
+}
+function enumeratePropertyCompletions(obj, top2) {
+  let originalObj = obj;
+  let options = [], seen = /* @__PURE__ */ new Set();
+  for (let depth = 0; ; depth++) {
+    for (let name2 of (Object.getOwnPropertyNames || Object.keys)(obj)) {
+      if (!/^[a-zA-Z_$\xaa-\uffdc][\w$\xaa-\uffdc]*$/.test(name2) || seen.has(name2))
+        continue;
+      seen.add(name2);
+      let value;
+      try {
+        value = originalObj[name2];
+      } catch (_) {
+        continue;
+      }
+      options.push({
+        label: name2,
+        type: typeof value == "function" ? /^[A-Z]/.test(name2) ? "class" : top2 ? "function" : "method" : top2 ? "variable" : "property",
+        boost: -depth
+      });
+    }
+    let next = Object.getPrototypeOf(obj);
+    if (!next)
+      return options;
+    obj = next;
+  }
+}
+function scopeCompletionSource(scope) {
+  let cache2 = /* @__PURE__ */ new Map();
+  return (context) => {
+    let path = completionPath(context);
+    if (!path)
+      return null;
+    let target = scope;
+    for (let step of path.path) {
+      target = target[step];
+      if (!target)
+        return null;
+    }
+    let options = cache2.get(target);
+    if (!options)
+      cache2.set(target, options = enumeratePropertyCompletions(target, !path.path.length));
+    return {
+      from: context.pos - path.name.length,
+      options,
+      validFor: Identifier
+    };
+  };
+}
 var javascriptLanguage = /* @__PURE__ */ LRLanguage.define({
   name: "javascript",
   parser: /* @__PURE__ */ parser.configure({
@@ -25216,6 +25299,7 @@ export {
   indentWithTab,
   javascript,
   keymap,
+  scopeCompletionSource,
   syntaxHighlighting,
   tags
 };

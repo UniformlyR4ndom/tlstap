@@ -71,16 +71,25 @@ const FORMAT_URL = new URL('./format.js', import.meta.url).href
 // scripts (see transforms.js's OPERATIONS_BY_CATEGORY) — one flat function per op id, regardless
 // of how the UI groups Encode/Decode/Encrypt/Decrypt/Compress/Uncompress into subsections, since
 // that grouping is a menu-presentation concern with no bearing on a script-facing API. Function
-// names are a mechanical camelCase of the op id (e.g. `hmac-sha256` -> `hmacSha256`) with one
-// necessary exception: `3des-encrypt`/`3des-decrypt` would camelCase to `3desEncrypt`, which
-// isn't a valid property name for dot-access (an identifier can't start with a digit), so those
-// two are spelled out as `tripleDesEncrypt`/`tripleDesDecrypt` instead.
+// names are a mechanical camelCase of the op id (e.g. `hmac-sha256` -> `hmacSha256`) with two
+// exceptions: `3des-encrypt`/`3des-decrypt` would camelCase to `3desEncrypt`, which isn't a valid
+// property name for dot-access (an identifier can't start with a digit), so those two are spelled
+// out as `tripleDesEncrypt`/`tripleDesDecrypt` instead; and `xor-encrypt`/`xor-decrypt` — a
+// repeating-key XOR is its own inverse (see encryption.js's xorTransform) — both map to a single
+// `xorCrypt`, deduplicated in buildTransformApiSource below rather than exposing two identical
+// functions under different names. The registry keeps `xor-encrypt`/`xor-decrypt` as distinct op
+// ids regardless, since the Transform panel still needs them in separate Encrypt/Decrypt menu
+// subsections.
 const TRANSFORM_NAME_OVERRIDES = {
     '3des-encrypt': 'tripleDesEncrypt',
     '3des-decrypt': 'tripleDesDecrypt',
+    'xor-encrypt': 'xorCrypt',
+    'xor-decrypt': 'xorCrypt',
 }
 
-function camelCaseOpId(opId) {
+// Exported for ScriptEditor.js's tamper.transform.* autocomplete shape, which must name
+// the same functions this generates for the real Worker-side API.
+export function camelCaseOpId(opId) {
     return TRANSFORM_NAME_OVERRIDES[opId] ?? opId.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase())
 }
 
@@ -90,12 +99,22 @@ function camelCaseOpId(opId) {
 // up inside the Worker itself, once BOOTSTRAP's own dynamic import of transforms.js (see
 // TRANSFORMS_URL above) has resolved; callTransform() (defined in BOOTSTRAP) is what does that
 // lookup and gates on readiness.
+//
+// A category's op ids can collide on their camelCased name (see xor-encrypt/xor-decrypt in
+// TRANSFORM_NAME_OVERRIDES above) — the first op id to claim a name wins and later ones are
+// skipped, rather than emitting a second, later-overriding property with the same key. Safe
+// precisely because such a collision only ever happens between op ids whose run() is the same
+// function, so which op id the generated call actually names makes no behavioral difference.
 function buildTransformApiSource() {
     const categories = Object.entries(OPERATIONS_BY_CATEGORY).map(([category, ops]) => {
-        const fns = Object.keys(ops).map(opId => {
+        const seenNames = new Set()
+        const fns = []
+        for (const opId of Object.keys(ops)) {
             const fnName = camelCaseOpId(opId)
-            return `${fnName}: (bytes, params) => callTransform(${JSON.stringify(opId)}, bytes, params)`
-        })
+            if (seenNames.has(fnName)) continue
+            seenNames.add(fnName)
+            fns.push(`${fnName}: (bytes, params) => callTransform(${JSON.stringify(opId)}, bytes, params)`)
+        }
         return `${category}: { ${fns.join(', ')} }`
     })
     return `{ ${categories.join(', ')} }`

@@ -223,9 +223,10 @@ the Go side executes a script. This module deliberately stays a flat name→text
 store with no opinion about which script is "main" or a "library" — that's a
 runtime-level concern (explicit load-by-name), not a storage-level one.
 [`doc/interceptor/tamper.md`](../../doc/interceptor/tamper.md) is the standalone,
-script-author-facing reference for this API (overview, architecture, full `tamper`/`ctx`
-function reference, worked examples) — the root `CLAUDE.md`/this file's coverage is
-implementation-notes-for-Claude, not a substitute for it.
+script-author-facing guide to this API (overview, architecture, full `tamper`/`ctx`
+function reference with a short example per method, worked examples) — the root
+`CLAUDE.md`/this file's coverage is implementation-notes-for-Claude, not a substitute
+for it.
 
 - `ScriptsDir` (`scripts-dir` config field): directory scripts are read from/written to,
   one `<name>.js` file per script. Empty disables the feature entirely — the REST

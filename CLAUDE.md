@@ -4,6 +4,9 @@ Go module: `tlstap`
 Entry point: `tlstap.go` → `cli.StartWithCli(nil)`  
 Build: `go build .`; custom interceptors build their own `main` under `examples/`.
 
+> **High priority:** read the **Code Style** section below before writing or editing
+> any code. Its rules override default habits and must be followed exactly.
+
 ## Tooling
 
 Available on demand — prefer these over hand-rolled equivalents:
@@ -15,7 +18,9 @@ Available on demand — prefer these over hand-rolled equivalents:
 If one of these isn't installed when needed, ask the user to install it rather than
 working around its absence.
 
-## Comment Policy
+## Code Style
+
+### Comment Policy
 
 Default to no comment at all; add one only when skipping it would leave a reader
 surprised or misled. When a comment is warranted, it must:
@@ -28,7 +33,7 @@ surprised or misled. When a comment is warranted, it must:
    does it," no caller/sibling enumeration. Describe this code, not the rest of the
    codebase.
 
-## Duplication Policy
+### Code Duplication
 
 Default to sharing logic that two or more call sites must always change together;
 default to leaving logic separate when it only resembles another spot today. When
@@ -338,12 +343,10 @@ when working in that directory.
 
 - `github.com/google/gopacket` — pcap writing in `intercept/pcapdump/`
 - `github.com/smallnest/ringbuffer` — used in `proxy/buf_conn.go`
-- `modernc.org/sqlite` — pure-Go SQLite driver (no CGO) used by `intercept/dbdump/`
-- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go` and
-  `intercept/tamper/api.go`; also used client-side by `test/tapctl` (the web frontend
-  uses the browser's native `WebSocket` instead, via `api.js`/`tamperApi.js`)
-- `fflate` 0.8.3 (JS, vendored under `web/vendor/fflate.module.js`) — zip archive support in `web/transforms/zip.js`. Vendored as a whole-library minify (`esbuild --minify`, no bundling/tree-shaking) so future code can pull in more of its exports (gzip/deflate/zlib) without re-vendoring; imported by relative path (not the importmap) since `transforms/*.js` must also run under the Node test suite, which has no importmap support.
-- `crypto-js` 4.2.0 (JS, vendored under `web/vendor/crypto-js.module.js`) — MD5/SHA1/SHA224/SHA256/SHA384/SHA512 support in `web/transforms/hash.js`, the HMAC variant of each of those six in `web/transforms/mac.js`, and DES/TripleDES/RC4 (+ CBC/CTR/ECB/CFB/OFB modes, Pkcs7/NoPadding padding) support in `web/transforms/encryption.js`. Upstream ships CommonJS/UMD modules with bare `require(...)` calls (not valid syntax for a native browser ES module import), so this is a real `esbuild --bundle --format=esm` build covering `core.js`, `lib-typedarrays.js` (patches `WordArray.init` to accept a `Uint8Array` directly), `x64-core.js` (needed for SHA384/512), `enc-hex.js`, `hmac.js` (**must precede** the hash algorithm modules in the entry file — each hash module defines its own `CryptoJS.HmacXXX` helper at load time, which only works once `hmac.js` has already attached `_createHmacHelper` to `Hasher`), the five hash algorithm modules, `enc-base64.js`/`evpkdf.js` (pulled in only because `tripledes.js`'s own module wrapper requires them as build-time dependencies — this project never calls the passphrase-based API they back), `cipher-core.js` (CBC + Pkcs7, the crypto-js defaults), `mode-ecb.js`, `mode-cfb.js`, `mode-ofb.js`, `mode-ctr.js`, `pad-nopadding.js`, `tripledes.js` (provides both `DES` and `TripleDES`), and `rc4.js` — deliberately **not minified** (unlike `fflate.module.js`) so the bundled source stays readable/debuggable; the file's header comment has the exact entry-file contents needed to rebuild it after upgrading crypto-js. Has no GCM/AEAD support at all, which is why AES doesn't use it (see `@noble/ciphers` below).
-- `hash-wasm` 4.12.0 (JS+WASM, vendored under `web/vendor/hash-wasm-whirlpool.module.js`) — Whirlpool support in `web/transforms/hash.js` (the one hash algorithm `crypto-js` doesn't cover, and risky to hand-roll correctly given its S-box/MDS-matrix complexity). Unlike the other hash-wasm-adjacent dist artifacts, the per-algorithm builds (`dist/whirlpool.umd.min.js`) only ever ship pre-minified — the WASM binary is inlined as base64 only there and in the full `dist/index.esm.js` bundle, nowhere else. Vendored from that unminified `dist/index.esm.js` instead (real source, comments intact, unlike a minified UMD reformat) via an entry file re-exporting just `whirlpool`/`createWhirlpool`, tree-shaken down to Whirlpool alone (dropping argon2/bcrypt/scrypt/blake2/3/keccak/the other hash functions/...) with `esbuild --bundle --format=esm` (no `--minify`, same reasoning as CodeMirror below — ~21KB unminified vs. ~13KB a minified equivalent would be, judged worth it for debuggability). Exports both the original async `whirlpool()` convenience function and the lower-level `createWhirlpool()` hasher factory — a genuine public export, not an internal — whose returned `IHasher`'s `.init()/.update()/.digest()` are synchronous once created; this is what lets `transforms/hash.js` warm up a hasher once and compute every subsequent digest synchronously (see its "Implemented operations" entry above) instead of paying an async WASM-init cost on every call. The vendored file's header comment has the exact rebuild recipe.
-- `@noble/ciphers` 2.2.0 (JS, vendored under `web/vendor/noble-ciphers/`) — AES (CBC/CTR/GCM) and Salsa20/ChaCha20 support in `web/transforms/encryption.js`. Chosen over extending `crypto-js` (which does have its own `AES` module) specifically because crypto-js has no GCM/AEAD support at all — consolidating all of AES's modes (CBC/CTR/GCM) into one implementation was judged better than splitting the one algorithm across two libraries. MIT-licensed, zero runtime dependencies, audited (Cure53). Unlike every other vendored JS library here, it's already a native ES module with only relative imports among its own files (`aes.js`/`chacha.js`/`salsa.js` plus their shared `_arx.js`/`_poly1305.js`/`_polyval.js`/`utils.js`), so vendoring is a direct, unmodified copy of those seven files rather than an esbuild bundle — see `aes.js`'s header comment for the exact file list.
-- CodeMirror 6 (JS, vendored under `web/vendor/codemirror.module.js`) — the `web/components/ScriptEditor.js` editor for the Tamper "Scripts" sub-tab (see above): the `codemirror` convenience package (exporting `basicSetup` — history, bracket matching, line numbers, the default keymap, baseline keyword/local-variable completion, etc.) plus `@codemirror/lang-javascript`, bundled together via `esbuild --bundle --format=esm`. `@codemirror/autocomplete` is pulled in only transitively (as a dependency of `basicSetup` itself) — tlstap has no completion source of its own layered on top; an earlier attempt at one was removed after it caused a reproducible editor freeze while typing (see `ScriptEditor.js` above). Unlike crypto-js/hash-wasm, this is a real multi-package bundle (upstream ships many small packages with bare `import` specifiers needing actual dependency resolution, not just a UMD-to-ESM reformat). Left **unminified** (esbuild's own per-source-file `// node_modules/...` annotations included) — this was originally minified like `fflate.module.js`, but was de-minified specifically to make it possible to read/step through while chasing the editor-freeze issue referenced above; the size cost (roughly 2x) was judged not worth losing debuggability for actively-investigated code. The vendored file's own header comment has the exact entry-file contents and package versions needed to rebuild after upgrading.
+- `modernc.org/sqlite` — pure-Go SQLite driver (no CGO), used by `intercept/dbdump/`
+- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go`/`intercept/tamper/api.go`; also used client-side by `test/tapctl` (the web frontend uses the browser's native `WebSocket` instead)
+- `fflate` 0.8.3 (`web/vendor/fflate.module.js`) — zip/gzip/deflate/zlib support in `web/transforms/zip.js`/`compression.js`. Unmodified copy of the package's own unminified browser ESM build.
+- `crypto-js` 4.2.0 (`web/vendor/crypto-js.module.js`) — MD5/SHA1/SHA2 family + HMAC (`web/transforms/hash.js`/`mac.js`) and DES/TripleDES/RC4 (`web/transforms/encryption.js`). esbuild bundle, unminified; rebuild recipe in the file's header comment.
+- `hash-wasm` 4.12.0 (`web/vendor/hash-wasm-whirlpool.module.js`) — Whirlpool hash in `web/transforms/hash.js` (the one algorithm crypto-js lacks). esbuild bundle, unminified; rebuild recipe in the file's header comment.
+- `@noble/ciphers` 2.2.0 (`web/vendor/noble-ciphers/`) — AES (CBC/CTR/GCM) and Salsa20/ChaCha20 in `web/transforms/encryption.js` (crypto-js has no GCM/AEAD support). Unmodified copy of the package's own source files.
+- CodeMirror 6 (`web/vendor/codemirror.module.js`) — script editor (`web/components/ScriptEditor.js`) for the Tamper "Scripts" sub-tab. esbuild bundle, unminified; rebuild recipe in the file's header comment.
