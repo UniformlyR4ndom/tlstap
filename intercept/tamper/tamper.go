@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"tlstap/assert"
+	"tlstap/intercept/scriptstore"
 	"tlstap/logging"
 	"tlstap/proxy"
 )
@@ -126,8 +127,8 @@ type TamperInterceptor struct {
 	holdTimeout        time.Duration
 	holdUntilConnected bool
 	logger             *logging.Logger
-	scripts            *scriptStore // nil if ScriptsDir wasn't configured
-	fsRoot             *fsStore     // nil if FsRoot wasn't configured
+	scripts            *scriptstore.Store // nil if ScriptsDir wasn't configured
+	fsRoot             *fsStore           // nil if FsRoot wasn't configured
 
 	mu               sync.Mutex
 	control          *websocket.Conn
@@ -156,10 +157,10 @@ func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*Tamper
 		holdTimeout = time.Duration(config.HoldTimeoutMs) * time.Millisecond
 	}
 
-	var scripts *scriptStore
+	var scripts *scriptstore.Store
 	if config.ScriptsDir != "" {
 		var err error
-		scripts, err = newScriptStore(config.ScriptsDir)
+		scripts, err = scriptstore.New(config.ScriptsDir)
 		if err != nil {
 			return nil, err
 		}

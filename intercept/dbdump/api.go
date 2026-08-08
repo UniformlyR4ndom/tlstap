@@ -1,7 +1,9 @@
 package dbdump
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -11,24 +13,62 @@ import (
 	"strings"
 
 	"github.com/gorilla/websocket"
+
+	"tlstap/intercept/scriptstore"
 )
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
+	Error: func(w http.ResponseWriter, r *http.Request, status int, reason error) {
+		writeError(w, status, reason.Error())
+	},
 }
 
 func (i *DbDumpInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) {
-	mux.HandleFunc(basePath+"/status", i.handleStatus)
-	mux.HandleFunc(basePath+"/sessions", i.handleSessions)
-	mux.HandleFunc(basePath+"/streams", i.handleStreams)
-	mux.HandleFunc(basePath+"/chunk", i.handleChunk)
-	mux.HandleFunc(basePath+"/chunklist", i.handleChunkList)
-	mux.HandleFunc(basePath+"/latest", i.handleLatest)
-	mux.HandleFunc(basePath+"/chunk-stid", i.handleChunkStid)
-	mux.HandleFunc(basePath+"/byte-stid", i.handleByteStid)
-	mux.HandleFunc(basePath+"/stid-stream", i.handleStidStream)
-	mux.HandleFunc(basePath+"/sgid-stream", i.handleSgidStream)
-	mux.HandleFunc(basePath+"/search-text", i.handleSearchText)
+	mux.HandleFunc("GET "+basePath+"/status", i.handleStatus)
+	mux.HandleFunc("GET "+basePath+"/sessions", i.handleSessions)
+	mux.HandleFunc("POST "+basePath+"/streams", i.handleStreams)
+	mux.HandleFunc("POST "+basePath+"/chunk", i.handleChunk)
+	mux.HandleFunc("POST "+basePath+"/chunklist", i.handleChunkList)
+	mux.HandleFunc("POST "+basePath+"/latest", i.handleLatest)
+	mux.HandleFunc("POST "+basePath+"/chunk-stid", i.handleChunkStid)
+	mux.HandleFunc("POST "+basePath+"/byte-stid", i.handleByteStid)
+	mux.HandleFunc("GET "+basePath+"/stid-stream", i.handleStidStream)
+	mux.HandleFunc("GET "+basePath+"/sgid-stream", i.handleSgidStream)
+	mux.HandleFunc("GET "+basePath+"/segments", i.handleSegments)
+	mux.HandleFunc("POST "+basePath+"/search-text", i.handleSearchText)
+	mux.HandleFunc("POST "+basePath+"/frame-progress", i.handleFrameProgress)
+	mux.HandleFunc("POST "+basePath+"/frames", i.handleFramesList)
+	mux.HandleFunc("POST "+basePath+"/frames/timeline", i.handleFramesTimeline)
+	mux.HandleFunc("POST "+basePath+"/frames/append", i.handleFramesAppend)
+
+	scriptstore.RegisterRoutes(mux, basePath, i.scripts, i.onFramerScriptPut, i.onFramerScriptDelete)
+}
+
+// onFramerScriptPut purges any other persisted frame-index version for name, keeping
+// only the one matching its just-written content — a script's previous version can
+// never be reached again once overwritten (script_version has no history, just the
+// current content's hash), so keeping its data around would only grow the DB for
+// nothing. Re-reads the content just written (rather than the callback carrying it)
+// since scriptstore.RegisterRoutes' callback contract is deliberately just a name.
+func (i *DbDumpInterceptor) onFramerScriptPut(name string) {
+	content, err := i.scripts.Get(name)
+	if err != nil {
+		i.logger.Error("dbdump: re-reading script %q after write: %v", name, err)
+		return
+	}
+	sum := sha256.Sum256(content)
+	if err := i.purgeOtherFrameVersions(name, hex.EncodeToString(sum[:])); err != nil {
+		i.logger.Error("dbdump: purge stale frame data for script %q: %v", name, err)
+	}
+}
+
+// onFramerScriptDelete purges every persisted frame-index version for name — none of
+// them can ever be reached again once the script itself is gone.
+func (i *DbDumpInterceptor) onFramerScriptDelete(name string) {
+	if err := i.purgeAllFrameVersions(name); err != nil {
+		i.logger.Error("dbdump: purge frame data for deleted script %q: %v", name, err)
+	}
 }
 
 func (i *DbDumpInterceptor) handleStatus(w http.ResponseWriter, r *http.Request) {

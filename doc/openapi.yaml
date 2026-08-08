@@ -15,6 +15,15 @@ info:
     **Errors:** All error responses use `Content-Type: application/json` and the
     body `{"error": "<message>"}` with an appropriate HTTP status code.
 
+    **Request validation:** a `400` on a JSON endpoint reliably means the body failed
+    to *parse* (malformed JSON, wrong field type). A `required` field in a request
+    schema below documents the field a well-formed request is expected to supply —
+    omitting it is not otherwise rejected; the handler just runs with that field's zero
+    value (`0`, `""`, `false`, or an empty array), which is occasionally the correct,
+    documented behavior (e.g. `/chunk`'s `chunks`) and occasionally just an
+    unintentionally-permissive gap. Don't rely on a missing required field producing
+    an error.
+
     **dbdump vs. tamper:** `dbdump` passively records traffic to SQLite and
     exposes a pull/replay history API. `tamper` is a separate, live-only
     interceptor that lets a connected control client pause, edit, drop, or
@@ -46,6 +55,15 @@ tags:
       Storage for scripts driving programmatic tamper interception. Execution is
       client-side only (a browser Web Worker via the "Scripts" sub-tab of the Tamper
       view) — these endpoints are just the REST CRUD backing that store.
+  - name: framer
+    description: >-
+      Storage for framer scripts (reassemble a stream's raw chunks into logical
+      frames) and the persisted frame index they produce, so a stream can be
+      viewed partitioned by frame instead of by raw chunk, both directions
+      merged chronologically. Execution is client-side only (a browser Web
+      Worker) — these endpoints are the REST CRUD backing script storage plus
+      reading/extending the computed result. See CLAUDE.md's "Framer scripts"
+      section and doc/design/packet-dissector.md for the wider design.
   - name: fs
     description: >-
       Scoped read/write/list access to one host directory (`fs-root`), for a
@@ -225,7 +243,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [session, stream, direction, chunks]
+              required: [session, stream, direction]
               properties:
                 session:
                   type: integer
@@ -242,7 +260,11 @@ paths:
                   items:
                     type: integer
                     format: int64
-                  description: Chunk IDs to fetch
+                  default: []
+                  description: |
+                    Chunk IDs to fetch. Omitting it (or supplying an empty array)
+                    is a valid, explicitly-handled request — see the empty-response
+                    note above, not a `400`.
       responses:
         '200':
           description: Multipart response with one part per chunk
@@ -476,6 +498,93 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
 
+  /api/i/dbdump/segments:
+    get:
+      tags: [chunks]
+      summary: Fetch a budgeted run of raw chunks ("segments") in stid order, forward or backward
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). Answers
+        one request with exactly one response (one metadata text frame
+        immediately followed by one binary frame) — unlike `stid-stream`,
+        there is no per-chunk streaming and no `done` signal; the pair *is*
+        the complete response. Multiple sequential requests may be sent on
+        one connection; the server processes them one at a time.
+
+        Every returned item is always a raw chunk — this endpoint has no
+        frame-awareness at all. Backs the backend half of a hex-view rework
+        described in `doc/design/hexview-segment-buffer.md`; the frontend
+        migration that will also route framer scripts' byte fetches through
+        this endpoint (slicing frame ranges out of the chunks it returns) is
+        not done yet — framer scripts still fetch bytes via `stid-stream`
+        today.
+
+        **Request frame** (client → server, JSON text):
+        ```json
+        {"session": N, "stream": N, "afterStid": N, "maxSegments": N, "maxBytes": N}
+        ```
+        or
+        ```json
+        {"session": N, "stream": N, "beforeStid": N, "maxSegments": N, "maxBytes": N}
+        ```
+        - `session` / `stream` — session and stream ID
+        - `afterStid` / `beforeStid` — **exactly one of these two fields must
+          be given**; that alone selects scan direction (there is no separate
+          `direction` field, deliberately — see below). `afterStid` walks
+          `stid` ascending, exclusive of the given value. `beforeStid` walks
+          `stid` descending, exclusive of the given value, then the server
+          re-sorts the result ascending before responding, so the client never
+          needs to special-case direction when consuming the response. A
+          request with both or neither set is rejected.
+        - `maxSegments` — maximum number of chunks to return; `<= 0` means
+          unlimited
+        - `maxBytes` — soft byte budget: chunks are added whole, and both caps
+          are only checked *after* adding one — so a single maximal chunk can
+          push the response slightly past `maxBytes` (bounded overshoot, up to
+          one chunk's own size; this endpoint never truncates a chunk).
+          `<= 0` means unlimited
+
+        No `direction` field is used for scan direction (unlike `afterStid`/
+        `beforeStid` above) to avoid colliding with the unrelated per-segment
+        `direction` (client→server vs. server→client) already used throughout
+        this response.
+
+        **Response** (server → client, one text frame then one binary frame):
+        1. Text frame (JSON metadata):
+           ```json
+           {"segments": [{"stid": N, "segmentId": N, "direction": N, "time": N, "offset": N, "length": N}, ...], "reachedEnd": bool}
+           ```
+           - `segments` — one entry per included chunk, in ascending `stid`
+             order regardless of scan direction
+             - `stid` — stream-local direction-agnostic chunk index
+             - `segmentId` — per-direction chunk ID (0-based within direction)
+             - `direction` — `0` = client→server, `1` = server→client
+             - `time` — capture timestamp in milliseconds since Unix epoch
+             - `offset` — byte offset of this chunk's first byte within its direction stream
+             - `length` — this chunk's own byte count (not cumulative) —
+               reconstructing each chunk's slice from the binary frame is one
+               linear pass accumulating `length` in array order
+           - `reachedEnd` — for a forward request, `true` means no chunks
+             exist after `afterStid`; for a backward request, `true` means no
+             chunks exist before `beforeStid` (i.e. the very start of the
+             stream was reached)
+        2. Binary frame: every listed segment's own bytes, concatenated in the
+           same order as the `segments` array (possibly empty if `segments` is
+           empty)
+
+        **Error** (server → client, JSON text, no binary frame follows):
+        ```json
+        {"error": "<message>"}
+        ```
+        Sent for a malformed request (both or neither of `afterStid`/
+        `beforeStid` given) or a database error; the connection is closed
+        afterwards.
+      operationId: segments
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
   /api/i/dbdump/search-text:
     post:
       tags: [search]
@@ -508,6 +617,10 @@ paths:
         The web frontend always uses `"base64"` for non-regex formats so that
         arbitrary byte sequences (UTF-16, hex, null bytes) can be transported
         safely through the JSON body.
+
+        **Pattern length limit:** for `pattern_encoding` `""`/`"text"`/`"base64"`, the
+        *decoded* pattern is capped at 4096 bytes; a longer pattern is rejected with
+        `400`, regardless of `contiguous`. `"regex"` patterns have no such cap.
       operationId: searchText
       requestBody:
         required: true
@@ -577,6 +690,280 @@ paths:
                   $ref: '#/components/schemas/SearchMatch'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/scripts:
+    get:
+      tags: [framer]
+      summary: List stored framer scripts
+      description: |
+        Metadata only, no script bodies, so listing stays cheap. Returns `501`
+        if the `dbdump` interceptor wasn't configured with `scripts-dir`.
+      operationId: listFramerScripts
+      responses:
+        '200':
+          description: All stored scripts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScriptInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/dbdump/scripts/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_-][A-Za-z0-9_. -]*[A-Za-z0-9_-]$|^[A-Za-z0-9_-]$'
+        description: |
+          Script name, without the `.js` extension. Letters, digits, `_`, `-`,
+          `.`, and spaces only; must not start/end with `.` or a space, and
+          must not be exactly `.` or `..`.
+    get:
+      tags: [framer]
+      summary: Fetch a framer script's content
+      operationId: getFramerScript
+      responses:
+        '200':
+          description: Raw script source
+          content:
+            application/javascript:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      tags: [framer]
+      summary: Create or overwrite a framer script
+      description: |
+        Writes the request body verbatim as `<name>.js` (atomically — never
+        observable as a partial write). Also purges any other persisted frame
+        index version for this script name (see `/frames` below), keeping
+        only the version matching the newly-written content's sha256 hash —
+        a previous version can never be reached again once overwritten.
+      operationId: putFramerScript
+      requestBody:
+        required: true
+        content:
+          application/javascript:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Script written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [framer]
+      summary: Delete a framer script
+      description: Also purges every persisted frame index version for this script name.
+      operationId: deleteFramerScript
+      responses:
+        '204':
+          description: Script deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/dbdump/frame-progress:
+    post:
+      tags: [framer]
+      summary: How far a framer script has processed one stream direction
+      description: |
+        Reports the persisted progress for one (session, stream, direction,
+        script, script_version) key, so a browser-run framer knows whether it
+        needs to compute anything beyond what's already stored. A key with no
+        rows yet is not an error — `processed_offset: 0` and `state: null`
+        just mean framing hasn't started for it.
+      operationId: getFrameProgress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FrameKey'
+      responses:
+        '200':
+          description: Current progress for the given key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FrameProgress'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/frames:
+    post:
+      tags: [framer]
+      summary: List persisted frames for one stream direction
+      description: |
+        Frames are returned in `id` order, `id >= start`. Together with
+        `frame-progress` this is what will let `HexDump` render a framed
+        partitioning of a stream alongside the raw per-chunk one, once a
+        framer script has processed it.
+      operationId: listFrames
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/FrameKey'
+                - type: object
+                  required: [start, n]
+                  properties:
+                    start:
+                      type: integer
+                      format: int64
+                      description: First frame id to return (inclusive)
+                    n:
+                      type: integer
+                      description: Maximum number of frames to return; 0 or negative means unlimited
+      responses:
+        '200':
+          description: Frames with id >= start, ordered by id
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Frame'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/frames/timeline:
+    post:
+      tags: [framer]
+      summary: List persisted frames for a stream across *both* directions, merged chronologically
+      description: |
+        The cross-direction counterpart to `/frames`: same script, both
+        directions at once, ordered by `stid` (a value inherited from
+        whichever raw chunk each frame completes on) rather than by
+        `id` — `id` alone isn't comparable across directions, and isn't
+        even unique within one `stid` (a single raw chunk producing
+        several frames at once — routine, not an edge case — makes them
+        tie on `stid`; such ties are broken by `id`, which is safe
+        precisely because ties are always within one direction: two
+        different chunks, from either direction, never share a `stid`).
+        The server guarantees a page never splits such a tied group, so
+        `start = the last returned frame's stid + 1` is always a safe
+        cursor for the next page — and symmetrically for `beforeStid`
+        below, `beforeStid = the first returned frame's stid` continues
+        further backward with nothing skipped or duplicated.
+
+        **Exactly one of `start` (forward, inclusive) or `beforeStid`
+        (backward, exclusive) must be given** — mirrors `/segments`'
+        `afterStid`/`beforeStid` convention (see that endpoint's own
+        description for why scan direction is picked this way rather
+        than a separate `direction` field). A request with both or
+        neither is rejected with `400`. Backward results are still
+        returned in ascending `(stid, id)` order, same as forward, so a
+        caller never special-cases which direction produced a page.
+      operationId: listFramesTimeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/FrameTimelineKey'
+                - type: object
+                  required: [n]
+                  properties:
+                    start:
+                      type: integer
+                      format: int64
+                      description: First stid to return (inclusive) — forward scan
+                    beforeStid:
+                      type: integer
+                      format: int64
+                      description: Scan backward for frames with stid strictly less than this value
+                    n:
+                      type: integer
+                      description: Maximum number of frames to return; 0 or negative means unlimited
+      responses:
+        '200':
+          description: >-
+            Frames with stid >= start (forward) or stid < beforeStid
+            (backward), always ordered ascending by (stid, id)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Frame'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/i/dbdump/frames/append:
+    post:
+      tags: [framer]
+      summary: Extend a framer script's persisted frame index by one computed batch
+      description: |
+        Atomically: asserts `expected_processed_offset` still matches what's
+        stored (0 if framing hasn't started for this key yet), assigns
+        `new_frames` sequential ids continuing from whatever's already
+        stored, and advances progress to
+        `new_processed_offset`/`new_state`. There is deliberately no
+        retry/CAS-defense beyond that one offset check — the browser UI
+        enforces a single writer per key, so a `409` here always means a
+        client bug, not a real race to resolve gracefully.
+      operationId: appendFrames
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/FrameKey'
+                - type: object
+                  required: [expected_processed_offset, new_frames, new_processed_offset]
+                  properties:
+                    expected_processed_offset:
+                      type: integer
+                      format: int64
+                      description: Must match the currently-stored processed_offset, or the request is rejected
+                    new_frames:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/FrameInput'
+                    new_processed_offset:
+                      type: integer
+                      format: int64
+                    new_state:
+                      type: string
+                      contentEncoding: base64
+                      description: Opaque framer state to persist alongside the new progress; omit/null for no state
+      responses:
+        '204':
+          description: Frames appended and progress advanced
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -833,6 +1220,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/ScriptInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
         '501':
           $ref: '#/components/responses/NotImplemented'
 
@@ -908,9 +1297,11 @@ paths:
       summary: List fs-root's top-level contents
       description: |
         Equivalent to `GET /fs/list/{path}` with an empty path — lists
-        `fs-root` itself. One directory level, not recursive (a `dir: true`
-        entry is listed again by requesting that path). Returns `501` if the
-        `tamper` interceptor wasn't configured with `fs-root`.
+        `fs-root` itself, via the same handler (so the same `400`/`404` failure
+        modes apply, e.g. if `fs-root` is removed or becomes unreadable after
+        startup). One directory level, not recursive (a `dir: true` entry is
+        listed again by requesting that path). Returns `501` if the `tamper`
+        interceptor wasn't configured with `fs-root`.
       operationId: listFsRoot
       responses:
         '200':
@@ -921,6 +1312,10 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/FsEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '501':
           $ref: '#/components/responses/NotImplemented'
 
@@ -1255,6 +1650,138 @@ components:
             Basename (not the full configured path) of the log file; empty
             when `enabled` is `false`
 
+    FrameKey:
+      type: object
+      required: [session, stream, direction, script, script_version]
+      properties:
+        session:
+          type: integer
+          format: int64
+          description: Session ID
+        stream:
+          type: integer
+          format: int64
+          description: Stream ID
+        direction:
+          $ref: '#/components/schemas/Direction'
+        script:
+          type: string
+          description: Framer script name (without the `.js` extension)
+        script_version:
+          type: string
+          description: >-
+            sha256 hex digest of the script's content, computed client-side —
+            a content change is simply a different (and initially absent) key,
+            not something requiring explicit staleness detection
+
+    FrameTimelineKey:
+      type: object
+      required: [session, stream, script, script_version]
+      properties:
+        session:
+          type: integer
+          format: int64
+          description: Session ID
+        stream:
+          type: integer
+          format: int64
+          description: Stream ID
+        script:
+          type: string
+          description: Framer script name (without the `.js` extension)
+        script_version:
+          type: string
+          description: sha256 hex digest of the script's content — see FrameKey's own field for the full rationale
+
+    FrameProgress:
+      type: object
+      required: [processed_offset]
+      properties:
+        processed_offset:
+          type: integer
+          format: int64
+          description: >-
+            How many bytes of the direction stream have been framed so far;
+            0 if framing hasn't started yet for this key
+        state:
+          type: string
+          contentEncoding: base64
+          description: >-
+            The framer script's own opaque persisted state, for resuming;
+            null if none
+
+    Frame:
+      type: object
+      required: [id, offset, length, direction, stid, time]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Sequential id, 0-based, assigned server-side, per direction
+        offset:
+          type: integer
+          format: int64
+          description: Byte offset of the frame's first byte within the direction stream
+        length:
+          type: integer
+          format: int64
+        meta:
+          type: string
+          description: >-
+            Free-form data the framer script attached to this frame (e.g. a
+            "kind" tag); opaque to the server, stored/returned as-is; null if
+            none
+        direction:
+          $ref: '#/components/schemas/Direction'
+          description: >-
+            Redundant with the request's own key for `/frames` (which is
+            already scoped to one direction); the field that actually matters
+            for `/frames/timeline`, whose key spans both
+        stid:
+          type: integer
+          format: int64
+          description: >-
+            Inherited from whichever raw chunk this frame completes on — the
+            cross-direction ordering key `/frames/timeline` sorts by. Ties
+            (multiple frames completing on the same chunk) are routine, not
+            an edge case, and are always within one direction (two different
+            chunks, from either direction, never share a `stid`) — broken by
+            `id`
+        time:
+          type: integer
+          format: int64
+          description: >-
+            Capture timestamp (milliseconds since Unix epoch) of whichever raw
+            chunk this frame completes on — frames have no timestamp of their
+            own, since they're computed, not captured
+
+    FrameInput:
+      type: object
+      required: [offset, length, stid, time]
+      properties:
+        offset:
+          type: integer
+          format: int64
+        length:
+          type: integer
+          format: int64
+        meta:
+          type: string
+          description: Opaque free-form data to attach to this frame; omit/null for none
+        stid:
+          type: integer
+          format: int64
+          description: >-
+            The stid of whichever raw chunk this frame completes on — the
+            caller already has this in hand for every raw chunk it fetched to
+            compute the frame, no extra lookup needed
+        time:
+          type: integer
+          format: int64
+          description: >-
+            The time of that same completing chunk — see Frame's own `time`
+            field
+
   responses:
 
     BadRequest:
@@ -1273,6 +1800,13 @@ components:
 
     NotFound:
       description: The requested resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Conflict:
+      description: The request's expected prior state no longer matches what's stored
       content:
         application/json:
           schema:

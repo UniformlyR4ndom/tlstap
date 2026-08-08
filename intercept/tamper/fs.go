@@ -234,3 +234,28 @@ func (i *TamperInterceptor) handleFsAppend(w http.ResponseWriter, r *http.Reques
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// atomicWriteFile creates or overwrites target with content via write-to-temp-file (in
+// tmpDir) + rename, so a concurrent reader can never observe a partial write. tmpDir
+// must already exist.
+func atomicWriteFile(tmpDir, target string, content []byte) error {
+	tmp, err := os.CreateTemp(tmpDir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}

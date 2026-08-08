@@ -209,29 +209,34 @@ deliberate exception to the "no I/O while holding the lock" rule elsewhere in th
 codebase, so a send can't race a concurrent `close()`. Unit-tested in isolation
 (`buffer_test.go`).
 
-**Script storage (`scripts.go`)** is the storage layer for the programmatic,
-callback-driven alternative to manual control-client decisions: JavaScript run in a
-browser Web Worker, dispatched from the same control-channel events a human client
-reacts to (`stream-created`/`stream-terminated`/`held`), deciding forward/edit/drop
-imperatively (not forced to return a verdict synchronously — a script can hold a chunk
-and decide later, same as the existing human flow) via the same `peek`/`release`
-primitives already documented above. The runtime itself (Worker bootstrap, RPC bridge,
-`self.tamper` framework API, and the "Scripts" sub-tab UI) lives entirely in the
-frontend — see `scriptRuntime.js`/`TamperScriptsPanel.js`, documented in
-`web/CLAUDE.md`'s "Scripted interception" section; nothing on
-the Go side executes a script. This module deliberately stays a flat name→text-blob
-store with no opinion about which script is "main" or a "library" — that's a
-runtime-level concern (explicit load-by-name), not a storage-level one.
+**Script storage** is the storage layer for the programmatic, callback-driven
+alternative to manual control-client decisions: JavaScript run in a browser Web Worker,
+dispatched from the same control-channel events a human client reacts to
+(`stream-created`/`stream-terminated`/`held`), deciding forward/edit/drop imperatively
+(not forced to return a verdict synchronously — a script can hold a chunk and decide
+later, same as the existing human flow) via the same `peek`/`release` primitives already
+documented above. The runtime itself (Worker bootstrap, RPC bridge, `self.tamper`
+framework API, and the "Scripts" sub-tab UI) lives entirely in the frontend — see
+`scriptRuntime.js`/`TamperScriptsPanel.js`, documented in `web/CLAUDE.md`'s "Scripted
+interception" section; nothing on the Go side executes a script.
 [`doc/interceptor/tamper.md`](../../doc/interceptor/tamper.md) is the standalone,
 script-author-facing guide to this API (overview, architecture, full `tamper`/`ctx`
 function reference with a short example per method, worked examples) — the root
 `CLAUDE.md`/this file's coverage is implementation-notes-for-Claude, not a substitute
 for it.
 
-- `ScriptsDir` (`scripts-dir` config field): directory scripts are read from/written to,
-  one `<name>.js` file per script. Empty disables the feature entirely — the REST
-  endpoints still exist but every request gets `501`, rather than silently defaulting to
-  an implicit directory. The directory (including any missing parents) is created in
+The storage/HTTP layer itself (name-validated flat `*.js` store, atomic writes, REST
+CRUD) is generic and lives in `intercept/scriptstore` — its own package, not
+tamper-specific, shared with any other interceptor that wants script storage (see that
+package's own doc comments for the full contract: name-validation rules, atomic-write
+guarantee, `Store`/`RegisterRoutes`). What's left here is only what's genuinely
+tamper-specific:
+
+- `ScriptsDir` (`scripts-dir` config field): directory passed to `scriptstore.New`,
+  read/written as one `<name>.js` file per script. Empty disables the feature entirely —
+  the REST endpoints still exist but every request gets `501` (`scriptstore`'s own
+  behavior when the store is `nil`), rather than silently defaulting to an implicit
+  directory. The directory (including any missing parents) is created in
   `NewTamperInterceptor` itself, not `Init`: `RegisterRoutes` runs synchronously while
   the proxy is being built, before `Init` runs asynchronously in the proxy's own start
   goroutine, so the scripts REST handlers must find `i.scripts` already usable the
@@ -245,16 +250,6 @@ for it.
   script-*`, see `test/tapctl/CLAUDE.md`) a first-class citizen alongside the browser
   rather than a bolted-on afterthought — both just `PUT`/`GET`/`DELETE` the same REST
   resource.
-- **Name validation** (`validateScriptName`): charset `[A-Za-z0-9_.\- ]` (letters, digits,
-  `_`, `-`, `.`, and spaces — space is discouraged but not forbidden). Path separators are
-  excluded outright, so a name is always joined as a single path segment; the only
-  dot-sequences that could still resolve outside the scripts directory when joined
-  (`"."`/`".."`) are rejected explicitly, along with a leading/trailing `.`/` ` (avoids
-  confusable near-duplicates like `"foo"` vs `"foo "`, and — with those covered — dots are
-  otherwise harmless). Note `net/http`'s own `ServeMux` already cleans/redirects a
-  path containing `..` before it would ever reach the handler, so the explicit check here
-  is defense in depth, and the one actually reachable path for verifying it is a direct
-  `scriptStore`/`validateScriptName` unit test (`scripts_test.go`), not an HTTP round trip.
 - **REST endpoints** (base: `/<proxy-name>/api/i/tamper` or canonical `/api/i/tamper`,
   same convention as the rest of the tamper API): `GET /scripts` → `[{name, size}]`
   (metadata only, no bodies, so listing stays cheap); `GET /scripts/{name}` → raw script
@@ -265,18 +260,18 @@ for it.
   UTF-8 text, and wrapping it would be pure overhead as well as friction for `curl`/CLI
   push-pull. A `PUT`/`DELETE` also pushes a `script-updated` control-channel event
   (`{"name":"..."}`, no separate "deleted" flag — a plain `GET`/list is enough to learn
-  whether it still exists) so a connected browser can react without polling.
-  `GET /log-file` (same base) → `{"enabled":bool,"filename":"..."}`, static for the
-  interceptor's whole run — lets the frontend show "Logged to `<filename>`" (see the root
-  `CLAUDE.md`'s "Scripted interception" section, "Log panel" note) without a push event
-  to track.
-- **`Put` is atomic**: written to a `.tmp-*` temp file in the same directory, then
-  `os.Rename`d into place, so a concurrent `Get` can never observe a partial write. Temp
-  files never appear in `List()` regardless of timing, since listing filters strictly by
-  the `.js` suffix.
-- Unit-tested in isolation (`scripts_test.go`): name validation (valid/invalid, including
-  traversal attempts), `scriptStore` list/get/put/delete round-trips, directory
-  auto-creation, and an HTTP-level end-to-end pass over the real REST handlers.
+  whether it still exists) via the `onScriptChange` callback `api.go` passes to
+  `scriptstore.RegisterRoutes` (the one behavior `scriptstore` itself knows nothing
+  about — its callback is generic, tamper is what decides to push an event from it), so
+  a connected browser can react without polling. `GET /log-file` (same base) →
+  `{"enabled":bool,"filename":"..."}`, static for the interceptor's whole run — lets the
+  frontend show "Logged to `<filename>`" (see the root `CLAUDE.md`'s "Scripted
+  interception" section, "Log panel" note) without a push event to track.
+- Unit-tested: `intercept/scriptstore`'s own tests cover name validation, atomic-write
+  behavior, and the generic REST CRUD round trip (including the `onPut`/`onDelete`
+  callbacks firing); `scripts_test.go` here keeps a thin smoke test confirming tamper's
+  own wiring — the real server's basePath, config-driven enable/disable, and that a
+  PUT/DELETE actually pushes `script-updated` over the control connection.
 
 **Filesystem access (`fs.go`)** grants a running script scoped read/write/list access to
 one host directory, for reading fixtures or persisting artifacts across a session —
@@ -323,9 +318,10 @@ just the browser.
   patterns are registered for `list` (with and without the trailing wildcard) because
   Go's `{path...}` wildcard doesn't match an empty trailing segment, so root and
   subdirectory listing need separate routes to the same handler.
-- **`Put` is atomic**, same `.tmp-*`-then-`os.Rename` discipline as `scripts.go`, except
-  the temp file is created alongside the target (which may be nested under a
-  subdirectory, not `fs-root` itself) rather than in a single fixed directory.
+- **`Put` is atomic**, the same `.tmp-*`-then-`os.Rename` discipline `intercept/scriptstore`
+  uses for its own writes (a separate copy here, not shared code — this store's target may
+  be nested under a subdirectory, not `fs-root` itself, rather than always a single fixed
+  directory).
 - **`Append`** opens the target with `O_APPEND` (creating it if needed) rather than
   being a client-side `Get`+concatenate+`Put`: two scripts (or their `onReceive`
   handlers for different connections, which run on independent per-conn goroutines — see

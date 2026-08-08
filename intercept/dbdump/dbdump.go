@@ -3,12 +3,14 @@ package dbdump
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"slices"
 	"sync"
 	"time"
 
+	"tlstap/intercept/scriptstore"
 	"tlstap/logging"
 	"tlstap/proxy"
 
@@ -41,6 +43,12 @@ type chunkRecord struct {
 type DbDumpConfig struct {
 	FilePath string `json:"file"`
 	Truncate bool   `json:"truncate"`
+
+	// Directory framer scripts are stored in and served from, via the shared
+	// intercept/scriptstore package (same feature tamper's control scripts use). Empty
+	// disables the feature entirely — the REST endpoints still exist but reject every
+	// request with 501, rather than silently defaulting to an implicit directory.
+	ScriptsDir string `json:"scripts-dir"`
 }
 
 // sessionConfig is the JSON snapshot written to sessions.config on first traffic.
@@ -88,6 +96,10 @@ type pendingStream struct {
 //	sessions(id, start, config)
 //	stream(id, session, src, dst, start, end)
 //	chunks(id, stream, direction, offset, time, data)  PK: (stream, direction, id)
+//	frames(session, stream, direction, script, script_version, id, offset, length, meta)
+//	  PK: (session, stream, direction, script, script_version, id)
+//	frame_progress(session, stream, direction, script, script_version, processed_offset, state)
+//	  PK: (session, stream, direction, script, script_version)
 //
 // Timestamps are milliseconds since the Unix epoch.
 // stream.id equals the proxy's connection counter (ConnID).
@@ -95,12 +107,17 @@ type pendingStream struct {
 // chunks.direction: 0 = client→server, 1 = server→client.
 // chunks.id starts at 0 and increments independently per (stream, direction).
 // chunks.offset is the byte offset of the chunk's first byte, independently per (stream, direction).
+// frames/frame_progress are the persisted output of a client-run framer script (see
+// frames.go); script_version is a sha256 hex digest of the script's content, computed
+// client-side, so a content change is simply a different (and initially absent) key
+// rather than something that needs explicit staleness detection.
 type DbDumpInterceptor struct {
 	filePath    string
 	truncate    bool
 	proxyConfig proxy.ResolvedProxyConfig
 	db          *sql.DB
-	sessionID   int64 // valid only after ensureSession succeeds
+	scripts     *scriptstore.Store // nil if ScriptsDir wasn't configured
+	sessionID   int64              // valid only after ensureSession succeeds
 
 	// Lazy session creation: the session row (and buffered stream rows) are only
 	// written to the DB on the first Intercept call, so idle runs leave no trace.
@@ -141,8 +158,10 @@ type DbDumpInterceptor struct {
 // API handlers, wired up synchronously right after this returns, never see a nil
 // or partially-schema'd i.db — Init itself runs later, asynchronously, from the
 // proxy's own start goroutine. No session/stream/chunk row is written here; that
-// stays deferred to the first Intercept call (see ensureSession).
-func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) (*DbDumpInterceptor, error) {
+// stays deferred to the first Intercept call (see ensureSession). If scriptsDir is
+// set, the scripts directory (including any missing parents) is also created here,
+// for the same "must be usable the moment RegisterRoutes runs" reason.
+func NewDbDumpInterceptor(path string, truncate bool, scriptsDir string, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) (*DbDumpInterceptor, error) {
 	if truncate {
 		_ = os.Remove(path)
 	}
@@ -212,16 +231,121 @@ func NewDbDumpInterceptor(path string, truncate bool, proxyConfig proxy.Resolved
 		return nil, err
 	}
 
+	// The PK's own btree is already ordered (session, stream, direction, script,
+	// script_version, id), which is exactly the per-direction access pattern
+	// listFrames/appendFrames need (equality filter on the first five columns, ordered
+	// range on id) — no extra index needed for that. idx_frames_stid below is for the
+	// separate cross-direction access pattern (listFramesTimeline).
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS frames (
+			session        INTEGER NOT NULL REFERENCES sessions(id),
+			stream         INTEGER NOT NULL,
+			direction      INTEGER NOT NULL,
+			script         TEXT    NOT NULL,
+			script_version TEXT    NOT NULL,
+			id             INTEGER NOT NULL,
+			offset         INTEGER NOT NULL,
+			length         INTEGER NOT NULL,
+			meta           TEXT,
+			PRIMARY KEY (session, stream, direction, script, script_version, id)
+		)
+	`); err != nil {
+		return nil, err
+	}
+
+	// stid added after frames first shipped, via ALTER rather than the CREATE TABLE
+	// above (a no-op on an already-existing table) — see ensureColumn. Inherited from
+	// whichever raw chunk a frame completes on; ties (multiple frames from one chunk)
+	// are routine, not an edge case, so every access ordered by stid must break ties by
+	// id (see listFramesTimeline) — never bare `ORDER BY stid`.
+	if err = ensureColumn(db, "frames", "stid", "INTEGER"); err != nil {
+		return nil, err
+	}
+
+	// time added the same way and for the same reason as stid above — a frame has no
+	// timestamp of its own (frames aren't captured, they're computed), so it's inherited
+	// from the same completing chunk stid is inherited from.
+	if err = ensureColumn(db, "frames", "time", "INTEGER"); err != nil {
+		return nil, err
+	}
+
+	// Backs listFramesTimeline's cross-direction query (session/stream/script/version
+	// filter, ordered by stid then id) — the frames table has no direction-less index
+	// otherwise, since every other access pattern here filters by direction too.
+	if _, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_frames_stid ON frames (session, stream, script, script_version, stid, id)
+	`); err != nil {
+		return nil, err
+	}
+
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS frame_progress (
+			session          INTEGER NOT NULL REFERENCES sessions(id),
+			stream           INTEGER NOT NULL,
+			direction        INTEGER NOT NULL,
+			script           TEXT    NOT NULL,
+			script_version   TEXT    NOT NULL,
+			processed_offset INTEGER NOT NULL,
+			state            BLOB,
+			PRIMARY KEY (session, stream, direction, script, script_version)
+		)
+	`); err != nil {
+		return nil, err
+	}
+
+	var scripts *scriptstore.Store
+	if scriptsDir != "" {
+		scripts, err = scriptstore.New(scriptsDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &DbDumpInterceptor{
 		filePath:        path,
 		truncate:        truncate,
 		proxyConfig:     proxyConfig,
 		db:              db,
+		scripts:         scripts,
 		clientEndpoints: make(map[uint32]string),
 		chunkStates:     make(map[chunkKey]chunkState),
 		streamNextSTID:  make(map[uint32]int64),
 		logger:          logger,
 	}, nil
+}
+
+// ensureColumn adds column to table via ALTER TABLE if it isn't already present,
+// idempotently — this codebase has no migration system beyond "CREATE TABLE/INDEX IF
+// NOT EXISTS" (which is a no-op on a table that already exists, columns and all, so it
+// can't retroactively add a column to a database file created before that column
+// existed). Safe to call on a table that was just freshly CREATE TABLE IF NOT EXISTS'd
+// too — PRAGMA table_info simply won't find the column yet in that case either, and the
+// ALTER adds it, so callers don't need to know or care which case they're in.
+func ensureColumn(db *sql.DB, table, column, ddlType string) error {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, ddlType))
+	return err
 }
 
 func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {

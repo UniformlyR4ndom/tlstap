@@ -9,7 +9,12 @@ import (
 
 func newTestInterceptor(t *testing.T) *DbDumpInterceptor {
 	t.Helper()
-	d, err := NewDbDumpInterceptor(":memory:", false, proxy.ResolvedProxyConfig{Name: "test"}, nil)
+	return newTestInterceptorWithScripts(t, "")
+}
+
+func newTestInterceptorWithScripts(t *testing.T, scriptsDir string) *DbDumpInterceptor {
+	t.Helper()
+	d, err := NewDbDumpInterceptor(":memory:", false, scriptsDir, proxy.ResolvedProxyConfig{Name: "test"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

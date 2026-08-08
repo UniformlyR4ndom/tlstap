@@ -112,6 +112,29 @@ func readBinary(t *testing.T, conn *websocket.Conn) []byte {
 	return data
 }
 
+func httpDo(t *testing.T, method, url string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func readBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func boolPtr(b bool) *bool                { return &b }
 func u32Ptr(u uint32) *uint32             { return &u }
 func directionPtr(d direction) *direction { return &d }

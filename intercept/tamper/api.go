@@ -1,29 +1,35 @@
 package tamper
 
 import (
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"tlstap/intercept/scriptstore"
 )
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
+	Error: func(w http.ResponseWriter, r *http.Request, status int, reason error) {
+		writeErrorResponse(w, status, reason.Error())
+	},
 }
 
 // RegisterRoutes implements proxy.ApiProvider.
 func (i *TamperInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) {
-	mux.HandleFunc(basePath+"/control", i.handleControl)
-	mux.HandleFunc(basePath+"/watch", i.handleWatch)
+	mux.HandleFunc("GET "+basePath+"/control", i.handleControl)
+	mux.HandleFunc("GET "+basePath+"/watch", i.handleWatch)
 
 	mux.HandleFunc("GET "+basePath+"/log-file", i.handleLogFileInfo)
 
-	mux.HandleFunc("GET "+basePath+"/scripts", i.handleScriptsList)
-	mux.HandleFunc("GET "+basePath+"/scripts/{name}", i.handleScriptGet)
-	mux.HandleFunc("PUT "+basePath+"/scripts/{name}", i.handleScriptPut)
-	mux.HandleFunc("DELETE "+basePath+"/scripts/{name}", i.handleScriptDelete)
+	onScriptChange := func(name string) {
+		i.sendEvent(scriptUpdatedMsg{Type: msgScriptUpdated, Name: name})
+	}
+	scriptstore.RegisterRoutes(mux, basePath, i.scripts, onScriptChange, onScriptChange)
 
 	mux.HandleFunc("GET "+basePath+"/fs/list", i.handleFsList)
 	mux.HandleFunc("GET "+basePath+"/fs/list/{path...}", i.handleFsList)
@@ -237,7 +243,7 @@ func (i *TamperInterceptor) handleDropConnection(conn *websocket.Conn, msg inbou
 func (i *TamperInterceptor) handleWatch(w http.ResponseWriter, r *http.Request) {
 	connID64, err := strconv.ParseUint(r.URL.Query().Get("conn"), 10, 32)
 	if err != nil {
-		http.Error(w, "invalid or missing conn parameter", http.StatusBadRequest)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid or missing conn parameter")
 		return
 	}
 	connID := uint32(connID64)
@@ -246,7 +252,7 @@ func (i *TamperInterceptor) handleWatch(w http.ResponseWriter, r *http.Request) 
 	st := i.streams[connID]
 	i.mu.Unlock()
 	if st == nil {
-		http.Error(w, "unknown stream", http.StatusNotFound)
+		writeErrorResponse(w, http.StatusNotFound, "unknown stream")
 		return
 	}
 
@@ -398,4 +404,15 @@ func (i *TamperInterceptor) sendStreamList() {
 		return
 	}
 	i.sendEventTo(conn, streamListMsg{Type: msgStreamList, Streams: streams})
+}
+
+func writeJSONResponse(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeErrorResponse(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
