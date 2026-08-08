@@ -14,3 +14,13 @@ export function dirClass(direction) {
 export function dirLabel(direction) {
     return direction === DIRNUM_C2S ? DIR_C2S : DIR_S2C
 }
+
+// Short machine-readable direction strings for a script's own API boundary (e.g. a
+// framer script's chunk.direction) — distinct from DIR_C2S/DIR_S2C above, which are for
+// human display.
+export const DIRSTR_C2S = 'c2s'
+export const DIRSTR_S2C = 's2c'
+
+export function dirToStr(direction) {
+    return direction === DIRNUM_C2S ? DIRSTR_C2S : DIRSTR_S2C
+}

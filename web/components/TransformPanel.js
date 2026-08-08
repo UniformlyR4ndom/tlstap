@@ -12,9 +12,9 @@ import { fmtAsHex, fmtAsRaw, parseRaw } from '../format.js'
 const html = htm.bind(h)
 
 // Groups a step's body params (i.e. excluding any `inHeader` ones) into render units: params
-// sharing the same `row` key render together on one labeled line (e.g. checksum.js's `init` and
-// `refin` both under "XOR in"); a param with no `row` renders alone, unchanged from the original
-// flat per-param layout. `rowLabel` may be set on any member of the group (first one found wins)
+// sharing the same `row` key render together on one labeled line (e.g. two params both
+// under "XOR in"); a param with no `row` renders alone, unchanged from the original flat
+// per-param layout. `rowLabel` may be set on any member of the group (first one found wins)
 // since a group's shared label isn't naturally "owned" by any single param in it.
 function groupParams(params) {
     const rows = []
@@ -35,10 +35,10 @@ function groupParams(params) {
     return rows
 }
 
-// Plain hex text -> bytes, for the Hex view. Distinct from transforms/basic.js's hex-decode
-// operation (which has a configurable separator param for the step pipeline) — this is a
-// simpler, fixed-format decode for the base view mode. Tolerates incidental whitespace so
-// pasted/pre-formatted hex still works; anything else invalid throws.
+// Plain hex text -> bytes, for the Hex view: a simpler, fixed-format decode than the
+// step pipeline's own hex-decode operation (which has a configurable separator param).
+// Tolerates incidental whitespace so pasted/pre-formatted hex still works; anything else
+// invalid throws.
 function hexTextToBytes(text) {
     const cleaned = text.replace(/\s+/g, '')
     if (cleaned.length % 2 !== 0) throw new Error('odd number of hex digits')
@@ -95,9 +95,9 @@ export default function TransformPanel() {
     function removeStep(id) {
         setSteps(prev => prev.filter(s => s.id !== id))
     }
-    // paramDef.onSet(value, params) may return extra params to merge in alongside the changed
-    // key — used by checksum.js's `variant` select to copy a preset's poly/init/refin/refout/
-    // xorout into the step so `Custom` starts from (and non-Custom reflects) that preset.
+    // paramDef.onSet(value, params) may return extra params to merge in alongside the
+    // changed key — e.g. a variant select copying a preset's values into the step so
+    // "Custom" starts from (and non-Custom reflects) that preset.
     function updateStepParam(id, key, value, paramDef) {
         let v = value
         if (paramDef.type === 'number') {

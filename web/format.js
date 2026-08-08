@@ -10,6 +10,10 @@ export function fmtAsBase64(bytes) {
     return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
 }
 
+export function parseBase64(text) {
+    return Uint8Array.from(atob(text), c => c.charCodeAt(0))
+}
+
 export function fmtAsHex(bytes) {
     return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
 }

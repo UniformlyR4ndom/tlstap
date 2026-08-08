@@ -9,17 +9,16 @@ import { downloadBlob } from '../download.js'
 
 const html = htm.bind(h)
 
-// "Scripts" sub-tab of the Tamper view: CRUD over the server-side script store (see
-// intercept/tamper/scripts.go) plus Run/Stop for the one script instance TamperView's
-// scriptRuntime can have active at a time. The running script and its log survive
-// switching away from this sub-tab (both are lifted to TamperView); the list/editor/
-// selection here are local and simply refetched each time this panel mounts.
+// "Scripts" sub-tab of the Tamper view: CRUD over the server-side script store plus
+// Run/Stop for the one script instance that can be active at a time. The running script
+// and its log survive switching away from this sub-tab (both are lifted to the parent);
+// the list/editor/selection here are local and simply refetched each time this panel
+// mounts.
 //
-// logFile ({enabled, filename}, from getLogFileInfo) and bypassBrowserLog/
-// onBypassBrowserLogChange are also owned by TamperView — the actual decisions of
-// whether to persist a line server-side and whether to also keep it in the browser's
-// own copy happen there (in the onLog handler passed to createScriptRuntime), not here;
-// this panel only renders what those choices imply (see the Log panel header below).
+// logFile ({enabled, filename}) and bypassBrowserLog/onBypassBrowserLogChange are also
+// owned by the parent — the actual decisions of whether to persist a line server-side
+// and whether to also keep it in the browser's own copy happen there; this panel only
+// renders what those choices imply.
 export default function TamperScriptsPanel({
     connected, running, onRun, onStop, logLines, onClearLog, refreshSignal,
     logFile, bypassBrowserLog, onBypassBrowserLogChange,
@@ -34,15 +33,14 @@ export default function TamperScriptsPanel({
     const [creatingNew,  setCreatingNew]  = useState(false)
     const [newName,      setNewName]      = useState('')
     // Handle sits after the list panel in DOM order, so a positive deltaX (dragging
-    // right) grows it — same convention as App.js's sidebar handle.
+    // right) grows it.
     const [listWidth, handleListResize] = useResizableLayout('scriptsListWidth', { min: 150, max: 500 })
     // Handle sits before the log panel (above it), so a negative deltaY (dragging up)
-    // grows it — same convention as App.js's bottom-panel handle.
+    // grows it.
     const [logHeight, handleLogResize]  = useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     // Bumped exactly once per genuine external reset of the editor's content (initial
-    // load, script switch, Reload) — see ScriptEditor.js's doc comment for why it must be
-    // an explicit signal rather than inferred from `source` changing (ordinary typing also
-    // changes `source`, via ScriptEditor's own onChange).
+    // load, script switch, Reload) — must be an explicit signal rather than inferred
+    // from `source` changing, since ordinary typing also changes `source`.
     const [loadVersion,  setLoadVersion]  = useState(0)
 
     function refreshList() {
@@ -92,15 +90,13 @@ export default function TamperScriptsPanel({
             .catch(err => setStatus({ ok: false, msg: err.message }))
     }
 
-    // Only rendered/reachable when no server-side log file is configured (see logFile
-    // prop below) — once one is, "Logged to <filename>" replaces this button entirely,
-    // since the server-persisted copy is the better source for anything sizable anyway.
-    // Plain per-line text; error lines get a textual [ERROR] marker since the red
-    // .tamper-log-error styling doesn't survive into a downloaded file. Always a plain
-    // anchor-click download rather than showSaveFilePicker (unlike ExtractPanel.js/
-    // MarkersPanel.js, which offer an explicit file/clipboard choice) — this button is
-    // just "Download", not "Save As", and showSaveFilePicker's native dialog can hang
-    // with no error and no visible feedback; a plain download has no such failure mode.
+    // Only rendered/reachable when no server-side log file is configured — once one is,
+    // "Logged to <filename>" replaces this button entirely. Plain per-line text; error
+    // lines get a textual [ERROR] marker since the red .tamper-log-error styling doesn't
+    // survive into a downloaded file. Always a plain anchor-click download, not
+    // showSaveFilePicker — this button is "Download," not "Save As," and the native save
+    // dialog can hang with no error and no visible feedback; a plain download has no
+    // such failure mode.
     function handleDownloadLog() {
         const text = logLines.map(l => l.level === 'error' ? `[ERROR] ${l.text}` : l.text).join('\n')
         downloadBlob(text, 'tamper-script-log.txt', 'text/plain')

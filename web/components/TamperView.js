@@ -40,13 +40,11 @@ export default function TamperView() {
     const [runningScript, setRunningScript] = useState(null)
     const [scriptLog,     setScriptLog]     = useState([])
     const [scriptsRefreshSignal, setScriptsRefreshSignal] = useState(0)
-    // Whether the server persists the script log to a file (static for the server's
-    // whole run — fetched once on mount, see getLogFileInfo) and the user's choice to
-    // skip the browser's own in-memory copy of it (only meaningful/offered while a log
-    // file is active — see TamperScriptsPanel.js). Both are read from inside onLog
-    // below, a callback created once (see the scriptRuntimeRef guard's own comment) —
-    // logFileRef/bypassLogRef keep it seeing live values instead of the stale ones
-    // captured at first render, same trick TrafficView.js's displayRef uses.
+    // logFileInfo: whether the server persists the script log to a file (static for the
+    // server's run, fetched once on mount). bypassBrowserLog: skip the browser's own
+    // in-memory copy, offered only while a log file is active. Both are read inside onLog
+    // below, a callback created once — logFileRef/bypassLogRef keep it seeing live values
+    // instead of what was captured at first render.
     const [logFileInfo,     setLogFileInfo]     = useState({ enabled: false, filename: '' })
     const [bypassBrowserLog, setBypassBrowserLog] = useState(false)
     const logFileRef = useRef(logFileInfo)
@@ -54,7 +52,7 @@ export default function TamperView() {
     const bypassLogRef = useRef(bypassBrowserLog)
     bypassLogRef.current = bypassBrowserLog
     // Set of "conn:direction" keys currently suspended in a script's ctx.pause(), waiting
-    // on a human "Continue" — see TamperDetailPanel's restricted toolbar for those entries.
+    // on a human "Continue".
     const [pausedEntries, setPausedEntries] = useState(() => new Set())
     const controlRef = useRef(null)
 
@@ -62,20 +60,18 @@ export default function TamperView() {
         controlRef.current?.listStreams().catch(() => {})
     }
 
-    // Lazily created once (the `if` guard, not useMemo, is what keeps createScriptRuntime
-    // from re-running every render — its own handlers only ever touch controlRef.current
-    // at call time, so binding them once here is safe even though controlRef itself is
-    // reassigned across reconnects). See scriptRuntime.js and TamperScriptsPanel.js.
+    // Lazily created once — the `if` guard (not useMemo) keeps createScriptRuntime from
+    // re-running every render; its handlers only touch controlRef.current at call time,
+    // so binding them once here is safe even though controlRef itself is reassigned
+    // across reconnects.
     const scriptRuntimeRef = useRef(null)
     if (!scriptRuntimeRef.current) {
         scriptRuntimeRef.current = createScriptRuntime({
             peek: (conn, direction) => peekBuffer(conn, direction),
             release: (conn, direction, opts, editedBytes) => handleRelease(conn, direction, opts, editedBytes),
             dropConnection: (conn, direction) => handleDropConnection(conn, direction),
-            // scriptRuntime.js's tamper.setIntercept -> this handler; the wire command
-            // underneath (controlRef.current.setMode) stays named after the "set-mode"
-            // control-protocol command, which also drives the human Intercept-checkbox UI
-            // (TamperStreamsList.js) — only the script-facing name changed.
+            // Wire command underneath (setMode) stays named after the "set-mode"
+            // control-protocol command; only the script-facing name changed.
             setIntercept: (conn, intercepting) => controlRef.current
                 ? controlRef.current.setMode(conn, intercepting).then(res => { resync(); return res })
                 : Promise.reject(new Error('not connected')),
@@ -83,23 +79,20 @@ export default function TamperView() {
                 ? controlRef.current.listStreams().then(res => res.streams)
                 : Promise.reject(new Error('not connected')),
             // fs-root access is a plain REST call, independent of the control connection's
-            // lifecycle (see intercept/tamper/fs.go and tamperApi.js) — no controlRef guard
-            // needed here, unlike every handler above.
+            // lifecycle — no controlRef guard needed here, unlike every handler above.
             fsList: (path) => listFs(path),
             fsRead: (path) => readFs(path),
             fsWrite: (path, bytes) => writeFs(path, bytes),
             fsAppend: (path, bytes) => appendFs(path, bytes),
-            // prefix (ctx.log only — see scriptRuntime.js's handleWorkerMessage 'ctxlog'
-            // branch) is a ready-made connection-summary + timestamp line, rendered above
-            // the formatted args rather than joined into them so it stays visually distinct
-            // even when args is empty (a bare ctx.log() with no arguments still logs
-            // something useful: "reached this point" for this connection/direction/time).
+            // prefix (ctx.log only) is a ready-made connection-summary + timestamp line,
+            // rendered above the args rather than joined into them so it stays visually
+            // distinct even when args is empty (a bare ctx.log() still logs something
+            // useful on its own).
             onLog: (level, args, prefix) => {
                 const text = prefix ? (args.length ? `${prefix}\n${formatLogArgs(args)}` : prefix) : formatLogArgs(args)
                 // Persistence is independent of the browser copy below: it always happens
-                // while a log file is configured, regardless of the bypass checkbox — the
-                // checkbox only ever controls the (memory-bounded, LOG_LIMIT-capped)
-                // browser copy, for the large-output use case (see TamperScriptsPanel.js).
+                // while a log file is configured, regardless of the bypass checkbox, which
+                // only controls the memory-bounded browser copy.
                 if (logFileRef.current.enabled) controlRef.current?.scriptLog(level, text)
                 if (!logFileRef.current.enabled || !bypassLogRef.current) {
                     setScriptLog(log => [...log, { level, text }].slice(-LOG_LIMIT))
@@ -132,10 +125,10 @@ export default function TamperView() {
             onClose: () => {
                 setConnected(false)
                 controlRef.current = null
-                // A running script talks to the control connection via this component's
-                // handlers; once it's gone there's nothing left for the script to act on,
-                // and reconnecting fresh shouldn't silently resume a script that was
-                // reacting to a now-stale view of the world.
+                // A running script talks to the control connection via these handlers;
+                // once it's gone there's nothing left for it to act on, and reconnecting
+                // fresh shouldn't silently resume a script reacting to a now-stale view
+                // of the world.
                 scriptRuntimeRef.current.stop()
             },
             onStreamCreated: msg => {
@@ -144,11 +137,9 @@ export default function TamperView() {
             },
             onStreamTerminated: msg => {
                 resync()
-                // Unstick any ctx.pause() suspended on this conn immediately — its
-                // Intercept-tab entry (and so the human's only way to click Continue) is
-                // about to disappear. Must happen before/independent of the queued onClose
-                // dispatch below, not routed through it, since the per-conn event queue
-                // itself can't advance past a still-pending pause on its own.
+                // Unsticks any ctx.pause() suspended on this conn immediately, before the
+                // queued onClose dispatch below — the per-conn event queue can't advance
+                // past a still-pending pause on its own.
                 scriptRuntimeRef.current.rejectPause(msg.conn)
                 scriptRuntimeRef.current.dispatch('onClose', msg.conn, [])
             },
@@ -177,10 +168,9 @@ export default function TamperView() {
         getLogFileInfo().then(setLogFileInfo).catch(() => {})
     }, [])
 
-    // One entry per (conn, direction) that currently has something held — a summary
-    // (chunks/length), not individually-addressable chunks, since there are no per-chunk
-    // ids. Sorted by conn/direction for a stable order — stream-list's pendingInfo carries
-    // no per-buffer timestamp to sort by (see TamperQueueList.js).
+    // One entry per (conn, direction) with something held — a summary (chunks/length),
+    // not individually-addressable chunks, since there are no per-chunk ids. Sorted by
+    // conn/direction for a stable order (no per-buffer timestamp to sort by instead).
     const queue = useMemo(() => {
         const flat = streams.flatMap(s => s.pending.map(p => ({ ...p, conn: s.conn, src: s.src, dst: s.dst })))
         flat.sort((a, b) => a.conn - b.conn || a.direction - b.direction)
@@ -188,9 +178,8 @@ export default function TamperView() {
     }, [streams])
 
     // Keep selection valid: auto-advance to the new first item once the selected buffer
-    // is no longer in the queue (fully released — by us or force-released elsewhere,
-    // timed out, or its stream terminated). Also the initial auto-select when nothing
-    // chosen yet, and the post-release auto-advance the Tamper tab is meant to provide.
+    // is no longer in the queue (released, timed out, or its stream terminated) — also
+    // covers the initial auto-select.
     useEffect(() => {
         if (selectedKey && queue.some(e => e.conn === selectedKey.conn && e.direction === selectedKey.direction)) return
         setSelectedKey(queue.length > 0 ? { conn: queue[0].conn, direction: queue[0].direction } : null)
@@ -207,10 +196,8 @@ export default function TamperView() {
 
     function handleRelease(conn, direction, opts, editedBytes) {
         if (!controlRef.current) return Promise.reject(new Error('not connected'))
-        // A successful release produces no push event of its own (e.g. "drop" means no
-        // further traffic ever flows on that stream, so nothing would otherwise trigger
-        // a resync) — explicitly refresh so the queue reflects it immediately, rather
-        // than relying on some later, unrelated event to happen to clean it up.
+        // A successful release produces no push event of its own, so explicitly resync
+        // rather than relying on some later, unrelated event to clean up the queue.
         return controlRef.current.release(conn, direction, opts, editedBytes).then(res => { resync(); return res })
     }
 
@@ -219,11 +206,9 @@ export default function TamperView() {
         return controlRef.current.dropConnection(conn, direction).then(res => { resync(); return res })
     }
 
-    // "Continue" on a script-paused entry: commits any pending edit (opts mirrors what
-    // TamperDetailPanel's own Forward/Drop would send, just forced to releaseChunks: 0 —
-    // an edit-only hold, same as a plain "Save" would be), then hands control back to the
-    // script's suspended ctx.pause() call rather than releasing anything to the wire —
-    // the script itself decides what happens to the buffer next.
+    // "Continue" on a script-paused entry: commits any pending edit as an edit-only hold
+    // (releaseChunks: 0), then hands control back to the script's suspended ctx.pause()
+    // call — the script itself decides what happens to the buffer next.
     function handleContinue(conn, direction, opts, editedBytes) {
         if (!controlRef.current) return Promise.reject(new Error('not connected'))
         // Nothing to commit — skip the network round-trip and resume the script directly.

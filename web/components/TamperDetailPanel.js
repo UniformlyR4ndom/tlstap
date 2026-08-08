@@ -11,12 +11,8 @@ import { useDismissOnOutsideClick } from '../useDismissOnOutsideClick.js'
 const html = htm.bind(h)
 
 // Decodes popover input text per the chosen format. 'hex'/'base64' reuse the Transform
-// panel's own (tested) decode ops rather than re-implementing hex/base64 parsing here —
-// 'hex' passes a fixed space separator (no prefix) since that op's separator stripping
-// already treats contiguous or whitespace-joined hex identically once whitespace is
-// collapsed. 'hexdump' has no Transform-panel equivalent (it isn't a general encode/decode
-// op, just this popover's way to round-trip HexDump's own "Copy as hexdump" output), so it
-// goes through format.js's parseHexdump directly.
+// panel's decode ops (fixed space separator for hex); 'hexdump' has no Transform-panel
+// equivalent, so it goes through parseHexdump directly.
 function decodeChunkText(text, format) {
     if (format === 'plain') return parseRaw(text)
     const bytes = parseRaw(text)
@@ -26,13 +22,9 @@ function decodeChunkText(text, format) {
     throw new Error(`unknown format "${format}"`)
 }
 
-// Toolbar/context-menu popover for inserting a new chunk at insertAt (an index into
-// chunksForView(viewMode, chunks) — see the call sites below), either empty or decoded
-// from a file/clipboard in one of four text formats. Kept as its own small floating panel
-// (not folded into ctxMenu) since — unlike Drop/Split/Merge/Forward, which are one-shot
-// instant actions — this needs to stay open across a format pick, a possible source pick,
-// and an async file-read/clipboard-read before finally calling onInsert, so it needs its
-// own independent outside-click/Escape dismissal instead of ctx-menu's fire-and-close one.
+// Popover for inserting a new chunk at insertAt, either empty or decoded from a
+// file/clipboard. Kept separate from ctxMenu (own outside-click/Escape dismissal) since it
+// stays open across an async file/clipboard read, unlike ctxMenu's one-shot actions.
 function InsertChunkPopover({ x, y, onInsert, onCancel }) {
     const [format, setFormat] = useState('empty') // empty | plain | hex | base64 | hexdump
     const [source, setSource] = useState('clipboard') // clipboard | file
@@ -146,57 +138,33 @@ function totalLength(chunks) {
     return chunks.reduce((n, c) => n + c.length, 0)
 }
 
-// Chunks the wire protocol can actually represent. A zero-length chunk carries no bytes, so
-// it can never get its own valid bounds entry — buffer.go's validBounds requires bounds to be
-// strictly increasing, and a zero-length chunk's start offset is identical to whatever comes
-// right after it (it added nothing to move the offset forward), so anything but a *trailing*
-// zero-length chunk collides with its successor and gets the whole release rejected as "the
-// buffer has changed". Filtering here is a no-op on the actual byte stream — merging an empty
-// chunk contributes nothing either way — so it's applied everywhere chunks[] feeds a release:
-// boundsFromChunks, mergeUint8Arrays, and the releaseChunks counts in act()/forwardFirstChunk.
-// A user can still create and leave an empty chunk locally (e.g. as an insertion point to type
-// new bytes into directly via its own HexEditor block, which is the primary reason to want one
-// at all) — it simply has no effect on the wire if it's still empty by the time Forward/Drop is
-// actually clicked.
+// Chunks the wire protocol can represent: a non-trailing zero-length chunk would collide
+// with its successor's start offset, which the server's strictly-increasing bounds check
+// rejects. A user can still leave an empty chunk locally (e.g. as a typing target); it
+// just has no effect on the wire if still empty when released.
 function nonEmptyChunks(chunks) {
     return chunks.filter(c => c.length > 0)
 }
 
-// What chunk-scoped operations (context menu, split) actually operate on, per view mode.
-// Continuous view displays mergeUint8Arrays(chunks) as one editor with no real per-chunk
-// structure visible, so a right-click's byteIndex is a position within *that* merged
-// buffer, not within chunks[0] alone — treating it as a single implicit chunk here is what
-// makes "index 0 of 1" the correct target both for menu-gating (already done) and for
-// actually performing a split. Segmented view's chunks already are that structure, so this
-// is just chunks unchanged.
+// What chunk-scoped operations (context menu, split) operate on, per view mode.
+// Continuous view has no real per-chunk structure, so a right-click's byteIndex is a
+// position within the single merged buffer — treated here as one implicit chunk.
 function chunksForView(viewMode, chunks) {
     return viewMode === 'continuous' ? [mergeUint8Arrays(chunks)] : chunks
 }
 
-// Bottom panel of the Tamper tab: shows the currently-selected direction's whole held
-// buffer (fetched on demand via peek, since "held" never carries bytes inline), plus the
-// forward/drop/drop-connection actions that release it.
+// Bottom panel of the Tamper tab: shows the selected direction's whole held buffer
+// (fetched via peek, since "held" carries no bytes inline) plus forward/drop/drop-
+// connection actions.
 //
-// Canonical state is chunks: Uint8Array[] — one entry per original chunk boundary, not a
-// flat byte array — since that's what both view modes below are ultimately a projection
-// of, and what the chunk-editing operations (split/merge/create/delete — see
-// splitChunk/mergeChunks/dropChunk/insertChunk below) operate on directly. A flat buffer
-// for submission or the continuous view is always just mergeUint8Arrays(chunks); the
-// reverse (bytes -> chunks) needs bounds, which is why peek's bounds are threaded all the
-// way through here now instead of being reduced to a bare chunk count.
+// Canonical state is chunks: Uint8Array[], one entry per original chunk boundary — not a
+// flat array — since split/merge/insert/delete operate on it directly; a flat buffer for
+// submission or continuous view is just mergeUint8Arrays(chunks).
 //
-// **Segmented view** (default) renders one independent <HexEditor> per chunk, fed that
-// chunk's own byte slice — HexEditor always renders offsets relative to whatever bytes it's
-// given starting at 0, so per-chunk local offsets and the "restart at each boundary" look
-// fall out for free, with zero changes to HexEditor.js itself. Editing inside one block only
-// ever replaces that one entry of chunks[]; the others (and their own HexEditor instances,
-// each with independent cursor state) are untouched.
-//
-// **Continuous view** is the single flat editor this panel used to always show: one
-// <HexEditor> over mergeUint8Arrays(chunks), whose onChange collapses chunks down to a
-// single entry — editing across what were chunk boundaries has no well-defined
-// per-chunk meaning yet (real boundary editing is still future work), so continuous mode
-// deliberately discards structure on edit rather than guessing.
+// Segmented view (default) renders one independent <HexEditor> per chunk; editing one
+// block only replaces that entry. Continuous view is a single editor over the merged
+// buffer, whose onChange collapses chunks to one entry — editing across former chunk
+// boundaries has no well-defined per-chunk meaning, so structure is discarded on edit.
 export default function TamperDetailPanel({ entry, onRelease, onDropConnection, paused, onContinue }) {
     const [viewMode,        setViewMode]       = useState('segmented') // 'segmented' | 'continuous'
     const [editMode,        setEditMode]       = useState('insert') // 'insert' | 'overwrite'
@@ -206,32 +174,22 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
     const [loadError,       setLoadError]      = useState(null)
     const [busy,            setBusy]           = useState(false)
     const [actionError,     setActionError]    = useState(null)
-    // null | { x, y, chunkIndex, byteIndex, totalChunks, chunkLength }. Continuous view has
-    // no real per-chunk structure to target, so it's treated as a single implicit chunk
-    // (index 0 of 1) for menu purposes — Forward is trivially enabled (it is the first
-    // chunk) and both Merge items are trivially disabled (no siblings), which is the
-    // correct answer for "the whole buffer" anyway.
-    //
-    // All items are implemented (see dropChunk/splitChunk/forwardFirstChunk/mergeChunks/
-    // openInsertPopover below). Enabled/disabled state: Forward only for the first chunk
-    // (release is always a front-aligned prefix), Split needs a real interior byte position
-    // (not the two edges, which would produce a zero-length chunk), Merge (back)/(front)
-    // need a next/previous chunk to merge with; Drop and Insert Chunk Before/After have no
-    // gating at all — unlike Merge, Drop needs no sibling (so it can remove the last
-    // remaining chunk too), and inserting a new chunk boundary never requires one either.
+    // null | { x, y, chunkIndex, byteIndex, totalChunks, chunkLength }. Continuous view is
+    // treated as one implicit chunk (index 0 of 1).
+    // Enabled/disabled state: Forward only for the first chunk, Split needs an interior
+    // byte position, Merge (back)/(front) need a next/previous chunk; Drop and Insert
+    // Chunk Before/After have no gating.
     const [ctxMenu, setCtxMenu] = useState(null)
     // null | { x, y, insertAt } — insertAt indexes into chunksForView(viewMode, chunks) at
-    // the moment the popover was opened (from the toolbar button, appending at the end, or
-    // from a context-menu "Insert Chunk Before/After"). See InsertChunkPopover above.
+    // the moment the popover was opened.
     const [insertPopover, setInsertPopover] = useState(null)
     const [settingsOpen, setSettingsOpen] = useState(false)
     const menuRef = useRef(null)
     const selKeyRef = useRef(null)
     const settingsRef = useRef(null)
 
-    // Dismiss context menu on outside click or Escape. Must use the ref-contains check (not
-    // HexDump.js's stopPropagation mechanism): mousedown fires before click, so an
-    // unconditional close would unmount the menu before an item's onClick ever fires.
+    // Uses the ref-contains check, not stopPropagation: mousedown fires before click, so an
+    // unconditional close would unmount the menu before an item's onClick fires.
     useDismissOnOutsideClick(menuRef, () => setCtxMenu(null), !!ctxMenu)
     useDismissOnOutsideClick(settingsRef, () => setSettingsOpen(false), settingsOpen)
 
@@ -243,26 +201,18 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         })
     }
 
-    // Right-click fallback for the segmented view's per-chunk block: HexEditor only reports
-    // a context-menu event for clicks landing inside its own .hexed-container (see
-    // HexEditor.js's handleContextMenu), so a right-click on the chunk header — or any other
-    // padding within the block that isn't the editor itself — used to fall through to the
-    // browser's default menu instead of this one. Bails out when the click already landed
-    // inside .hexed-container, since HexEditor's own onContextMenu already handled that case
-    // (with a real byteIndex when the click hit an actual byte); this only ever fires for the
-    // remainder of the block, so it always opens with byteIndex: null, same as a click inside
-    // the editor that missed every byte.
+    // Right-click fallback for padding outside HexEditor's own .hexed-container (which
+    // already handles clicks landing inside it) — opens with byteIndex: null, same as a
+    // click inside the editor that missed every byte.
     function handleBlockContextMenu(e, chunkIndex) {
         if (e.target.closest('.hexed-container')) return
         e.preventDefault()
         openChunkMenu(chunkIndex, { index: null, x: e.clientX, y: e.clientY })
     }
 
-    // Splits chunksForView(viewMode, chunks)[chunkIndex] into two entries at byteIndex,
-    // replacing it in place. In continuous view this also collapses whatever multi-chunk
-    // structure existed before the split into just the two new pieces — the same "an edit
-    // discards prior structure" rule continuous mode's plain byte edits already follow (see
-    // the module doc comment), just via a split instead of a byte insert/delete.
+    // Splits target[chunkIndex] into two entries at byteIndex. In continuous view this
+    // also collapses any prior multi-chunk structure into just the two new pieces (the
+    // same edit-discards-structure rule a plain byte edit there already follows).
     function splitChunk(chunkIndex, byteIndex) {
         setChunks(cs => {
             const target = chunksForView(viewMode, cs)
@@ -274,10 +224,8 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         setCtxMenu(null)
     }
 
-    // Merges chunksForView(viewMode, chunks)[a] and [b] (adjacent, a === b - 1) into one
-    // entry. Shared by both Merge (back) (a = chunkIndex, b = chunkIndex + 1) and Merge
-    // (front) (a = chunkIndex - 1, b = chunkIndex) — merging is direction-agnostic, only
-    // which pair of neighboring indices is being joined differs between the two menu items.
+    // Merges adjacent target[a]/target[b] into one entry. Shared by Merge (back)
+    // (a=chunkIndex, b=chunkIndex+1) and Merge (front) (a=chunkIndex-1, b=chunkIndex).
     function mergeChunks(a, b) {
         setChunks(cs => {
             const target = chunksForView(viewMode, cs)
@@ -287,12 +235,9 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         setCtxMenu(null)
     }
 
-    // Removes chunksForView(viewMode, chunks)[chunkIndex] entirely — a pure local edit, like
-    // Split/Merge and unlike Forward (which has to hit the server, since only it can do a
-    // partial release). Unlike Merge, there's no sibling requirement, so this can remove the
-    // last remaining chunk too, leaving chunks empty; the toolbar's Forward/Drop (submitting
-    // that as a full-buffer edit to nothing) or a Refresh (discarding it) are what resolve
-    // that state, same as any other edit.
+    // Removes target[chunkIndex] entirely — a pure local edit, unlike Forward (which must
+    // hit the server for a partial release). No sibling requirement, so this can empty
+    // chunks[] entirely.
     function dropChunk(chunkIndex) {
         setChunks(cs => {
             const target = chunksForView(viewMode, cs)
@@ -301,18 +246,14 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         setCtxMenu(null)
     }
 
-    // Opens InsertChunkPopover targeting insertAt (an index into chunksForView(viewMode,
-    // chunks) as it stands right now). Closes ctxMenu too, since "Insert Chunk Before/After"
-    // are themselves ctxMenu items — only one of the two floating panels should ever be up.
+    // Closes ctxMenu first — only one floating panel should be up at a time.
     function openInsertPopover(insertAt, x, y) {
         setCtxMenu(null)
         setInsertPopover({ x, y, insertAt })
     }
 
-    // Splices a newly-created chunk into chunksForView(viewMode, chunks) at insertAt — same
-    // splice-in-place shape as splitChunk/mergeChunks/dropChunk above, so an insert made
-    // while in continuous view lands in the underlying array the same way a Split there
-    // would, just displayed merged until the view is switched back to segmented.
+    // Splices a new chunk into target at insertAt — same in-place splice shape as
+    // split/merge/drop above.
     function insertChunk(insertAt, bytes) {
         setChunks(cs => {
             const target = chunksForView(viewMode, cs)
@@ -334,12 +275,9 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
             .finally(() => setLoading(false))
     }
 
-    // Selection changes always (re)load from scratch. Staying on the same selection but
-    // seeing its live chunks/length change (a new "held" push arrived, reflected via
-    // TamperView's resync-on-every-event stream-list) only auto-reloads if nothing's
-    // been edited yet — silently replacing an in-progress edit would be a real way to
-    // lose work, so an edited-and-stale buffer instead surfaces the banner below and
-    // waits for an explicit refresh.
+    // A selection change always reloads. The same selection's live chunks/length changing
+    // only auto-reloads if nothing's been edited yet — an edited-and-stale buffer instead
+    // surfaces the banner below and waits for an explicit refresh.
     useEffect(() => {
         setActionError(null)
         if (!entry) {
@@ -372,12 +310,9 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         if (!entry || busy) return
         setBusy(true)
         setActionError(null)
-        // Continuous-mode edits already collapsed chunks down to a single entry (see the
-        // module doc comment); segmented-mode edits preserve however many entries chunks[]
-        // currently has. Either way releaseChunks/bounds just describe chunks[] as it stands
-        // now — no special-casing needed between the two view modes here. nonEmptyChunks
-        // strips any still-empty chunk (e.g. one created via New Chunk/Insert and never typed
-        // into) before that description is built, since the wire protocol can't represent one.
+        // releaseChunks/bounds just describe chunks[] as it stands now, regardless of view
+        // mode. nonEmptyChunks strips any still-empty chunk first, since the wire protocol
+        // can't represent one.
         const submit = nonEmptyChunks(chunks)
         const opts = {
             action,
@@ -391,30 +326,21 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
             .finally(() => setBusy(false))
     }
 
-    // Forwards just the first chunk in chunksForView(viewMode, chunks) — the same "first" the
-    // Forward menu item's chunkIndex === 0 gate already checks — leaving the rest still held.
-    // Reuses act()'s exact edited/prefixLength/bounds computation (always describing the
-    // *whole* current buffer, never a hand-picked partial prefix): the server applies that
-    // full-buffer edit first, then releases only releaseChunks of the result, so this needs
-    // no bookkeeping about which original bytes ended up in "chunk 0" even after a Merge
-    // pulled in a neighbor — the edit already fully describes the new structure regardless of
-    // how it was built locally. The one difference from a plain act('forward') is
-    // releaseChunks: in continuous view chunksForView's single synthetic entry already *is*
-    // everything, so "release its first chunk" has to mean every raw chunk (submit.length or
-    // originalChunks.length, exactly what act() itself would release) — segmented view's
-    // chunksForView is chunks unchanged, so there releaseChunks is 1 chunk of the *filtered*
-    // sequence (see nonEmptyChunks): if target[0] itself is a still-empty chunk (possible if
-    // the user right-clicks one directly — chunkIndex === 0 doesn't require non-empty), it
-    // contributes no bounds entry at all, so "1 filtered chunk" actually covers it plus
-    // whatever real chunk follows it; dropCount below mirrors that same coalescing on the
-    // local (raw) side so `remaining` stays exactly what the server has left.
+    // Forwards just the first chunk, leaving the rest held. Reuses act()'s edited/
+    // prefixLength/bounds computation (always describes the whole current buffer) — the
+    // server applies that edit first, then releases releaseChunks of the result.
     function forwardFirstChunk() {
         if (!entry || busy) return
         const target = chunksForView(viewMode, chunks)
+        // Also skips leading empty chunks: a still-empty target[0] contributes no bounds
+        // entry of its own, so dropCount must match what releaseChunks below actually covers.
         let dropCount = 1
         while (dropCount < target.length && target[dropCount - 1].length === 0) dropCount++
         const remaining = target.slice(dropCount)
         const submit = nonEmptyChunks(chunks)
+        // In continuous view the single synthetic entry already is everything, so this
+        // releases everything (same count act() would use); in segmented view it's 1 chunk
+        // of the filtered sequence.
         const releaseChunks = viewMode === 'continuous'
             ? (edited ? submit.length : originalChunks.length)
             : Math.min(1, submit.length)
@@ -429,12 +355,10 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         }
         onRelease(entry.conn, entry.direction, opts, edited ? mergeUint8Arrays(submit) : undefined)
             .then(() => {
-                // Optimistic local update to the known remainder, rather than waiting on the
-                // resync TamperView's onRelease chain triggers: without this, the panel would
-                // keep showing the just-forwarded first chunk (and, if this action was itself
-                // an edit, "edited" would stay true relative to the now-stale originalChunks)
-                // until that round-trip completes, which the auto-refresh effect can't correct
-                // on its own since it only fires when unedited.
+                // Optimistic local update to the known remainder, instead of waiting on the
+                // resync that follows a release — the auto-refresh effect only fires when
+                // unedited, so without this the panel would keep showing the just-forwarded
+                // chunk until that round-trip completes.
                 setChunks(remaining)
                 setOriginalChunks(remaining)
             })
@@ -443,14 +367,10 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
         setCtxMenu(null)
     }
 
-    // "Continue" (only shown while paused, in place of Forward/Drop/Drop Connection):
-    // commits any pending edit as an edit-only hold (releaseChunks: 0 — TamperView's
-    // onContinue forces this regardless of what's passed here) and hands control back to
-    // the script's suspended ctx.pause() call, rather than releasing anything to the wire.
-    // Mirrors forwardFirstChunk's optimistic local update on success, for the same reason:
-    // without it, the buffer would still compare "edited" against a now-stale
-    // originalChunks until some unrelated event happens to trigger a resync, and briefly
-    // show the (misleading, since nothing external changed) stale-edit banner.
+    // "Continue" (only shown while paused): commits any pending edit as an edit-only hold
+    // (releaseChunks: 0) and hands control back to the script's suspended ctx.pause() call,
+    // instead of releasing to the wire. Mirrors forwardFirstChunk's optimistic local
+    // update on success, for the same reason.
     function handleContinue() {
         if (!entry || busy) return
         const submit = nonEmptyChunks(chunks)
@@ -486,10 +406,8 @@ export default function TamperDetailPanel({ entry, onRelease, onDropConnection, 
     }
 
     const actionsDisabled = busy || loading || !!loadError || originalChunks.length === 0
-    // A split at position 0 or at the chunk's own length would produce a zero-length
-    // chunk — bounds the server's validBounds rejects outright (bounds must be strictly
-    // increasing), so those two edge positions are excluded here alongside "no byte
-    // position was targeted at all".
+    // A split at position 0 or the chunk's own length would produce a zero-length chunk,
+    // which the server rejects — both edge positions are excluded here.
     const canSplit = !!ctxMenu && ctxMenu.byteIndex != null &&
         ctxMenu.byteIndex > 0 && ctxMenu.byteIndex < ctxMenu.chunkLength
 

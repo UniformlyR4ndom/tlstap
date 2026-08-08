@@ -17,14 +17,15 @@ export default function SessionList({ selected, onSelect, refreshKey, onLoad, la
             .catch(e => setError(e.message))
     }
 
-    // See StreamList.js's equivalent effect pair for why `latestSessionId` is read here
-    // (seeding) without being a dependency, and reacted to separately below.
+    // Seeds the baseline from the current prop value (rather than a network round trip)
+    // without depending on it, so the poll-reaction effect below is the only one that
+    // reacts to it changing.
     useEffect(() => {
         lastSeenIdRef.current = latestSessionId
         load()
     }, [refreshKey])
 
-    // App.js's own poll updates `latestSessionId` centrally; just react when it moves.
+    // The central live poll updates `latestSessionId`; just react when it moves.
     useEffect(() => {
         if (latestSessionId === lastSeenIdRef.current) return
         lastSeenIdRef.current = latestSessionId

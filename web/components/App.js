@@ -15,6 +15,8 @@ import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
 import { useResizableLayout } from '../useResizableLayout.js'
 import { usePoll } from '../usePoll.js'
 import { getLatest } from '../api.js'
+import { listFramerScripts } from '../dbdumpFramerApi.js'
+import { loadDefaultFramerScript, saveDefaultFramerScript } from '../framerPrefs.js'
 import { DIRNUM_C2S } from '../direction.js'
 
 const html = htm.bind(h)
@@ -41,6 +43,8 @@ export default function App() {
     const [extractFrom,  setExtractFrom]  = useState('')
     const [extractTo,    setExtractTo]    = useState('')
     const [latest,       setLatest]       = useState({ latest_session_id: -1, latest_sgid: -1, streams_version: -1, latest_stid: -1 })
+    const [framerScripts, setFramerScripts] = useState([])
+    const [defaultFramerScript, setDefaultFramerScriptState] = useState(() => loadDefaultFramerScript())
     const [sidebarWidth, handleSidebarResize] = useResizableLayout('sidebarWidth', { min: 180, max: 600 })
     const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
@@ -52,10 +56,24 @@ export default function App() {
     useEffect(() => { saveMarkers(markers) }, [markers])
     useEffect(() => { rememberPositionRef.current = rememberPosition }, [rememberPosition])
 
-    // Single central live poll for SessionList/StreamList/TrafficView/CombinedView — one
-    // request per tick instead of one per component. `stream` is only included while a
-    // specific stream is actually the visible view (single mode); CombinedView has no use
-    // for latest_stid, so there's no reason to compute it server-side while it's mounted.
+    // Fetched once here (not per-component) since multiple consumers need the same
+    // list; re-fetched on Refresh in case scripts were added/removed externally in the
+    // meantime (there's no in-app editor yet). A 501 (scripts-dir not configured) or any
+    // other failure just leaves the list empty.
+    useEffect(() => {
+        listFramerScripts().then(setFramerScripts).catch(() => setFramerScripts([]))
+    }, [refreshKey])
+
+    function handleSetDefaultFramer(name) {
+        setDefaultFramerScriptState(name || null)
+        saveDefaultFramerScript(name || null)
+        setOpenMenu(null)
+    }
+
+    // Single central live poll for the whole Analysis view — one request per tick
+    // instead of one per consumer. `stream` is only included while a specific stream is
+    // actually the visible view (single mode); the combined view has no use for
+    // latest_stid, so there's no reason to compute it server-side while it's mounted.
     usePoll(true, POLL_INTERVAL_MS, async () => {
         try {
             const params = {}
@@ -215,6 +233,19 @@ export default function App() {
                                 <span class="menu-check">${rememberPosition ? '✓' : ''}</span>
                                 Remember stream position
                             </div>
+                            <div class="menu-sep" />
+                            <div class="menu-item">
+                                <span>Default framer</span>
+                                <select
+                                    class="goto-select"
+                                    style="margin-left:auto"
+                                    value=${defaultFramerScript ?? ''}
+                                    onchange=${e => handleSetDefaultFramer(e.target.value)}
+                                >
+                                    <option value="">(none)</option>
+                                    ${framerScripts.map(s => html`<option value=${s.name}>${s.name}</option>`)}
+                                </select>
+                            </div>
                         </div>
                     `}
                 </div>
@@ -258,6 +289,7 @@ export default function App() {
                             onSetExtractEnd=${handleSetExtractEnd}
                             onSetExtractRange=${handleSetExtractRange}
                             onLeaveStream=${handleLeaveStream}
+                            framerScripts=${framerScripts}
                           />`
                     }
                 </main>

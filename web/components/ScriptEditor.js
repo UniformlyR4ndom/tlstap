@@ -11,10 +11,10 @@ import { camelCaseOpId } from '../scriptRuntime.js'
 
 const html = htm.bind(h)
 
-// Reflection-only mirror of the real `self.tamper` API built by scriptRuntime.js's
-// BOOTSTRAP, for scopeCompletionSource to read property names/types off of — never called.
-// transform's shape is generated from OPERATIONS_BY_CATEGORY/camelCaseOpId, the same inputs
-// BOOTSTRAP itself uses, so a new transform op appears here without a separate update.
+// Reflection-only mirror of the real self.tamper API, for scopeCompletionSource to read
+// property names/types off of — never called. transform's shape is generated from
+// OPERATIONS_BY_CATEGORY/camelCaseOpId, the same inputs the real API uses, so a new
+// transform op appears here without a separate update.
 const TAMPER_COMPLETION_SHAPE = {
     register: () => {},
     peek: () => {},
@@ -35,12 +35,12 @@ const TAMPER_COMPLETION_SHAPE = {
     log: () => {},
 }
 
-// Same idea as TAMPER_COMPLETION_SHAPE, mirroring makeCtx()'s return value in
-// scriptRuntime.js (minus __flush, internal-only there). scopeCompletionSource matches on
+// Same idea as TAMPER_COMPLETION_SHAPE, mirroring the real ctx object handed to
+// onReceive (minus __flush, internal-only there). scopeCompletionSource matches on
 // identifier text alone, not real lexical scope, so `ctx.` completes anywhere in the
-// document — including outside an onReceive callback, where no such binding exists. That's
-// a one-time, deliberate imprecision, not a per-keystroke computation: harmless since it
-// only ever adds unwanted suggestions, never blocks or slows typing.
+// document, including outside an onReceive callback — a one-time, deliberate
+// imprecision: harmless since it only ever adds unwanted suggestions, never blocks or
+// slows typing.
 const CTX_COMPLETION_SHAPE = {
     conn: 0,
     direction: 'c2s',
@@ -54,10 +54,9 @@ const CTX_COMPLETION_SHAPE = {
     log: () => {},
 }
 
-// Dark theme + syntax colors matching this app's own CSS variables (index.html) — kept
-// here rather than in index.html's CSS since CodeMirror styles its content via classed
-// spans generated from the HighlightStyle below, not plain CSS selectors an external
-// stylesheet could target on its own.
+// Dark theme + syntax colors matching this app's own CSS variables — kept here rather
+// than in a stylesheet since CodeMirror styles its content via classed spans generated
+// from the HighlightStyle below, not selectors an external stylesheet could target.
 const theme = EditorView.theme({
     '&': { color: 'var(--text)', backgroundColor: 'var(--bg)', height: '100%' },
     '.cm-content': { caretColor: 'var(--text)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: '12.5px' },
@@ -84,21 +83,18 @@ const highlightStyle = HighlightStyle.define([
     { tag: tags.punctuation, color: 'var(--text-dim)' },
 ])
 
-// Controlled-ish component, same contract as HexEditor.js: <${ScriptEditor} value=${text}
-// onChange=${text => ...} loadVersion=${n} readOnly? />. CodeMirror owns the actual DOM/
-// cursor/undo-history state internally; this wrapper reports every edit upward via
-// onChange, but only ever pushes `value` INTO CodeMirror when `loadVersion` changes — the
-// caller must bump it on every genuinely external reset (initial load, script switch,
-// Reload), and only then.
+// Controlled-ish: <${ScriptEditor} value onChange loadVersion readOnly? />. CodeMirror
+// owns the DOM/cursor/undo-history state internally; this wrapper reports every edit
+// upward via onChange, but only pushes `value` into CodeMirror when `loadVersion`
+// changes — the caller must bump it on every genuinely external reset, and only then.
 //
-// A string-equality check ("does `value` differ from CodeMirror's current doc?") can't
-// substitute for `loadVersion`: CodeMirror applies keystrokes synchronously, independent of
-// Preact's deferred effect scheduling, so an effect can run after several more keystrokes
-// have landed than the `value` it closed over accounts for. It then sees a stale mismatch
-// and dispatches a destructive full-document replace, rolling back real typing — and since
-// that rollback is itself a docChange, it can trigger the same race again. Gating the sync
-// entirely on an explicit `loadVersion` signal sidesteps this structurally: the sync effect
-// never runs during typing at all, regardless of scheduling order.
+// A string-equality check can't substitute for loadVersion: CodeMirror applies
+// keystrokes synchronously, independent of Preact's deferred effect scheduling, so an
+// effect can run after more keystrokes have landed than the `value` it closed over
+// accounts for, see a stale mismatch, and dispatch a destructive full-document replace
+// that rolls back real typing — and since that rollback is itself a docChange, it can
+// trigger the same race again. Gating on an explicit loadVersion signal sidesteps this
+// structurally: the sync effect never runs during typing at all.
 export default function ScriptEditor({ value, onChange, loadVersion, readOnly = false }) {
     const containerRef = useRef(null)
     const viewRef = useRef(null)
@@ -141,10 +137,10 @@ export default function ScriptEditor({ value, onChange, loadVersion, readOnly = 
         view.dispatch({ effects: readOnlyCompartmentRef.current.reconfigure(EditorState.readOnly.of(readOnly)) })
     }, [readOnly])
 
-    // Gated on loadVersion, NOT value — see the module doc comment above for why a
+    // Gated on loadVersion, not value — see the module doc comment above for why a
     // value-equality heuristic can't safely detect "external change" here. The caller
-    // (TamperScriptsPanel.js) bumps loadVersion exactly once per genuine external reset;
-    // ordinary typing never touches it, so this effect simply never runs while typing.
+    // bumps loadVersion exactly once per genuine external reset; ordinary typing never
+    // touches it, so this effect simply never runs while typing.
     useEffect(() => {
         const view = viewRef.current
         if (!view) return

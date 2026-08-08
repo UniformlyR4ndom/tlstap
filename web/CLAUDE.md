@@ -163,6 +163,56 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
   a different path and two independent counters could otherwise coincide on the same value and
   make `HexDump.js` miss a jump.
 
+**Byte-budgeted segment buffer (`useByteBuffer.js`, `byteBufferCore.js`, `chunkSegments.js`,
+`frameSegments.js`, `frameSegmentsCore.js`) — not yet wired into any view:**
+
+Full design: [`doc/design/hexview-segment-buffer.md`](../doc/design/hexview-segment-buffer.md).
+Replacement for the chunk buffer hook above, built to bound memory for an arbitrarily huge
+single frame (today's frame mode loads a frame's entire byte span in one shot — see that
+document's "What problem this solves") — developed alongside the existing hook, not yet
+cut over (see the design doc's "Migration plan"; `TrafficView.js`/`CombinedView.js` are
+unchanged and still use `useChunkBuffer.js`/`buildRows`/`frameBuildRows` as documented
+above).
+
+- **`byteBufferCore.js`** (pure, no Preact import — kept separately testable with Node's
+  plain test runner via `byteBufferCore.test.js`, the same reason `format.js`/
+  `transforms/*.js` stay framework-free): the `Segment`/`SegmentWindow` model, `buildRows`
+  (the shared row-builder that will replace both `buildRows`/`frameBuildRows` above once
+  wired in — `relTime` becomes unconditional, since `segment.time` is now always present
+  for both entity types), `evict` (byte-budgeted, row-aligned mid-segment trimming —
+  fixes the tied-`stid`-group eviction gap the old chunk-count model had), `fillToTarget`
+  (the quantized fill loop driving an adapter's `fillForward`/`fillBackward` toward a
+  target, with generation-based cancellation between quanta).
+- **`useByteBuffer.js`**: the Preact hook wrapping that core — same external contract as
+  `useChunkBuffer.js` above (`display`, `loading`, `error`, `setError`, `handleScrollEnd`,
+  `reloadFrom`, `displayRef`, `jumpToTop`, `jumpToBottom`), so migrating a view onto it is
+  meant to be a small change. Caller props shrink to `{entity, refreshKey, openConnection,
+  fillForward, fillBackward, isClosed, latestId}` — no `fetchPage`/`getId`/`buildRows`,
+  since pagination is now the adapter's own concern and row-building is shared.
+- **Adapters** — one per entity type, each implementing `openConnection`/`fillForward`/
+  `fillBackward` against `/segments` (see `intercept/dbdump/CLAUDE.md`'s "WebSocket
+  `/segments` protocol"):
+  - **`chunkSegments.js`**: a thin, direct mapping — every returned window is already
+    fully loaded, since `/segments` delivers a chunk's metadata and bytes together in one
+    exchange. Tested via a fake connection handle (`chunkSegments.test.js`), sidestepping
+    `openSegmentsStream()`'s real `WebSocket`/`location` dependency.
+  - **`frameSegments.js`** / **`frameSegmentsCore.js`**: metadata via `/frames/timeline`
+    (`dbdumpFramerApi.js`'s `listFramesTimeline`/`listFramesTimelineBackward`), bytes via
+    the same `/segments` chunk mode uses (the same offset→stid resolution `api.js`'s
+    `fetchDirectionChunks` does today). Split the same way `useByteBuffer.js`/
+    `byteBufferCore.js` is: `frameSegmentsCore.js` holds the pure selection/range math —
+    `selectByBudget` (accumulate whole frames until the budget would be exceeded; a
+    single oversized first candidate is still included, but only partially, and nothing
+    further is added that round) and the forward/backward anchor asymmetry in
+    `initialWindowRange` (a huge frame's first partial load anchors at the segment's
+    *start* when opened while scrolling forward into it, so later extension grows
+    `loadedEnd`; anchors at the segment's *end* when opened scrolling backward into it, so
+    later extension shrinks `loadedStart` instead — in both cases the loaded window grows
+    toward whatever's already visible) — tested directly (`frameSegmentsCore.test.js`).
+    `frameSegments.js` is the thin async glue calling the real REST/WS endpoints,
+    including a temporary duplicate of `TrafficView.js`'s `sliceFrameBytes` (removed once
+    the view migration lands and deletes `TrafficView.js`'s own copy).
+
 **`TrafficView.js`-specific layer on top of the hook:**
 - Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`, `jumpRef`.
 - `jumpRef`: a ref `App.js` owns; a dependency-array-free effect keeps it pointed at the
@@ -238,7 +288,7 @@ threaded to `<HexDump>` at all.
 - Local state: `format` (`'raw'`|`'base64'`|`'hex'`|`'hexdump'`), `method` (`'file'`|`'clipboard'`), `working`, `status`.
 - Shows "Select a stream first" placeholder when no stream selected.
 - `parseOffset(s)`: accepts decimal or `0x`/`0X`-prefixed hex; returns `null` on invalid input.
-- `fetchRange(session, stream, dir, fromOffset, toOffset)`: resolves both offsets to stids via parallel `getByteStid` calls, fetches `endStid - startStid + 1` chunks via `openStidStream`, filters by direction, trims to exact byte boundaries.
+- `fetchRange(session, stream, dir, fromOffset, toOffset)`: fetches the covering chunks via `api.js`'s `fetchDirectionChunks` (see below), then trims to exact byte boundaries and merges — the resolve-offsets-to-stids/fetch/filter-by-direction part is shared with `framerRun.js`'s catch-up fetch, factored out once that became a second real caller.
 - **Extract button is `type="button"` with `onclick` handler** — NOT a form submit. This is required for `showSaveFilePicker` (Chrome/Edge File System Access API): the browser only grants a file-picker dialog from a direct click event, not from a form `submit` event.
 - For file method: `acquireFileHandle(format)` (thin wrapper over `download.js`'s shared `acquireSaveHandle`, see below) is called **before** `fetchRange` to preserve the transient user activation; Chrome consumes activation on the first relevant `await`.
 - Fallback for browsers without `showSaveFilePicker` (Firefox): uses an anchor-click download; status message notes "no save dialog in this browser".
@@ -310,6 +360,25 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - `getChunkStid(sessionId, streamId, direction, id)`: POST `/chunk-stid`.
 - `getByteStid(sessionId, streamId, direction, offset)`: POST `/byte-stid`.
 - `searchText(req)`: POST `/search-text`; `req` is the full request object.
+- `fetchDirectionChunks(sessionId, streamId, direction, fromOffset, toOffset?)`: resolves
+  `fromOffset` (and `toOffset`, if given) to stids via `getByteStid`, fetches that range
+  via `openStidStream`, filters down to `direction` (stid is direction-agnostic — chunks
+  of both directions share the counter). `toOffset` omitted means "everything up to the
+  current end" (`n: 0`, unlimited). Two callers: `ExtractPanel.js`'s `fetchRange` (bounded,
+  trims to exact bytes and merges into one buffer) and `framerRun.js`'s catch-up fetch
+  (unbounded, keeps chunks separate — a framer's `frame()` is called once per raw chunk).
+- `openSegmentsStream()` → `{ fetchForward(session, stream, afterStid, maxSegments,
+  maxBytes), fetchBackward(session, stream, beforeStid, maxSegments, maxBytes), close() }`:
+  persistent WS to `/segments` (see `intercept/dbdump/CLAUDE.md`'s "WebSocket `/segments`
+  protocol"). Not `openStidStream`/`openChunkStream`-based — `/segments` answers one
+  request with exactly one response (one metadata text frame + one binary frame), not a
+  per-item stream, so this has its own message-pairing state machine. Each resolves to
+  `{ segments: [{stid, segmentId, direction, time, offset, length, data}, ...],
+  reachedEnd }`; `splitSegments` (module-private) reconstructs each segment's own
+  zero-copy `Uint8Array` view from the one combined binary frame using each entry's own
+  (non-cumulative) `length`, walked in array order. Backs `chunkSegments.js`/
+  `frameSegments.js` (see "Byte-budgeted segment buffer" below) — not yet called from any
+  view.
 
 **Tamper tab (`TamperView.js`, `TamperStreamsList.js`, `TamperQueueList.js`, `TamperDetailPanel.js`, `tamperApi.js`):**
 
@@ -460,3 +529,142 @@ This section is implementation notes only:
   readOnly? />` — `value` is only pushed back into CodeMirror when the caller bumps
   `loadVersion`, never inferred from `value` changing on its own. `readOnly` is applied
   through a `Compartment` rather than a remount.
+
+**Framer scripts (`dbdumpFramerApi.js`, `frameRuntime.js`, `framerRun.js`,
+`framerPrefs.js`, plus `App.js`'s View-menu entry and `TrafficView.js`'s "Framer"
+control):** reassembles a stream direction's raw chunks into logical frames via a
+user-authored script, persisting the result server-side (dbdump's
+`frames`/`frame_progress` tables — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts"
+section) so a stream can be viewed partitioned by frame instead of by raw chunk at
+near-zero repeat cost once cached. Full design in
+[`doc/design/packet-dissector.md`](../doc/design/packet-dissector.md).
+
+Frame view merges both directions into one scroll, the same way the raw-chunk view
+already does via `chunks.stid` — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts"
+section ("Cross-direction interleaving") for the backend half (`frames.stid`,
+`listFramesTimeline`, why ties are routine and how pagination avoids splitting one).
+Known gaps here (buffer-trimming eviction not group-aware, large-frame byte-payload
+pagination, no empty state for zero-result frame view) are tracked in the root
+`CLAUDE.md`'s TODO section, not repeated here.
+
+Confirmed working end-to-end in a real browser (2026-08-05) against
+`examples/dbdump/framer/tls-framer.js`, a TLS record-layer framer — real frames
+rendered, merged/interleaved across both directions.
+
+- **Script contract**: a plain top-level `function frame(state, chunk)`, no registration
+  call — unlike tamper's `tamper.register(hook, fn)`, there's only one hook, so a bare
+  global function is simpler and matches the (not-yet-built) dissector stage's `dissect`
+  convention (see the design doc). `chunk` is `{offset, length, direction, data}` — one raw
+  chunk, in stream order, for the one direction being framed; `direction` (`'c2s'`/`'s2c'`,
+  `direction.js`'s `dirToStr` — same convention `scriptRuntime.js` uses for its own
+  script-facing API) is fixed for the whole run but carried on every chunk anyway, so a
+  script covering both sides of an asymmetric protocol (one script, run once per
+  direction) can branch on it. Returns `{frames, state}` (or nothing,
+  to mean "no new frames, state unchanged"); each frame is `{offset, length, meta?}`.
+  `state`/`meta` are always plain JSON-serializable JS values from the script's point of
+  view — a script never sees bytes or base64 for either, even though `frame_progress.state`
+  is a BLOB column and `frames.meta` is TEXT (`dbdumpFramerApi.js` encodes/decodes both at
+  the wire boundary: `state` → JSON → UTF-8 bytes → base64 for the BLOB; `meta` → JSON text
+  directly, since the column is already TEXT).
+- **`frameRuntime.js`** runs the script in a Worker via the same two-Blob-plus-`sourceURL`
+  loading technique `scriptRuntime.js` uses (see that file's header comment) — but
+  **not** that file's IIFE-wrapping of the script Blob: the framer contract looks
+  `frame` up by *name* (`typeof frame`/`frame(...)`, unlike tamper's side-effecting
+  `tamper.register(...)`), and an IIFE would trap the script's `function frame(...)`
+  declaration in its own local scope instead of the global one BOOTSTRAP looks it up
+  in — always failing with "framer script must define a top-level function named
+  'frame'" regardless of the script's actual content (a real bug this shipped with
+  briefly; fixed by dropping the wrapper entirely, safe since BOOTSTRAP's own internals
+  are already scoped inside its own separate IIFE).
+- No RPC bridge: a framer script is a pure function over bytes
+  already fetched onto the main thread, so there's no `peek`/`release`/network access from
+  inside the Worker at all, unlike tamper's scripted interception. The only messages are a
+  batch/ack cycle: `runFramer(scriptName, scriptSource, initialState, chunks, onBatch)`
+  posts every chunk in one message; the Worker loops over them calling `frame()`, and posts
+  a `{frames, state, processedOffset}` batch back every `BATCH_FRAMES` (500) frames or
+  `BATCH_BYTES` (2 MB) processed, whichever comes first (plus a final batch, even if
+  empty, so a trailing state-only advance still persists) — `onBatch` must return a
+  Promise, and the Worker waits for it to resolve (`{kind:'continue'}`) before computing
+  the next batch. This is what lets the caller apply backpressure and stop immediately
+  (nothing further computed) if a batch fails to persist. A script that never defines
+  `frame`, or throws, rejects `runFramer`'s promise; so does an `onBatch` rejection (e.g. a
+  409 from `appendFrames`) — in every case the Worker is torn down immediately, not asked
+  to wind down gracefully.
+- **`framerRun.js`**'s `catchUpFramer(sessionId, streamId, direction, scriptName,
+  scriptSource)` (plain scalar ids, matching every other `api.js` wrapper — not whole
+  session/stream objects) is the orchestration: fetches `frame-progress` (how far framing has
+  gotten, plus the framer's own persisted `state`) and `/chunklist`'s length for the target
+  direction; if already caught up, resolves immediately having fetched nothing further.
+  Otherwise fetches the missing tail via `api.js`'s `fetchDirectionChunks` (unbounded — see
+  its own entry above) and runs it through `runFramer`, tagging each returned frame with
+  the `stid` *and* `time` of whichever raw chunk contains its last byte (a frame has no
+  timestamp of its own, since it's computed, not captured) before calling `appendFrames`
+  after each batch with a running `expectedOffset` tracker. `scriptVersion` (sha256 hex of
+  `scriptSource`, via `sha256Hex` — also exported) is computed once per call, not passed
+  in, so every caller derives it identically. Idempotent and safe to call repeatedly —
+  `TrafficView.js`'s live-tailing effect (below) calls it again on every central-poll
+  tick while a stream with an active framer is still growing.
+- **`framerPrefs.js`**: two `localStorage`-backed preferences, deliberately **not** the
+  same in-memory-only mechanism "remember stream position" uses (App.js) — these survive
+  a reload. `loadDefaultFramerScript`/`saveDefaultFramerScript` (one global default,
+  driven by the View menu's new "Default framer" entry) and
+  `loadStreamFramerScript`/`saveStreamFramerScript` (per-`session:streamId` override;
+  reading falls back to the default when a stream has no override of its own yet — once
+  it does, the two are independent).
+- **`TrafficView.js`'s "Framer" control** (in the stream meta bar) and the frame-view
+  toggle:
+  - `frameState`: `'raw'` | `'framing'` | `'framed'` — **never persisted**, always starts
+    at `'raw'` on a stream (re)selection; only the *script selection* survives that (via
+    `framerPrefs.js`). Entering `'framed'` is always an explicit "Run" click (never
+    automatic just from picking a script) — **blocking**: the raw view stays up, "Run"
+    shows "Framing…" and is disabled, until `catchUpFramer` resolves for both directions
+    (`Promise.all`) or throws. On success the picked script is also persisted as this
+    stream's override; on failure, `frameState` falls back to `'raw'` and the message
+    surfaces via a `.error-msg` banner at the top of `.traffic-body`, above the hex view.
+  - Once `'framed'`, both directions are shown merged in one scroll (see
+    `intercept/dbdump/CLAUDE.md`'s "Cross-direction interleaving" note for the backend
+    half); "Show raw chunks" returns to `'raw'` without discarding anything (the
+    raw-mode hook's own data was never torn down — only which of the two is rendered
+    changes).
+  - **Two independent `useChunkBuffer` instances** back the two views — the hook needed
+    no changes at all (see its own file for the generic `fetchPage`/`getId`/`buildRows`/
+    `openStream` contract): the frame-mode instance's `entity` is a synthetic object
+    (`{id: "streamId:scriptVersion", end, session, streamId, script, scriptVersion}`,
+    `null` while not in frame view — the hook already treats a `null` entity as "nothing
+    to show") rather than a real stream/session pair, and its `openStream` is a no-op
+    stub (`openNullStream`) since frames are plain REST, not a persistent WebSocket.
+  - **`frameFetchPage`/`frameGetId`/`frameBuildRows`** (module-level functions in
+    `TrafficView.js`, mirroring the existing chunk-mode `fetchPage`/`getId`/`buildRows`):
+    `frameFetchPage` pages `listFramesTimeline` (both directions merged), then — since a
+    single page can contain frames from both — groups the returned frames by direction,
+    fetches each direction's covering bytes in one `fetchDirectionChunks` call (not one
+    fetch per frame, and not one per frame's direction either), and slices each frame's
+    own bytes out via `sliceFrameBytes` (a frame can span more than one underlying
+    chunk). Rows reuse the exact same `{type:'header'|'hex', ...}` shape chunk-mode rows
+    use, with `direction` now a per-row field instead of constant for the page (same as
+    chunk-mode rows already are) — no `HexDump.js` changes needed for that part. `getId`
+    is `row => row.stid` (the cross-direction ordering key — see the backend note for
+    why this is safe despite `stid` not being unique per row) in place of the earlier
+    per-direction design's `row.id`.
+  - **One `HexDump.js` change**: `ChunkHeader`'s `[${row.relTime}]` became conditional
+    (empty when `relTime` is falsy) rather than always rendered, since frame-view rows
+    have no timestamp at all (frames aren't captured, they're computed) — chunk-mode rows
+    are unaffected (`relTime` is always truthy there).
+  - **Live-tailing (eager)**: a `useEffect` keyed on `latestStid` (the same prop the raw
+    view already reacts to) calls `catchUpFramer` again for both directions whenever
+    frame view is active, then bumps a `frameRefreshKey` fed into the frame-mode hook's
+    own `refreshKey` — reusing its existing unconditional top-up path rather than
+    inventing a `latestId`-style mechanism for frames (no per-stream "latest frame id" is
+    available from `App.js`'s central poll the way `latestStid` already is for chunks).
+    Best-effort: a transient failure here is swallowed and retried next tick, since a
+    real failure was already surfaced by the initial Run.
+  - Markers/extract-selection context-menu items are omitted in frame view (`HexDump.js`
+    already hides those context-menu sections when their callback props are omitted) —
+    a deliberate v1 scope cut, not a limitation of the offsets themselves (which are
+    still real absolute stream offsets and would work if wired up later).
+- **`App.js`**: fetches `listFramerScripts()` once (on mount and on Refresh — the same
+  list backs both the View menu's "Default framer" entry and every `TrafficView`'s own
+  per-stream picker), and owns the "Default framer" menu entry itself (a `<select>`
+  inside a `.menu-item`, not the usual checkmark-toggle shape every other entry uses).
+  Scripts must be added via `curl`/`tapctl` against dbdump's `/scripts` endpoints — no
+  in-app editor yet (see the root `CLAUDE.md`'s TODO section).

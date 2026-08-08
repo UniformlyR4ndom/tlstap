@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { fmtAsHexdump, parseHexdump } from './format.js'
+import { fmtAsHexdump, parseHexdump, fmtAsBase64, parseBase64 } from './format.js'
 
 test('parseHexdump round-trips fmtAsHexdump output for arbitrary bytes', () => {
     const bytes = new Uint8Array(37)
@@ -31,4 +31,14 @@ test('parseHexdump rejects a line missing the |ascii| column', () => {
 
 test('parseHexdump rejects an odd-length hex token', () => {
     assert.throws(() => parseHexdump('00000000  486 5  |Hh|'), /invalid hex byte/)
+})
+
+test('parseBase64 round-trips fmtAsBase64 output for arbitrary bytes', () => {
+    const bytes = new Uint8Array(37)
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 11 + 5) & 0xff
+    assert.deepEqual([...parseBase64(fmtAsBase64(bytes))], [...bytes])
+})
+
+test('parseBase64 round-trips empty input', () => {
+    assert.deepEqual([...parseBase64(fmtAsBase64(new Uint8Array(0)))], [])
 })

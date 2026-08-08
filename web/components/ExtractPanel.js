@@ -1,7 +1,7 @@
 import { h } from 'preact'
 import { useState } from 'preact/hooks'
 import htm from 'htm'
-import { openStidStream, getByteStid } from '../api.js'
+import { fetchDirectionChunks } from '../api.js'
 import { fmtAsRaw, fmtAsBase64, fmtAsHex, fmtAsHexdump, mergeUint8Arrays } from '../format.js'
 import { downloadBlob, acquireSaveHandle, writeToFileHandle } from '../download.js'
 import { DIR_C2S, DIR_S2C, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
@@ -62,29 +62,16 @@ function downloadFallback(bytes, format, baseOffset) {
 }
 
 async function fetchRange(session, stream, dir, fromOffset, toOffset) {
-    const [startRes, endRes] = await Promise.all([
-        getByteStid(session.id, stream.id, dir, fromOffset),
-        getByteStid(session.id, stream.id, dir, toOffset),
-    ])
-    const startStid = startRes.stid
-    const n         = endRes.stid - startStid + 1
-
-    const ws = openStidStream()
-    try {
-        const chunks = await ws.fetch(session.id, stream.id, startStid, n)
-        const parts = []
-        for (const chunk of chunks) {
-            if (chunk.direction !== dir) continue
-            if (chunk.offset + chunk.data.length - 1 < fromOffset) continue
-            if (chunk.offset > toOffset) continue
-            const sliceStart = Math.max(0, fromOffset - chunk.offset)
-            const sliceEnd   = Math.min(chunk.data.length, toOffset - chunk.offset + 1)
-            parts.push(chunk.data.slice(sliceStart, sliceEnd))
-        }
-        return mergeUint8Arrays(parts)
-    } finally {
-        ws.close()
+    const chunks = await fetchDirectionChunks(session.id, stream.id, dir, fromOffset, toOffset)
+    const parts = []
+    for (const chunk of chunks) {
+        if (chunk.offset + chunk.data.length - 1 < fromOffset) continue
+        if (chunk.offset > toOffset) continue
+        const sliceStart = Math.max(0, fromOffset - chunk.offset)
+        const sliceEnd   = Math.min(chunk.data.length, toOffset - chunk.offset + 1)
+        parts.push(chunk.data.slice(sliceStart, sliceEnd))
     }
+    return mergeUint8Arrays(parts)
 }
 
 export default function ExtractPanel({ session, stream, direction, from, to, onDirectionChange, onFromChange, onToChange }) {

@@ -29,10 +29,9 @@ function findChunkBoundaryNearHalf(rows, fallback) {
 // connection. `fetchPage(ws, entity, startId, n)`: wraps the entity-specific fetch call.
 // `getId(obj)`: extracts the pagination id (same field name on a chunk and a header row
 // built from it). `buildRows(chunks, startMs)`: caller-owned row builder. `isClosed(entity)`:
-// optional; stops refresh top-up (and live-poll top-up) once true. `latestId`: optional;
-// the latest id the caller already knows about from a centrally-polled `/latest` call
-// (`App.js`) — a plain number, not a function; the hook itself does no polling. Omit to
-// disable the live-poll reaction below for a given caller.
+// optional; stops refresh top-up (and live-poll top-up) once true. `latestId`: optional, a
+// plain number (the hook itself does no polling); omit to disable the live-poll reaction
+// below.
 export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId }) {
     const [display, setDisplay] = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading, setLoading] = useState(false)
@@ -144,23 +143,19 @@ export function useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getI
         topUp()
     }, [refreshKey])
 
-    // Live-poll reaction — App.js's own poll (see its "latest" state) updates `latestId`
-    // whenever it re-fetches; this just reacts by calling topUp() when that's ahead of
-    // what's already buffered. No fetching, no interval, no isClosed/loadingMoreRef check
-    // here — topUp() already guards on all of that itself.
+    // Live-poll reaction: calls topUp() when latestId moves ahead of what's already
+    // buffered. No fetching, no interval, no isClosed/loadingMoreRef check here — topUp()
+    // already guards on all of that itself.
     useEffect(() => {
         if (latestId != null && latestId >= nextIdRef.current) topUp()
     }, [latestId])
 
-    // Jump-to-top/bottom (App.js's header buttons, via each caller's own jumpRef wiring).
-    // Both go through reloadFrom — a genuine reload of the buffer window, not a scroll
-    // over already-loaded rows. The version passed to computeExtra is read fresh off
-    // displayRef rather than kept as a separate counter here, since TrafficView.js's own
-    // jump effect (search/marker/remember-position jumps) writes into this same
-    // display.scrollToVersion field through a different path — always basing the next
-    // version off whatever's currently there (regardless of which path wrote it last)
-    // avoids two independent counters coincidentally landing on the same number, which
-    // would make HexDump.js's version-keyed effect silently miss the jump.
+    // Jump-to-top/bottom. Both go through reloadFrom — a genuine reload of the buffer
+    // window, not a scroll over already-loaded rows. version is read fresh off displayRef
+    // rather than kept as a separate counter, since a caller-owned jump effect can write
+    // into this same display.scrollToVersion field through a different path — always
+    // basing the next version off whatever's currently there avoids two independent
+    // counters coincidentally landing on the same number and silently dropping a jump.
     function jumpToTop() {
         if (!entityRef.current) return
         const version = (displayRef.current.scrollToVersion ?? 0) + 1

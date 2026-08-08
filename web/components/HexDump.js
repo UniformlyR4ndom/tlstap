@@ -233,11 +233,14 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
 function ChunkHeader({ row }) {
     const dir        = dirClass(row.direction)
     const label      = row.direction === DIRNUM_C2S ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
+    // relTime is omitted (frame-view rows have no timestamp — frames aren't captured,
+    // they're computed) rather than shown as the misleading "[undefined]"/"[]".
+    const timePart   = row.relTime ? `[${row.relTime}]` : ''
     const stidPart   = row.stid   != null ? ` [#${row.stid}]`   : ''
     const streamPart = row.stream != null ? `  stream ${row.stream}` : ''
     return html`
         <div class=${'chunk-hdr ' + dir}>
-            ${`[${row.relTime}]${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
+            ${`${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
         </div>
     `
 }

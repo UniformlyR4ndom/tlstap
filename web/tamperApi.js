@@ -17,19 +17,15 @@ function wsUrl(path) {
 // bounds } — mirrors the server's combined edit+release command directly. editedBytes
 // is required iff opts.edited is true.
 //
-// Replies are matched by their "type", not by "the next message in": the server can
-// interleave a push event (held/stream-created/stream-terminated) with the ok/error/
-// stream-list reply to whatever command was just sent. "ok"/"error" resolve or reject
-// the in-flight command; "stream-list" both updates onStreamList and resolves it, since
-// every stream-list is inherently a reply to list-streams — the server never pushes it
-// unsolicited.
+// Replies are matched by "type," not by arrival order: a push event can interleave with
+// the ok/error/stream-list reply to whatever command was just sent. "stream-list" both
+// updates onStreamList and resolves the pending command, since it's always a reply to
+// list-streams.
 //
-// Only one command is ever in flight to the server at a time — sendCommand below queues
-// the rest rather than clobbering an outstanding one. list-streams is coalesced (at most
-// one in flight plus one queued, with extra calls attaching to the queued one) since it
-// can be issued redundantly at high frequency, unlike every other command
-// (release/dropConnection/setMode/setAutoIntercept), each of which corresponds to a
-// distinct, non-redundant decision and is never merged.
+// Only one command is in flight at a time — sendCommand below queues the rest.
+// list-streams is coalesced (extra calls attach to an already-queued one) since it's
+// issued redundantly at high frequency; every other command is a distinct,
+// non-redundant decision and is never merged.
 export function openTamperControl(handlers = {}) {
     const ws = new WebSocket(wsUrl(`${BASE}/control`))
     let pending = null   // { type, waiters: [{resolve,reject}, ...] } — the in-flight command
@@ -131,11 +127,9 @@ export function openTamperControl(handlers = {}) {
         dropConnection(conn, direction) {
             return sendCommand({ type: 'drop-connection', conn, direction })
         },
-        // Fire-and-forget: the server never replies on success, so this deliberately
-        // bypasses sendCommand's one-in-flight pending-promise tracking rather than
-        // leaving a promise that would never resolve. Silently dropped if the socket
-        // isn't open (e.g. a log line racing connection teardown) — script logging
-        // here is best-effort.
+        // Fire-and-forget: the server never replies on success, so this bypasses
+        // sendCommand's pending-promise tracking. Silently dropped if the socket isn't
+        // open (e.g. a log line racing connection teardown) — best-effort.
         scriptLog(level, text) {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'script-log', level, text }))
@@ -146,22 +140,15 @@ export function openTamperControl(handlers = {}) {
 }
 
 // Reads one direction's currently-held buffer via a short-lived /watch connection: open,
-// send "peek", collect the reply, close. The server always replies with exactly one
-// "pending" + binary pair (or a single "error" for an invalid direction) — a direction
-// with nothing held is a normal zero-length reply, not an error. offset/length
-// optionally slice the buffer; omit both for the whole thing.
+// send "peek", collect the reply, close. A direction with nothing held is a normal
+// zero-length reply, not an error. offset/length optionally slice the buffer.
 //
-// This connection is also registered server-side as a live-mirror watcher for as long
-// as it's open — mirroring fires on receipt of every chunk regardless of hold/intercept
-// state, so a chunk arriving here while our own peek reply is still in flight
-// interleaves its own unsolicited header+binary pair with ours on the same socket. A
-// mirror-frame header has no "type" field, so text messages are already distinguishable,
-// but header and binary writes aren't atomic server-side, so another write can land
-// between a header and its own binary payload — a single "last header seen" flag isn't
-// enough if two pairs' headers both arrive before either's binary. `awaiting` is a FIFO
-// of headers in arrival order (our own "pending" metadata, or null for a mirror frame);
-// each binary frame pairs with whichever header is at the front, which is always correct
-// since binaries arrive in the same relative order as their headers.
+// This connection also mirrors live traffic while open, so a chunk arriving during our
+// own in-flight peek can interleave its own header+binary pair with ours — and header/
+// binary writes aren't atomic server-side, so two headers can arrive before either's
+// binary. `awaiting` is a FIFO of headers in arrival order (ours, or null for a mirror
+// frame); each binary pairs with whichever header is at the front, since binaries always
+// arrive in the same relative order as their headers.
 export function peekBuffer(conn, direction, offset, length) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl(`${BASE}/watch?conn=${conn}`))

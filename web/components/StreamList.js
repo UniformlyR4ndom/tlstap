@@ -25,7 +25,7 @@ export default function StreamList({ session, selected, onSelect, onLoad, refres
         load(session.id)
     }, [session?.id, refreshKey])
 
-    // App.js's own poll updates `streamsVersion` centrally; just react when it moves.
+    // The central live poll updates `streamsVersion`; just react when it moves.
     useEffect(() => {
         if (!session || streamsVersion === lastSeenVersionRef.current) return
         lastSeenVersionRef.current = streamsVersion
