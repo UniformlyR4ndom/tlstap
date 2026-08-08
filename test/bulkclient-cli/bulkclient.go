@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ type BulkClientConfig struct {
 func main() {
 	optConfig := flag.String("config", "bulkclient-config.json", "Path to server config")
 	optEnable := flag.String("enable", "", "Name of enabled config")
+	optLengthPrefix := flag.Bool("length-prefix", false, "Prefix each message with its own 4-byte big-endian length, for testing length-prefixed framer scripts (see examples/dbdump/framer/length-prefix-framer.js)")
 	flag.Parse()
 
 	data, err := os.ReadFile(*optConfig)
@@ -38,7 +40,7 @@ func main() {
 	proxy.CheckFatal(err)
 
 	for i, s := range config.MessageSizes {
-		msg := buildMessage(s, i)
+		msg := buildMessage(s, i, *optLengthPrefix)
 		_, err := conn.Write(msg)
 		proxy.CheckFatal(err)
 
@@ -49,11 +51,20 @@ func main() {
 	log.Printf("Exchanged %d messages", len(config.MessageSizes))
 }
 
-func buildMessage(size, id int) []byte {
+// buildMessage's returned payload is always exactly `size` bytes, length-prefix or not —
+// the prefix (when present) covers just that payload length and is additive on top.
+func buildMessage(size, id int, lengthPrefix bool) []byte {
 	prefix := fmt.Sprintf("#%08d", id)
 	if size < len(prefix) {
 		prefix = ""
 	}
 
-	return append([]byte(prefix), make([]byte, size-len(prefix))...)
+	payload := append([]byte(prefix), make([]byte, size-len(prefix))...)
+	if !lengthPrefix {
+		return payload
+	}
+
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(payload)))
+	return append(header, payload...)
 }

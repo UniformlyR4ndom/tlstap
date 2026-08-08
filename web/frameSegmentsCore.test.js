@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-    initialWindowRange, selectByBudget, wantRangeFor, rangesByDirection,
+    initialWindowRange, selectByBudget, computeReachedEnd, wantRangeFor, rangesByDirection,
     buildFrameWindow, extendRange, mergeExtendedWindow,
 } from './frameSegmentsCore.js'
 
@@ -70,6 +70,30 @@ test('selectByBudget: no candidates at all yields an empty selection', () => {
     const { included, openRange } = selectByBudget([], 100, 300, 1)
     assert.deepEqual(included, [])
     assert.equal(openRange, null)
+})
+
+// ── computeReachedEnd ────────────────────────────────────────────────────────────────
+
+test('computeReachedEnd: true when metadata is exhausted and everything fetched was included', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0)]
+    assert.equal(computeReachedEnd(frames, 5, frames), true)
+})
+
+test('computeReachedEnd: false when the metadata listing itself has more beyond this page', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0)]
+    assert.equal(computeReachedEnd(frames, 1, frames), false) // frames.length === requestN
+})
+
+test('computeReachedEnd: false when selectByBudget left candidates unconsumed, even though metadata is exhausted', () => {
+    // Reproduces the real scenario: a small frame fits the round's budget, a later oversized
+    // one doesn't and is deferred (see selectByBudget's "deferred to the next round" test
+    // above) — listFramesTimeline had nothing more beyond this page (frames.length <
+    // requestN), but there's still real, not-yet-fetched data left over from *this* page.
+    const small = frame(1, 0, 0, 0, 10, 0)
+    const huge  = frame(2, 0, 0, 10, 1000, 0)
+    const frames = [small, huge]
+    const { included } = selectByBudget(frames, 100, 300, 1)
+    assert.equal(computeReachedEnd(frames, 3, included), false)
 })
 
 // ── wantRangeFor / rangesByDirection ────────────────────────────────────────────────

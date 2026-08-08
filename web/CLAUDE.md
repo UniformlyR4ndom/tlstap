@@ -81,7 +81,7 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 - **Global/local offset**: `HexRow` displays `row.offset` (stream-global byte offset) when `globalOffset` is true, or `row.localOffset` (offset within the chunk, resets to 0 at each chunk start) when false.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
 - **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
-- **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView).
+- **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView). A `⋯ ` prefix (plus a `title` tooltip) marks a `row.continued` header — the byte-budgeted segment buffer's loaded window doesn't start at the segment's own offset, so the real header is further up, out of the loaded range (only possible in `TrafficView.js`'s frame mode today, for a still-growing huge frame).
 - **Context menu** (right-click on a hex row or chunk header):
   - Copy as hex / ASCII / hexdump / base64 — copies chunk bytes (header click) or selection/chunk bytes (row click).
   - Separator, then (when right-clicking a hex byte and extract props present):
@@ -106,23 +106,20 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 - A synthetic trailing cell (`byte === null`) at `bufferLength` lets the cursor be positioned after the last byte when the last row isn't full; an empty buffer gets exactly one row holding just that cell; a buffer whose length is a nonzero multiple of 16 gets no extra row for it.
 - `readOnly` prop: every mutating path becomes a no-op; navigation still works. Used for `TransformPanel`'s output panel.
 
-**Chunk buffer hook (`useChunkBuffer.js`), shared by `TrafficView.js` and `CombinedView.js`:**
-- Backs both views' windowed/paginated chunk buffer — initial load, forward/backward
-  scroll-driven eviction, and refresh top-up. `TrafficView.js` is keyed by stream/`stid`;
-  `CombinedView.js` by session/`sgid`; one `getId(obj)` accessor works on both shapes
-  since a fetched chunk and its header row always carry the same id field name.
+**Chunk buffer hook (`useChunkBuffer.js`) — `CombinedView.js`'s only remaining consumer**
+**(`TrafficView.js` migrated off it entirely — see "Byte-budgeted segment buffer" below):**
+- Backs `CombinedView.js`'s windowed/paginated chunk buffer — initial load, forward/backward
+  scroll-driven eviction, and refresh top-up. Keyed by session/`sgid`.
 - `useChunkBuffer({ entity, refreshKey, openStream, fetchPage, getId, buildRows, isClosed, latestId })`
   → `{ display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom }`.
-  `entity` is the current stream or session; `openStream` is `openStidStream`/`openSgidStream`
-  (`api.js`); `fetchPage(ws, entity, startId, n)` wraps entity-specific fetch args; `buildRows`
-  stays caller-owned (row shape differs per view) and is only invoked by the hook; `isClosed(entity)`
-  is optional (`TrafficView.js` passes `s => !!s.end` so top-up stops once closed; `CombinedView.js`
-  omits it); `latestId` is optional too — a plain number from `App.js`'s central poll, not a
-  function the hook calls itself.
+  `entity` is the current session; `openStream` is `openSgidStream` (`api.js`);
+  `fetchPage(ws, entity, startId, n)` wraps entity-specific fetch args; `buildRows` stays
+  caller-owned and is only invoked by the hook; `isClosed(entity)` is optional
+  (`CombinedView.js` omits it); `latestId` is optional too — a plain number from `App.js`'s
+  central poll, not a function the hook calls itself.
 - `display = {rows, scrollAdjust, adjustVersion, scrollTo, scrollToVersion}` — single state
   object for atomic render.
-- `BATCH = 50` chunks per request (exported — `TrafficView.js`'s jump-to needs it too, to
-  center the fetched window the same way `reloadFrom` does); `MAX_BUFFERED_CHUNKS = BATCH * 2`
+- `BATCH = 50` chunks per request (exported); `MAX_BUFFERED_CHUNKS = BATCH * 2`
   (100) soft-caps how many chunks the refresh path may hold at once; `countChunks(rows)` counts
   `header` rows to measure occupancy against it.
 - Refs owned by the hook: `nextIdRef` (exclusive upper bound of buffer), `prevIdRef` (id of
@@ -131,8 +128,8 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
   (single WS connection per entity), `displayRef`, `hasMountedRef`.
 - **`reloadFrom(startId, { computeExtra })`**: opens a fresh connection, fetches one `BATCH`
   window from `startId`, builds rows, replaces `display` — merging in `computeExtra(rows)` if
-  given. The entity-change effect calls `reloadFrom(0)` on mount/swap; `TrafficView.js`'s
-  jump-to effect (below) is the only other caller.
+  given. The entity-change effect calls `reloadFrom(0)` on mount/swap; that's the hook's only
+  caller today (`CombinedView.js` has no `jumpTo`-driven jump effect — see below).
 - **`handleScrollEnd(scrollDir)`** (stable `useCallback([])`):
   - **Forward** (1): fetches next `BATCH` from `nextIdRef`, appends rows, evicts front half at
     the nearest chunk-header boundary, updates `prevIdRef`, sets negative `scrollAdjust`.
@@ -159,30 +156,40 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
   Number.MAX_SAFE_INTEGER` — `HexDump.js`'s scroll-to effect clamps that to the DOM's real
   range, landing exactly at the end without either view tracking its own viewport height.
   `scrollToVersion` in both is `(displayRef.current.scrollToVersion ?? 0) + 1` rather than a
-  separate counter, since `TrafficView.js`'s own jump effect writes into the same field through
-  a different path and two independent counters could otherwise coincide on the same value and
-  make `HexDump.js` miss a jump.
+  separate counter — same convention `useByteBuffer.js` below uses, where it matters more
+  directly (`TrafficView.js`'s own jump effect writes into that hook's identical field
+  through a different path; two independent counters could otherwise coincide on the same
+  value and make `HexDump.js` miss a jump).
 
 **Byte-budgeted segment buffer (`useByteBuffer.js`, `byteBufferCore.js`, `chunkSegments.js`,
-`frameSegments.js`, `frameSegmentsCore.js`) — not yet wired into any view:**
+`frameSegments.js`, `frameSegmentsCore.js`) — backs all of `TrafficView.js` now (both raw
+and frame mode); `CombinedView.js` is the only view still on `useChunkBuffer.js` above:**
 
 Full design: [`doc/design/hexview-segment-buffer.md`](../doc/design/hexview-segment-buffer.md).
 Replacement for the chunk buffer hook above, built to bound memory for an arbitrarily huge
-single frame (today's frame mode loads a frame's entire byte span in one shot — see that
-document's "What problem this solves") — developed alongside the existing hook, not yet
-cut over (see the design doc's "Migration plan"; `TrafficView.js`/`CombinedView.js` are
-unchanged and still use `useChunkBuffer.js`/`buildRows`/`frameBuildRows` as documented
-above).
+single frame (frame mode used to load a frame's entire byte span in one shot — see that
+document's "What problem this solves"). Per the design doc's "Migration plan", frame mode
+went first (the one with the actual defect), then raw-chunk mode (a mechanical port, as
+expected — same hook, `chunkSegments.js` in place of `frameSegments.js`, entity is the real
+`stream` object rather than a synthetic one). Both are done and live-verified; observed
+bonus from the byte-budget replacing the old item-count one: the browser's scrollbar thumb
+size now stays roughly consistent regardless of how a stream happened to be chunked, rather
+than varying with chunk size, except in degenerate cases where the segment-count cap (not
+the byte cap) ends up binding. `CombinedView.js` (step 4 of the migration plan) remains
+undecided — deliberately left open until this size/complexity was visible in practice, per
+that plan; still on `useChunkBuffer.js`/`buildRows` as documented above.
+`useChunkBuffer.js` itself isn't touched until nothing references it.
 
 - **`byteBufferCore.js`** (pure, no Preact import — kept separately testable with Node's
   plain test runner via `byteBufferCore.test.js`, the same reason `format.js`/
   `transforms/*.js` stay framework-free): the `Segment`/`SegmentWindow` model, `buildRows`
-  (the shared row-builder that will replace both `buildRows`/`frameBuildRows` above once
-  wired in — `relTime` becomes unconditional, since `segment.time` is now always present
-  for both entity types), `evict` (byte-budgeted, row-aligned mid-segment trimming —
-  fixes the tied-`stid`-group eviction gap the old chunk-count model had), `fillToTarget`
-  (the quantized fill loop driving an adapter's `fillForward`/`fillBackward` toward a
-  target, with generation-based cancellation between quanta).
+  (the shared row-builder frame mode now uses in place of the deleted `frameBuildRows` —
+  `relTime` is unconditional, since `segment.time` is always present for both entity
+  types; `ChunkHeader` in `HexDump.js` no longer special-cases a missing one), `evict`
+  (byte-budgeted, row-aligned mid-segment trimming — fixes the tied-`stid`-group eviction
+  gap the old chunk-count model had), `fillToTarget` (the quantized fill loop driving an
+  adapter's `fillForward`/`fillBackward` toward a target, with generation-based
+  cancellation between quanta).
 - **`useByteBuffer.js`**: the Preact hook wrapping that core — same external contract as
   `useChunkBuffer.js` above (`display`, `loading`, `error`, `setError`, `handleScrollEnd`,
   `reloadFrom`, `displayRef`, `jumpToTop`, `jumpToBottom`), so migrating a view onto it is
@@ -210,37 +217,41 @@ above).
     later extension shrinks `loadedStart` instead — in both cases the loaded window grows
     toward whatever's already visible) — tested directly (`frameSegmentsCore.test.js`).
     `frameSegments.js` is the thin async glue calling the real REST/WS endpoints,
-    including a temporary duplicate of `TrafficView.js`'s `sliceFrameBytes` (removed once
-    the view migration lands and deletes `TrafficView.js`'s own copy).
+    including `sliceFrameBytes` — now the only copy; `TrafficView.js`'s own was deleted
+    once frame mode moved onto this adapter.
 
-**`TrafficView.js`-specific layer on top of the hook:**
+**`TrafficView.js`-specific layer on top of its raw-mode `useByteBuffer.js` instance**
+(frame mode's own layer is documented in "Framer scripts" below):
 - Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`, `jumpRef`.
 - `jumpRef`: a ref `App.js` owns; a dependency-array-free effect keeps it pointed at the
-  hook's current `jumpToTop`/`jumpToBottom` every render. `CombinedView.js` has the identical effect.
+  raw-mode hook's current `jumpToTop`/`jumpToBottom` every render (frame mode has its own
+  instance but doesn't feed `jumpRef` — see "Framer scripts" below). `CombinedView.js` has
+  the identical effect over its own (`useChunkBuffer.js`) hook.
 - `handleSetMarker` / `handleClearMarker` are local (not lifted); `onSetExtractStart/End/Range` are forwarded directly to `HexDump`.
-- `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state, independent of the hook's `display`, mirrored via its own small effect on `stream?.id`.
-- **Jump effect** (`useEffect([jumpTo?.version])`, no `CombinedView.js` equivalent): resolves
-  `jumpTo` to a target stid, then calls the hook's `reloadFrom`. A local `cancelled` flag
-  (set in the effect's cleanup) guards the resolution step against a stale jump firing after
-  a newer one has superseded it — the hook's own `generationRef` only protects `reloadFrom`'s
-  internal async work, not this caller-side step.
+- `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state, independent of either hook's `display`, mirrored via its own small effect on `stream?.id`.
+- **Jump effect** (`useEffect([jumpTo?.version])`, no `CombinedView.js` equivalent, and not
+  wired to frame mode): resolves `jumpTo` to a target stid, then calls the raw-mode hook's
+  `reloadFrom`. A local `cancelled` flag (set in the effect's cleanup) guards the resolution
+  step against a stale jump firing after a newer one has superseded it — the hook's own
+  `generationRef` only protects `reloadFrom`'s internal async work, not this caller-side step.
   - `chunks` unit: `targetStid = jumpTo.value`.
   - `chunks-c2s` / `chunks-s2c`: `POST /chunk-stid` resolves per-direction `id` → `stid`.
   - `offset-c2s` / `offset-s2c`: `POST /byte-stid` resolves byte offset → `stid`, also recording `targetByteOffset`/`targetDirection`.
-  - Calls `reloadFrom(max(0, targetStid - BATCH/2), { computeExtra })`, where `computeExtra`
-    scans the freshly-built rows for the target row (byte-offset jumps match both direction
-    and offset range, since c2s/s2c offsets both start at 0) and returns `{scrollTo,
-    scrollToVersion: jumpTo.version}` — centered by default, or placed at the very top when
-    `jumpTo.align === 'top'` (marker jumps, remembered-position restore).
+  - Calls `reloadFrom(max(0, targetStid - FILL_TARGET_SEGMENTS/2), { computeExtra })` —
+    `FILL_TARGET_SEGMENTS` (from `useByteBuffer.js`) plays the same centering role `BATCH`
+    played before this view's migration — where `computeExtra` scans the freshly-built rows
+    for the target row (byte-offset jumps match both direction and offset range, since
+    c2s/s2c offsets both start at 0) and returns `{scrollTo, scrollToVersion: jumpTo.version}`
+    — centered by default, or placed at the very top when `jumpTo.align === 'top'` (marker
+    jumps, remembered-position restore).
   - A resolution failure calls the hook's `setError` directly, since `reloadFrom` is never reached.
-- `buildRows(chunks, streamStart)`: each hex row carries both `offset` (global stream byte offset) and `localOffset` (byte offset within the chunk).
 - **Leave effect** (`useEffect([stream?.id])`, save side of "Remember stream position"): its
   cleanup resolves the row at `Math.floor(scrollTopRef.current / ROW_HEIGHT)` in
   `displayRef.current.rows`, scanning forward past any `'header'` row to the next `'hex'`
   row, and calls `onLeaveStream(leavingStream, {direction, offset})` if one was found.
   `scrollTopRef`/`viewHeightRef` are stashed by `handleViewportChange` on every scroll/resize tick.
 
-**`CombinedView.js`-specific layer on top of the hook:** almost none — no markers, no
+**`CombinedView.js`-specific layer on top of `useChunkBuffer.js`:** almost none — no markers, no
 extract-selection, no `totalBytes`, no `jumpTo`-driven jump effect. It has the `jumpRef`
 registration effect described above, and is the only place `scrollTo`/`scrollToVersion` get
 threaded to `<HexDump>` at all.
@@ -626,30 +637,25 @@ rendered, merged/interleaved across both directions.
     half); "Show raw chunks" returns to `'raw'` without discarding anything (the
     raw-mode hook's own data was never torn down — only which of the two is rendered
     changes).
-  - **Two independent `useChunkBuffer` instances** back the two views — the hook needed
-    no changes at all (see its own file for the generic `fetchPage`/`getId`/`buildRows`/
-    `openStream` contract): the frame-mode instance's `entity` is a synthetic object
-    (`{id: "streamId:scriptVersion", end, session, streamId, script, scriptVersion}`,
-    `null` while not in frame view — the hook already treats a `null` entity as "nothing
-    to show") rather than a real stream/session pair, and its `openStream` is a no-op
-    stub (`openNullStream`) since frames are plain REST, not a persistent WebSocket.
-  - **`frameFetchPage`/`frameGetId`/`frameBuildRows`** (module-level functions in
-    `TrafficView.js`, mirroring the existing chunk-mode `fetchPage`/`getId`/`buildRows`):
-    `frameFetchPage` pages `listFramesTimeline` (both directions merged), then — since a
-    single page can contain frames from both — groups the returned frames by direction,
-    fetches each direction's covering bytes in one `fetchDirectionChunks` call (not one
-    fetch per frame, and not one per frame's direction either), and slices each frame's
-    own bytes out via `sliceFrameBytes` (a frame can span more than one underlying
-    chunk). Rows reuse the exact same `{type:'header'|'hex', ...}` shape chunk-mode rows
-    use, with `direction` now a per-row field instead of constant for the page (same as
-    chunk-mode rows already are) — no `HexDump.js` changes needed for that part. `getId`
-    is `row => row.stid` (the cross-direction ordering key — see the backend note for
-    why this is safe despite `stid` not being unique per row) in place of the earlier
-    per-direction design's `row.id`.
-  - **One `HexDump.js` change**: `ChunkHeader`'s `[${row.relTime}]` became conditional
-    (empty when `relTime` is falsy) rather than always rendered, since frame-view rows
-    have no timestamp at all (frames aren't captured, they're computed) — chunk-mode rows
-    are unaffected (`relTime` is always truthy there).
+  - **Raw and frame mode run on two separate `useByteBuffer.js` instances** — see
+    "Byte-budgeted segment buffer" above for the hook and its two adapters
+    (`chunkSegments.js` for raw mode, `frameSegments.js` for frame mode); frame mode was
+    the first migrated onto it, per that design doc's migration plan, raw mode followed.
+    The frame-mode `entity` is a synthetic object (`{id: "streamId:scriptVersion", end,
+    start, session, streamId, script, scriptVersion}`, `null` while not in frame view —
+    the hook treats a `null` entity as "nothing to show" either way) rather than a real
+    stream/session pair, unlike raw mode's (the real `stream` object); `start`
+    (`stream.start`, added for the frame-mode migration) feeds `buildRows`' `relTime`
+    calc. No `openStream`/`fetchPage`/`getId`/`buildRows` props for either instance —
+    this file's old per-mode `fetchPage`/`getId`/`buildRows` (raw) and
+    `frameFetchPage`/`frameGetId`/`frameBuildRows`/`openNullStream`/`sliceFrameBytes`
+    (frame) are all gone, replaced by the two adapters' own
+    `openConnection`/`fillForward`/`fillBackward` (see above).
+  - **`ChunkHeader`'s `relTime` is unconditional** now (no longer the conditional-empty
+    special case frame-view rows used to need) — `frames.time` is always populated, so
+    `byteBufferCore.js`'s shared `buildRows` always sets it. See the "Chunk header" bullet
+    under "Virtual scroll" above for the `⋯` continued-segment marker this migration also
+    added to `HexDump.js`.
   - **Live-tailing (eager)**: a `useEffect` keyed on `latestStid` (the same prop the raw
     view already reacts to) calls `catchUpFramer` again for both directions whenever
     frame view is active, then bumps a `frameRefreshKey` fed into the frame-mode hook's

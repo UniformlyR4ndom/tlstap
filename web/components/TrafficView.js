@@ -1,121 +1,24 @@
 import { h } from 'preact'
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
 import htm from 'htm'
-import { openStidStream, getChunkStid, getByteStid, fetchDirectionChunks } from '../api.js'
-import { listFramesTimeline, getFramerScript } from '../dbdumpFramerApi.js'
+import { getChunkStid, getByteStid } from '../api.js'
+import { getFramerScript } from '../dbdumpFramerApi.js'
 import { catchUpFramer, sha256Hex } from '../framerRun.js'
 import { loadStreamFramerScript, saveStreamFramerScript } from '../framerPrefs.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
 import MarkersPanel from './MarkersPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { useResizableLayout } from '../useResizableLayout.js'
-import { useChunkBuffer, BATCH } from '../useChunkBuffer.js'
-import { fmtByteSize, fmtDuration, fmtRelTime } from '../format.js'
+import { useByteBuffer, FILL_TARGET_SEGMENTS } from '../useByteBuffer.js'
+import { openConnection as openChunkSegments, fillForward as fillChunkForward, fillBackward as fillChunkBackward } from '../chunkSegments.js'
+import { openConnection as openFrameSegments, fillForward as fillFrameForward, fillBackward as fillFrameBackward } from '../frameSegments.js'
+import { fmtByteSize, fmtDuration } from '../format.js'
 import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
 
-// no-op "connection" for the frame-mode useChunkBuffer instance — frames are plain REST,
-// not a persistent WebSocket, but the hook's contract expects something with .close().
-function openNullStream() {
-    return { close() {} }
-}
-
-// Slices [offset, offset+length) out of a set of possibly-overlapping raw chunks (a
-// frame's own bytes can span more than one underlying chunk).
-function sliceFrameBytes(chunks, offset, length) {
-    const out = new Uint8Array(length)
-    const end = offset + length
-    for (const c of chunks) {
-        const cEnd = c.offset + c.data.length
-        if (cEnd <= offset || c.offset >= end) continue
-        const srcStart  = Math.max(0, offset - c.offset)
-        const srcEnd    = Math.min(c.data.length, end - c.offset)
-        const destStart = Math.max(0, c.offset - offset)
-        out.set(c.data.subarray(srcStart, srcEnd), destStart)
-    }
-    return out
-}
-
-// fetchPage/getId/buildRows for the frame-mode useChunkBuffer instance. entity is the
-// synthetic object built below (frameEntity). A page can contain frames from both
-// directions, so covering chunks are fetched once per direction actually present in the
-// page, not once overall.
-async function frameFetchPage(ws, entity, startId, n) {
-    const key = { session: entity.session, stream: entity.streamId, script: entity.script, scriptVersion: entity.scriptVersion }
-    const frames = await listFramesTimeline(key, startId, n)
-    if (frames.length === 0) return []
-
-    const rangeByDirection = new Map() // direction -> {min, max}
-    for (const f of frames) {
-        const end = f.offset + f.length - 1
-        const range = rangeByDirection.get(f.direction)
-        if (!range) rangeByDirection.set(f.direction, { min: f.offset, max: end })
-        else { range.min = Math.min(range.min, f.offset); range.max = Math.max(range.max, end) }
-    }
-    const chunksByDirection = new Map()
-    for (const [direction, range] of rangeByDirection) {
-        chunksByDirection.set(direction, await fetchDirectionChunks(entity.session, entity.streamId, direction, range.min, range.max))
-    }
-
-    return frames.map(f => ({ ...f, data: sliceFrameBytes(chunksByDirection.get(f.direction), f.offset, f.length) }))
-}
-
-// stid (inherited from whichever raw chunk a frame completes on) is the cross-direction
-// ordering key. Not unique per row (multiple frames can complete on the same chunk),
-// but that's fine for pagination — the server guarantees a page never splits such a group.
-function frameGetId(row) {
-    return row.stid
-}
-
-// No relTime (frames aren't captured, so have no timestamp). chunkId reuses the
-// header's "#N" slot for the frame's own per-direction id; direction is a per-frame
-// field since a page can mix both.
-function frameBuildRows(frames) {
-    const rows = []
-    for (const f of frames) {
-        rows.push({ type: 'header', stid: f.stid, chunkId: f.id, direction: f.direction, size: f.data.length })
-        for (let off = 0; off < f.data.length; off += 16) {
-            rows.push({ type: 'hex', direction: f.direction, bytes: f.data.slice(off, off + 16), offset: f.offset + off, localOffset: off })
-        }
-    }
-    return rows
-}
-
-function fetchPage(ws, stream, start, n) {
-    return ws.fetch(stream.session, stream.id, start, n)
-}
-
-function getId(row) {
-    return row.stid
-}
-
 function isClosed(stream) {
     return !!stream.end
-}
-
-function buildRows(chunks, streamStart) {
-    const rows = []
-    for (const chunk of chunks) {
-        rows.push({
-            type:      'header',
-            direction: chunk.direction,
-            stid:      chunk.stid,
-            chunkId:   chunk.chunkId,
-            relTime:   fmtRelTime(chunk.time, streamStart),
-            size:      chunk.data.length,
-        })
-        for (let off = 0; off < chunk.data.length; off += 16) {
-            rows.push({
-                type:        'hex',
-                direction:   chunk.direction,
-                bytes:       chunk.data.slice(off, off + 16),
-                offset:      chunk.offset + off,
-                localOffset: off,
-            })
-        }
-    }
-    return rows
 }
 
 export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts }) {
@@ -135,13 +38,12 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     const [frameScriptRunning, setFrameScriptRunning] = useState(null) // { name, version, content }
     const [frameRefreshKey, setFrameRefreshKey] = useState(0)
 
-    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom } = useChunkBuffer({
+    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom } = useByteBuffer({
         entity: stream,
         refreshKey,
-        openStream: openStidStream,
-        fetchPage,
-        getId,
-        buildRows,
+        openConnection: openChunkSegments,
+        fillForward: fillChunkForward,
+        fillBackward: fillChunkBackward,
         isClosed,
         latestId: latestStid,
     })
@@ -149,6 +51,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     const frameEntity = (frameState === 'framed' && frameScriptRunning && stream) ? {
         id: `${stream.id}:${frameScriptRunning.version}`,
         end: stream.end,
+        start: stream.start,
         session: stream.session,
         streamId: stream.id,
         script: frameScriptRunning.name,
@@ -160,13 +63,12 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         loading: frameLoading,
         error: frameFetchError,
         handleScrollEnd: frameHandleScrollEnd,
-    } = useChunkBuffer({
+    } = useByteBuffer({
         entity: frameEntity,
         refreshKey: frameRefreshKey,
-        openStream: openNullStream,
-        fetchPage: frameFetchPage,
-        getId: frameGetId,
-        buildRows: frameBuildRows,
+        openConnection: openFrameSegments,
+        fillForward: fillFrameForward,
+        fillBackward: fillFrameBackward,
         isClosed,
     })
 
@@ -260,7 +162,7 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                 }
                 if (cancelled) return
 
-                const startStid = Math.max(0, targetStid - Math.floor(BATCH / 2))
+                const startStid = Math.max(0, targetStid - Math.floor(FILL_TARGET_SEGMENTS / 2))
                 reloadFrom(startStid, {
                     computeExtra: rows => {
                         let targetRowPx = 0

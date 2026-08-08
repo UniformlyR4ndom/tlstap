@@ -2,7 +2,7 @@ import { getByteStid, openSegmentsStream } from './api.js'
 import { listFramesTimeline, listFramesTimelineBackward } from './dbdumpFramerApi.js'
 import {
     selectByBudget, wantRangeFor, rangesByDirection, buildFrameWindow,
-    extendRange, mergeExtendedWindow,
+    extendRange, mergeExtendedWindow, computeReachedEnd,
 } from './frameSegmentsCore.js'
 
 // Frame-mode adapter for useByteBuffer.js — see doc/design/hexview-segment-buffer.md's
@@ -91,10 +91,10 @@ export async function fillForward(handle, entity, { afterStid, resumeWindow, max
 
     const requestN = maxSegments + 1
     const frames = await listFramesTimeline(timelineKey(entity), afterStid + 1, requestN)
-    const reachedEnd = frames.length < requestN
 
     // Already ascending = nearest-to-afterStid-first for a forward walk.
     const { included, openRange } = selectByBudget(frames, maxSegments, maxBytes, 1)
+    const reachedEnd = computeReachedEnd(frames, requestN, included)
     if (included.length === 0) return { windows: [], reachedEnd }
 
     const windows = await fetchFrameWindows(handle, entity, included, openRange)
@@ -106,12 +106,12 @@ export async function fillBackward(handle, entity, { beforeStid, resumeWindow, m
 
     const requestN = maxSegments + 1
     const frames = await listFramesTimelineBackward(timelineKey(entity), beforeStid, requestN)
-    const reachedEnd = frames.length < requestN
 
     // frames comes back ascending (smallest stid first); reverse to nearest-to-
     // beforeStid-first (largest stid first) for selection.
     const nearestFirst = frames.slice().reverse()
     const { included, openRange } = selectByBudget(nearestFirst, maxSegments, maxBytes, -1)
+    const reachedEnd = computeReachedEnd(frames, requestN, included)
     if (included.length === 0) return { windows: [], reachedEnd }
 
     const windows = await fetchFrameWindows(handle, entity, included, openRange)

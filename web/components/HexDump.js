@@ -233,14 +233,16 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
 function ChunkHeader({ row }) {
     const dir        = dirClass(row.direction)
     const label      = row.direction === DIRNUM_C2S ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
-    // relTime is omitted (frame-view rows have no timestamp — frames aren't captured,
-    // they're computed) rather than shown as the misleading "[undefined]"/"[]".
-    const timePart   = row.relTime ? `[${row.relTime}]` : ''
+    const timePart   = `[${row.relTime}]`
     const stidPart   = row.stid   != null ? ` [#${row.stid}]`   : ''
     const streamPart = row.stream != null ? `  stream ${row.stream}` : ''
+    // continued: this window doesn't start at the segment's own offset — the real header
+    // is further up, out of the loaded window (front-trimmed while a huge frame was still
+    // being scrolled through).
+    const continuedPart = row.continued ? '⋯ ' : ''
     return html`
-        <div class=${'chunk-hdr ' + dir}>
-            ${`${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
+        <div class=${'chunk-hdr ' + dir} title=${row.continued ? 'Segment continues from further up — its own header is out of view' : undefined}>
+            ${`${continuedPart}${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
         </div>
     `
 }

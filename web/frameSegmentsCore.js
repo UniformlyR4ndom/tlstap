@@ -18,6 +18,18 @@ export function initialWindowRange(dir, f, maxBytes) {
         : { wantStart: f.offset + f.length - maxBytes, wantEnd: f.offset + f.length }
 }
 
+// True only if there is genuinely nothing left to fetch in this direction: the metadata
+// listing itself ran dry (frames.length < requestN) *and* selectByBudget consumed every
+// candidate it returned. The latter half matters because selectByBudget can stop short
+// of the full frames list purely on budget (byte cap, segment cap, or the
+// oversized-single-candidate case) — that leftover metadata still describes real,
+// not-yet-fetched segments, so reporting "reached end" on metadata exhaustion alone would
+// strand them: the caller latches reachedEnd into a ref that permanently gates further
+// fetches in that direction.
+export function computeReachedEnd(frames, requestN, included) {
+    return frames.length < requestN && included.length === frames.length
+}
+
 // Decides which of candidatesNearestFirst (frame metadata, ordered nearest-to-the-
 // current-boundary first) to open this round, respecting maxSegments/maxBytes. Mirrors
 // the Go /segments endpoint's own "checked only between whole items" budget discipline,

@@ -77,14 +77,18 @@ intercept/          ← built-in interceptor implementations
   drop/             ← drops connection on TLS upgrade (for TLS downgrade testing)
   dbdump/           ← logs traffic to an SQLite database; exposes a REST API + WebSocket
     dbdump.go       ← interceptor lifecycle, DB schema, data capture
-    api.go          ← REST API handlers (RegisterRoutes + endpoints + WebSocket)
+    api.go          ← REST API handlers (RegisterRoutes + endpoints + WebSocket); also
+                      wires scriptstore.RegisterRoutes for /scripts (framer scripts)
     search.go       ← /search-text handler; literal and regex search across chunks
+    frames.go       ← frames/frame_progress storage layer for a client-run framer script
+  scriptstore/      ← shared name→content *.js store + REST CRUD handlers; used by tamper's
+                      control scripts and dbdump's framer scripts
   tamper/           ← live hold/edit/drop/forward of traffic; control + watch WebSocket API
     tamper.go       ← interceptor lifecycle, hold/resolve logic, direction detection
-    api.go          ← WebSocket handlers (control: commands/acks/events; watch: mirror + peek)
+    api.go          ← WebSocket handlers (control: commands/acks/events; watch: mirror + peek);
+                      also wires scriptstore.RegisterRoutes for /scripts
     protocol.go     ← wire message types for both WebSockets
     buffer.go       ← heldBuffer: per-(stream,direction) growing buffer + chunk bounds
-    scripts.go      ← script storage (REST CRUD over a directory of named .js files)
     fs.go           ← fs-root: scoped REST read/write/list of one host directory, for scripts
 web/                ← embedded web frontend (Preact + htm, no build step)
   server.go         ← //go:embed; exports FS (embedded into binary)
@@ -92,6 +96,10 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   main.js           ← mounts App into #root
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
   tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, fs-root)
+  dbdumpFramerApi.js ← REST wrappers for /api/i/dbdump/* framer-script CRUD + frame-progress/frames/frames-append (see "Framer scripts" in web/CLAUDE.md)
+  frameRuntime.js   ← Worker bootstrap that runs a framer script's frame() function over pre-fetched chunks (no RPC bridge, unlike scriptRuntime.js — see web/CLAUDE.md)
+  framerRun.js      ← catchUpFramer(): orchestrates fetching un-framed chunks, running frameRuntime.js, and persisting each batch via dbdumpFramerApi.js
+  framerPrefs.js    ← localStorage: global default framer script + per-stream override (see "Framer scripts" in web/CLAUDE.md)
   format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
   direction.js      ← direction constants/helpers (DIRNUM_C2S/DIRNUM_S2C, DIR_C2S/DIR_S2C, dirClass, dirLabel)
   download.js       ← file-save helpers (downloadBlob anchor-click fallback; acquireSaveHandle/writeToFileHandle for the File System Access API)
@@ -109,7 +117,7 @@ web/                ← embedded web frontend (Preact + htm, no build step)
     ListPanel.js    ← shared panel-header (title/badge/sort-toggle) + sorted/selectable item list, used by SessionList.js/StreamList.js
     SessionList.js  ← sessions panel, built on ListPanel.js (sort toggle asc/desc)
     StreamList.js   ← streams panel, built on ListPanel.js (sort toggle resets to asc on session change)
-    TrafficView.js  ← single-stream view, built on useChunkBuffer.js (stid-keyed): metadata bar + virtual scroll + jump-to + markers-panel sizing
+    TrafficView.js  ← single-stream view, built on useChunkBuffer.js (stid-keyed): metadata bar + virtual scroll + jump-to + markers-panel sizing; also owns the Framer control + frame-view toggle (a second, frame-keyed useChunkBuffer instance — see "Framer scripts" in web/CLAUDE.md)
     CombinedView.js ← combined-stream view, built on useChunkBuffer.js (sgid-keyed): all streams in a session merged chronologically
     HexDump.js      ← virtual-scroll hex dump with prefetch, scroll correction, byte selection, context menu (read-only, for captured traffic)
     HexEditor.js    ← small non-virtualized editable hex/ASCII grid with an insertion cursor; used by TransformPanel and the Tamper tab (editable input, read-only output)
@@ -125,7 +133,9 @@ web/                ← embedded web frontend (Preact + htm, no build step)
     TamperDetailPanel.js ← Tamper tab: selected buffer's chunks (via peek), segmented/continuous view, forward/drop/drop-connection, and a per-chunk context menu (drop/forward/split/merge)
 logging/            ← thin slog wrapper
 assert/             ← assert.Assertf — panics with message; used for "this is a bug" invariants
-examples/           ← standalone binaries showing how to write custom interceptors
+examples/           ← standalone binaries showing how to write custom interceptors, plus
+                      framer/tamper script examples (e.g. dbdump/framer/tls-framer.js — a
+                      TLS record-layer framer; see "Framer scripts" below)
 test/               ← echo server/client helpers, CLI wrappers for manual testing, and tapctl/
                       (one-shot test client for the tamper/dbdump WebSocket + REST APIs)
 ```
@@ -268,7 +278,7 @@ Three strategies (configured on the server side):
 | `match-replace` | `MatchReplaceInterceptor` | `replacements`: ordered list of `{regex: replacement}` maps |
 | `bridge` | `BridgeInterceptor` | `connect` (endpoint); streams data to a TCP server using a custom binary framing protocol |
 | `droptls` | `DropTlsInterceptor` | none; aborts on `ConnectionUpgraded` to attempt TLS downgrade |
-| `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool); logs all traffic to SQLite; exposes REST API |
+| `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool), `scripts-dir` (string, optional — storage for user-authored framer scripts; see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section); logs all traffic to SQLite; exposes REST API |
 | `tamper` | `TamperInterceptor` | `hold-timeout-ms` (int, `<=0` = infinite), `hold-until-connected` (bool), `scripts-dir` (string, optional), `fs-root` (string, optional — grants scripts scoped read/write/list access to this host directory via REST; see `intercept/tamper/CLAUDE.md`'s "Filesystem access" section), `log-file` (string, optional — persists a running script's `tamper.log`/`ctx.log` output server-side, always appended to; see `intercept/tamper/CLAUDE.md`'s "Script storage" section and `web/CLAUDE.md`'s "Scripted interception" section); lets a connected control client actively pause, inspect, edit, drop, or forward live chunks, or just live-watch them; exposes a WebSocket API |
 
 ## REST API
@@ -338,6 +348,36 @@ when working in that directory.
 ## Documentation
 
 - `doc/openapi.yaml` — OpenAPI 3.1.0 specification for all REST and WebSocket endpoints
+
+## TODO
+
+Known gaps and deferred work, collected here so they aren't rediscovered from scratch.
+
+- **`doc/openapi.yaml`'s `{path}` parameters don't survive standard OpenAPI tooling.**
+  `/api/i/tamper/fs/list/{path}` and `/fs/file/{path}` document `path` as a single
+  `in: path` string, but the real route is a `{path...}` wildcard that can embed
+  `/`-separated segments — standard tooling (Swagger UI, most codegen) percent-encodes
+  `/` in a path parameter, so it can't actually drive a nested path through these
+  operations as written. Needs a parameter-modeling redesign (e.g. prose-only
+  documentation for the parameter, or a vendor extension), not a safe drive-by edit.
+- **Packet dissector stage — not started.** `doc/design/packet-dissector.md` covers two
+  stages: framer (done — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section)
+  and dissector (deferred, no work begun).
+- **Byte-budgeted segment buffer — `TrafficView.js` fully migrated, `CombinedView.js`
+  still pending (deliberately deferred).** `doc/design/hexview-segment-buffer.md` has the
+  full migration plan; all of `TrafficView.js` (raw and frame mode) now runs on
+  `useByteBuffer.js` (see `web/CLAUDE.md`'s "Byte-budgeted segment buffer" section);
+  `CombinedView.js` is unchanged, still on `useChunkBuffer.js` — its migration is about
+  consistency, not fixing a bug (it never shows huge segments), so it's left open until
+  asked for rather than done proactively.
+- **Frame view has no explicit "no frames found" empty state.** A successful Run with
+  zero resulting frames (stale `frame_progress`, or a script that legitimately finds
+  nothing for that stream) renders silently blank in `TrafficView.js`, indistinguishable
+  from "still loading." Low-risk, small; do it if asked, not proactively.
+- **No in-app framer-script editor.** dbdump's framer scripts have no create/edit/delete
+  UI in the browser yet (deferred, to eventually reuse `TamperScriptsPanel.js`'s generic
+  parts) — scripts must be added via `curl`/`tapctl` against dbdump's `/scripts`
+  endpoints for now.
 
 ## Dependencies
 
