@@ -10,13 +10,80 @@
 // {frames, state} are plain JSON-serializable values, never bytes/base64. Each returned
 // frame is {offset, length, meta?}. No frame function defined, or one that throws,
 // rejects runFramer's returned promise.
+//
+// A global `framer` object exposes the same transform framework tamper scripts get, under
+// framer.transform.*/encode.*/decode.*/number.* (mirroring tamper.*'s shape, sans the
+// `tamper` prefix). Unlike tamper's version, this is always plain synchronous — never a
+// Promise — because runScript (unlike tamper's live event dispatch) only starts once
+// explicitly told to via the 'run' message, so it can simply await the module import
+// finishing first; a framer script's own top level, outside frame(), has no such
+// guarantee and shouldn't reference framer.* there. framer.log(...args) — a plain
+// postMessage, no OPERATIONS/FORMAT dependency — is surfaced to runFramer's caller via
+// the optional onLog callback below.
+
+import { buildTransformApiSource, buildNumberApiSource, HEX_DEFAULTS, BASE64_DEFAULTS } from './transformWorkerApi.js'
 
 const BATCH_FRAMES = 500  // flush a batch after this many frames accumulate
 const BATCH_BYTES = 2 * 1024 * 1024 // ...or this many bytes processed, whichever first
 
+// Absolute URLs, so BOOTSTRAP's dynamic import() can resolve their own relative imports
+// (transforms/*, vendor/*) from inside a Blob-URL worker, where a relative specifier
+// wouldn't resolve.
+const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
+const FORMAT_URL = new URL('./format.js', import.meta.url).href
+
+// framer.transform.<category>'s function bodies call OPERATIONS directly — always plain
+// sync, since runScript never calls frame() before modulesReady has resolved.
+const FRAMER_TRANSFORM_API_SOURCE = buildTransformApiSource(
+    opId => `(bytes, params) => OPERATIONS[${JSON.stringify(opId)}].run(bytes, params)`,
+)
+
+// framer.number.decode<Type>/encode<Type> — real numbers/bigints, not decimal text; each
+// type's own shape is inlined so no runtime lookup back into NUMBER_TYPES is needed.
+const FRAMER_NUMBER_API_SOURCE = buildNumberApiSource((type, kind) => {
+    const typeJson = JSON.stringify(type)
+    return kind === 'decode'
+        ? `(bytes) => decodeNumberValue(bytes, ${typeJson})`
+        : `(value) => encodeNumberValue(value, ${typeJson})`
+})
+
 const BOOTSTRAP = `
 (function () {
     let pendingAck = null
+    let OPERATIONS = null
+    let FORMAT = null
+    let decodeNumberValue = null
+    let encodeNumberValue = null
+
+    const HEX_DEFAULTS = ${JSON.stringify(HEX_DEFAULTS)}
+    const BASE64_DEFAULTS = ${JSON.stringify(BASE64_DEFAULTS)}
+
+    const modulesReady = (async () => {
+        const [transformsMod, formatMod] = await Promise.all([
+            import(${JSON.stringify(TRANSFORMS_URL)}),
+            import(${JSON.stringify(FORMAT_URL)}),
+        ])
+        await transformsMod.warmupWhirlpool()
+        OPERATIONS = transformsMod.OPERATIONS
+        FORMAT = formatMod
+        decodeNumberValue = transformsMod.decodeNumberValue
+        encodeNumberValue = transformsMod.encodeNumberValue
+        self.framer = {
+            transform: ${FRAMER_TRANSFORM_API_SOURCE},
+            encode: {
+                hex:     (bytes, params) => new TextDecoder().decode(OPERATIONS['hex-encode'].run(bytes, { ...HEX_DEFAULTS, ...params })),
+                base64:  (bytes, params) => new TextDecoder().decode(OPERATIONS['base64-encode'].run(bytes, { ...BASE64_DEFAULTS, ...params })),
+                hexdump: (bytes, baseOffset) => FORMAT.fmtAsHexdump(bytes, baseOffset ?? 0),
+            },
+            decode: {
+                hex:     (text, params) => OPERATIONS['hex-decode'].run(new TextEncoder().encode(text), { ...HEX_DEFAULTS, ...params }),
+                base64:  (text, params) => OPERATIONS['base64-decode'].run(new TextEncoder().encode(text), { ...BASE64_DEFAULTS, ...params }),
+                hexdump: (text) => FORMAT.parseHexdump(text),
+            },
+            number: ${FRAMER_NUMBER_API_SOURCE},
+            log: (...args) => postMessage({ kind: 'log', args }),
+        }
+    })()
 
     function postBatchAndWait(frames, state, processedOffset) {
         return new Promise((resolve, reject) => {
@@ -29,6 +96,7 @@ const BOOTSTRAP = `
         if (typeof frame !== 'function') {
             throw new Error('framer script must define a top-level function named "frame"')
         }
+        await modulesReady
 
         let state = initialState
         let pending = []
@@ -103,8 +171,10 @@ try {
 //
 // Rejects and stops the Worker immediately, computing nothing further, if the script
 // throws, never defines frame, or an onBatch call rejects (e.g. a 409 indicating someone
-// else already advanced this key).
-export function runFramer(scriptName, scriptSource, initialState, chunks, onBatch) {
+// else already advanced this key). onLog (optional) is called with a script's own
+// framer.log(...) arguments, in call order, whenever it uses that — best-effort, doesn't
+// affect the run either way.
+export function runFramer(scriptName, scriptSource, initialState, chunks, onBatch, onLog) {
     return new Promise((resolve, reject) => {
         const scriptBlobUrl = URL.createObjectURL(new Blob([buildScriptSource(scriptName, scriptSource)], { type: 'text/javascript' }))
         const bootstrapBlobUrl = URL.createObjectURL(new Blob([buildWorkerSource(scriptBlobUrl)], { type: 'text/javascript' }))
@@ -128,6 +198,8 @@ export function runFramer(scriptName, scriptSource, initialState, chunks, onBatc
             } else if (msg.kind === 'error') {
                 cleanup()
                 reject(new Error(msg.message))
+            } else if (msg.kind === 'log') {
+                onLog?.(msg.args)
             }
         }
         worker.onerror = (e) => {

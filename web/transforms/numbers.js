@@ -2,7 +2,10 @@ import { fmtAsRaw, parseRaw } from '../format.js'
 
 // Fixed-width binary integer types. `get`/`set` name the DataView methods to use; the
 // 1-byte types ignore the extra `le` argument DataView getters/setters are called with.
-const NUMBER_TYPES = [
+// Exported for transformWorkerApi.js's number namespace (framer.number.*/tamper.number.*
+// — see that file), the one other consumer that needs the raw type table rather than
+// going through OPERATIONS' decimal-text-in-bytes convention below.
+export const NUMBER_TYPES = [
     { id: 'i8',    label: 'Int8',                    bytes: 1, signed: true,  get: 'getInt8',     set: 'setInt8' },
     { id: 'u8',    label: 'UInt8',                   bytes: 1, signed: false, get: 'getUint8',    set: 'setUint8' },
     { id: 'i16be', label: 'Int16 (big endian)',      bytes: 2, signed: true,  get: 'getInt16',    set: 'setInt16',    le: false },
@@ -28,26 +31,45 @@ function numberRange(type) {
     return type.signed ? { min: -(2 ** (bits - 1)), max: 2 ** (bits - 1) - 1 } : { min: 0, max: 2 ** bits - 1 }
 }
 
-// Decodes a fixed-width binary integer to its decimal text representation.
-function numberDecode(bytes, type) {
+// Decodes a fixed-width binary integer to its actual number/bigint value (bigint for the
+// 64-bit types, per DataView's own getBigInt64/getBigUint64). The pure bytes<->value core
+// both numberDecode/numberEncode below (OPERATIONS' decimal-text convention) and
+// transformWorkerApi.js's number namespace (framer.number.*/tamper.number.* — real
+// numbers, no text round-trip) build on.
+export function decodeNumberValue(bytes, type) {
     if (bytes.length !== type.bytes) {
         throw new Error(`expected exactly ${type.bytes} byte${type.bytes === 1 ? '' : 's'} for ${type.label}, got ${bytes.length}`)
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    const value = view[type.get](0, type.le)
-    return parseRaw(String(value))
+    return view[type.get](0, type.le)
+}
+
+// Encodes a number (or bigint, for the 64-bit types) into the fixed-width binary
+// representation.
+export function encodeNumberValue(value, type) {
+    if (type.big && typeof value !== 'bigint') {
+        throw new Error(`${type.label} requires a BigInt value (e.g. ${value}n)`)
+    }
+    if (!type.big && typeof value !== 'number') {
+        throw new Error(`${type.label} requires a number value`)
+    }
+    const { min, max } = numberRange(type)
+    if (value < min || value > max) throw new Error(`value ${value} is out of range for ${type.label} (${min} to ${max})`)
+    const out = new Uint8Array(type.bytes)
+    new DataView(out.buffer)[type.set](0, value, type.le)
+    return out
+}
+
+// Decodes a fixed-width binary integer to its decimal text representation.
+function numberDecode(bytes, type) {
+    return parseRaw(String(decodeNumberValue(bytes, type)))
 }
 
 // Encodes decimal text (e.g. "-123") into the fixed-width binary representation.
 function numberEncode(bytes, type) {
     const text = fmtAsRaw(bytes).trim()
     if (!/^-?\d+$/.test(text)) throw new Error(`"${text}" is not a valid integer`)
-    const value = type.big ? BigInt(text) : Number(text)
-    const { min, max } = numberRange(type)
-    if (value < min || value > max) throw new Error(`value ${text} is out of range for ${type.label} (${min} to ${max})`)
-    const out = new Uint8Array(type.bytes)
-    new DataView(out.buffer)[type.set](0, value, type.le)
-    return out
+    return encodeNumberValue(type.big ? BigInt(text) : Number(text), type)
 }
 
 export const OPERATIONS = {}

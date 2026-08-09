@@ -8,18 +8,11 @@
 const HEADER_LEN = 4
 const MAX_MESSAGE_LENGTH = 256 * 1024 * 1024 // sanity cap against a misaligned stream
 
-function bytesToBase64(bytes) {
-    return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
-}
-
-function base64ToBytes(b64) {
-    return Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-}
-
 function frame(state, chunk) {
     // `state.carry` holds whatever tail bytes didn't yet form a complete message last
-    // time (undefined on the very first call for this direction).
-    const carry = state && state.carry ? base64ToBytes(state.carry) : new Uint8Array(0)
+    // time (undefined on the very first call for this direction) — a plain Uint8Array;
+    // dbdumpFramerApi.js base64-encodes it only when state actually crosses the wire.
+    const carry = state && state.carry ? state.carry : new Uint8Array(0)
 
     const buf = new Uint8Array(carry.length + chunk.data.length)
     buf.set(carry, 0)
@@ -32,13 +25,15 @@ function frame(state, chunk) {
     const frames = []
     let pos = 0
     while (buf.length - pos >= HEADER_LEN) {
-        const length = ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0
-
+        const length = framer.number.decodeU32be(buf.subarray(pos, pos + HEADER_LEN))
+        
         if (length > MAX_MESSAGE_LENGTH) {
-            throw new Error(`implausible message length ${length} at offset ${bufBaseOffset + pos} — probably misaligned, not a real message boundary`)
+            const headerHex = framer.encode.hex(buf.subarray(pos, pos + HEADER_LEN))
+            throw new Error(`implausible message length ${length} (header bytes ${headerHex}) at offset ${bufBaseOffset + pos} — probably misaligned, not a real message boundary`)
         }
         if (buf.length - pos < HEADER_LEN + length) break // message not fully arrived yet
 
+        framer.log("emitting frame at offset: " + bufBaseOffset + pos + HEADER_LEN)
         frames.push({
             offset: bufBaseOffset + pos + HEADER_LEN,
             length,
@@ -49,6 +44,8 @@ function frame(state, chunk) {
 
     return {
         frames,
-        state: { carry: bytesToBase64(buf.subarray(pos)) },
+        // .slice(), not .subarray(): a view would keep the whole (possibly much larger)
+        // accumulated buf alive in memory for as long as this carry is held.
+        state: { carry: buf.slice(pos) },
     }
 }

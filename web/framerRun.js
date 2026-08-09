@@ -17,8 +17,10 @@ export async function sha256Hex(text) {
 // fields never needs to synthesize one just to call this. scriptSource is the script's
 // current content — never fetched here, so a script mid-edit can be run without saving
 // first. scriptVersion is derived from scriptSource via sha256Hex, kept internal so
-// every caller computes it identically.
-export async function catchUpFramer(sessionId, streamId, direction, scriptName, scriptSource) {
+// every caller computes it identically. onLog (optional) is called with (direction, args)
+// for every framer.log(...) call the script makes during this run — direction is this
+// call's own fixed direction, passed through since runFramer's onLog only sees args.
+export async function catchUpFramer(sessionId, streamId, direction, scriptName, scriptSource, onLog) {
     const scriptVersion = await sha256Hex(scriptSource)
     const key = { session: sessionId, stream: streamId, direction, script: scriptName, scriptVersion }
 
@@ -58,5 +60,5 @@ export async function catchUpFramer(sessionId, streamId, direction, scriptName, 
         })
         await appendFrames(key, expectedOffset, framesWithStid, batch.processedOffset, batch.state)
         expectedOffset = batch.processedOffset
-    })
+    }, args => onLog?.(direction, args))
 }

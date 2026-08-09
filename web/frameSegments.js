@@ -1,8 +1,9 @@
 import { getByteStid, openSegmentsStream } from './api.js'
 import { listFramesTimeline, listFramesTimelineBackward } from './dbdumpFramerApi.js'
+import { isWindowFull } from './byteBufferCore.js'
 import {
     selectByBudget, wantRangeFor, rangesByDirection, buildFrameWindow,
-    extendRange, mergeExtendedWindow, computeReachedEnd,
+    extendRange, mergeExtendedWindow, computeReachedEnd, excludeAlreadyLoaded,
 } from './frameSegmentsCore.js'
 
 // Frame-mode adapter for useByteBuffer.js — see doc/design/hexview-segment-buffer.md's
@@ -86,32 +87,46 @@ async function extendResumeWindow(handle, entity, resumeWindow, maxBytes, dir) {
     return { windows: [window], reachedEnd: false }
 }
 
-export async function fillForward(handle, entity, { afterStid, resumeWindow, maxBytes, maxSegments }) {
-    if (resumeWindow) return extendResumeWindow(handle, entity, resumeWindow, maxBytes, 1)
+export async function fillForward(handle, entity, { afterStid, resumeWindow, excludeIds, maxBytes, maxSegments }) {
+    if (resumeWindow && !isWindowFull(resumeWindow)) return extendResumeWindow(handle, entity, resumeWindow, maxBytes, 1)
 
     const requestN = maxSegments + 1
-    const frames = await listFramesTimeline(timelineKey(entity), afterStid + 1, requestN)
+    // Inclusive of afterStid (not "+1") whenever resumeWindow is given: a stid can hold
+    // more than one frame (a tied group — e.g. two messages completing on the same raw
+    // chunk), and once resumeWindow's own segment has finished loading, boundary/afterStid
+    // is exactly its stid — an exclusive cursor would then permanently skip a still-unread
+    // sibling at that same stid, since this stid is never revisited once passed. No
+    // resumeWindow at all means a genuinely fresh boundary with nothing loaded there yet,
+    // so the original exclusive "+1" still applies. excludeIds (every id already consumed
+    // at this exact stid, not just resumeWindow's own — see excludeAlreadyLoaded) turns the
+    // inclusive result back into "only what's genuinely new".
+    const rawFrames = await listFramesTimeline(timelineKey(entity), resumeWindow ? afterStid : afterStid + 1, requestN)
+    const frames = excludeAlreadyLoaded(rawFrames, afterStid, excludeIds)
 
     // Already ascending = nearest-to-afterStid-first for a forward walk.
     const { included, openRange } = selectByBudget(frames, maxSegments, maxBytes, 1)
-    const reachedEnd = computeReachedEnd(frames, requestN, included)
+    const reachedEnd = computeReachedEnd(frames, requestN, included, rawFrames.length)
     if (included.length === 0) return { windows: [], reachedEnd }
 
     const windows = await fetchFrameWindows(handle, entity, included, openRange)
     return { windows, reachedEnd } // included was already ascending; no reorder needed
 }
 
-export async function fillBackward(handle, entity, { beforeStid, resumeWindow, maxBytes, maxSegments }) {
-    if (resumeWindow) return extendResumeWindow(handle, entity, resumeWindow, maxBytes, -1)
+export async function fillBackward(handle, entity, { beforeStid, resumeWindow, excludeIds, maxBytes, maxSegments }) {
+    if (resumeWindow && !isWindowFull(resumeWindow)) return extendResumeWindow(handle, entity, resumeWindow, maxBytes, -1)
 
     const requestN = maxSegments + 1
-    const frames = await listFramesTimelineBackward(timelineKey(entity), beforeStid, requestN)
+    // listFramesTimelineBackward is exclusive of beforeStid already (stid < beforeStid);
+    // "+1" makes it inclusive of beforeStid whenever resumeWindow is given, mirroring
+    // fillForward's adjustment above for the same tied-stid-group reason.
+    const rawFrames = await listFramesTimelineBackward(timelineKey(entity), resumeWindow ? beforeStid + 1 : beforeStid, requestN)
+    const frames = excludeAlreadyLoaded(rawFrames, beforeStid, excludeIds)
 
     // frames comes back ascending (smallest stid first); reverse to nearest-to-
     // beforeStid-first (largest stid first) for selection.
     const nearestFirst = frames.slice().reverse()
     const { included, openRange } = selectByBudget(nearestFirst, maxSegments, maxBytes, -1)
-    const reachedEnd = computeReachedEnd(frames, requestN, included)
+    const reachedEnd = computeReachedEnd(frames, requestN, included, rawFrames.length)
     if (included.length === 0) return { windows: [], reachedEnd }
 
     const windows = await fetchFrameWindows(handle, entity, included, openRange)

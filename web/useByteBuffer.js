@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
 import { ROW_HEIGHT } from './components/HexDump.js'
 import {
     MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS, FILL_TARGET_BYTES, FILL_TARGET_SEGMENTS,
-    totalBytes, isWindowFull, buildRows, evict, fillToTarget,
+    totalBytes, isWindowFull, buildRows, evict, fillToTarget, windowIndexAtRow, rowIndexOfWindow,
 } from './byteBufferCore.js'
 
 export { MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS, FILL_TARGET_SEGMENTS }
@@ -150,7 +150,9 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
             try {
                 const tail    = windows[windows.length - 1]
                 const boundary = tail ? tail.segment.stid : -1
-                const initialResume = tail && !isWindowFull(tail) ? tail : null
+                // Passed even when tail is already fully loaded — see byteBufferCore.js's
+                // fillToTarget for why (a tied-stid sibling left over at that same stid).
+                const initialResume = tail ?? null
                 const newWindows = windows.slice()
                 const { addedBytes, addedSegments, reachedEnd } = await fillToTarget(
                     fillForward, capturedHandle, e, newWindows, 1, boundary, initialResume,
@@ -206,6 +208,103 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
         reloadFromBoundary(-1, latestId + 1, { computeExtra: () => ({ scrollTo: Number.MAX_SAFE_INTEGER, scrollToVersion: version }) })
     }
 
+    // Scrolls to a segment already present in the buffer — no fetch, so scrollAdjust/rows
+    // are left untouched (same "jump without a reload" shape HexDump's own pinned-header
+    // click uses, just expressed via display.scrollTo/scrollToVersion since this lives
+    // outside HexDump.js).
+    function scrollToWindow(windows, index) {
+        const targetRow = rowIndexOfWindow(windows, index)
+        const version = (displayRef.current.scrollToVersion ?? 0) + 1
+        setDisplay(prev => ({ ...prev, scrollTo: targetRow * ROW_HEIGHT, scrollToVersion: version }))
+    }
+
+    // Fetches exactly one more segment beyond `edge` (the current buffer's forward/backward
+    // extreme) and scrolls to it once it arrives — the "neighbor isn't loaded yet" half of
+    // jumpToNextSegment/jumpToPrevSegment below.
+    //
+    // Passes a *synthetic* stand-in for edge, reported as fully loaded regardless of its
+    // real state (isWindowFull always true), so the adapter treats it as settled and looks
+    // for what comes next/before instead of extending its own byte range — jumping past a
+    // still-loading huge segment shouldn't have to wait for it to finish loading first.
+    // (idsAtStid, called inside fillToTarget, still sees edge's real entry in `newWindows`,
+    // so a tied sibling at the same stid is correctly found rather than mistaken for "the
+    // segment we're already past".) targetSegments: 1 asks for exactly one new segment;
+    // targetBytes: Infinity means only the segment count, never a byte budget, ends the
+    // fetch — appropriate here since a jump wants "the next segment", full stop, not
+    // "up to some amount of the next segment".
+    function fetchAndJump(dir, windows) {
+        const capturedGen    = generationRef.current
+        const capturedEntity = entityRef.current
+        const capturedHandle = handleRef.current
+        if (!capturedEntity || !capturedHandle) return
+
+        const edge          = dir === 1 ? windows[windows.length - 1] : windows[0]
+        const fullEdgeStandIn = { ...edge, loadedEnd: edge.segment.offset + edge.segment.length }
+        const boundary       = edge.segment.stid
+
+        loadingMoreRef.current = true
+        setLoading(true)
+
+        ;(async () => {
+            try {
+                const newWindows = windows.slice()
+                const fill = dir === 1 ? fillForward : fillBackward
+                const { addedSegments, reachedEnd } = await fillToTarget(
+                    fill, capturedHandle, capturedEntity, newWindows, dir, boundary, fullEdgeStandIn,
+                    Infinity, 1, generationRef, capturedGen,
+                )
+                if (generationRef.current !== capturedGen) return
+                if (dir === 1) reachedForwardRef.current  = reachedEnd
+                else            reachedBackwardRef.current = reachedEnd
+                if (addedSegments === 0) return
+
+                windowsRef.current = newWindows
+                // Forward: newly-appended segments land at the tail in order, so the very
+                // next one (what we want, even if the adapter happened to return more than
+                // one in this round) is right after the original array's own end. Backward:
+                // newly-prepended segments land at the front in ascending order, so the one
+                // closest to where we started is the last of them.
+                const targetIndex = dir === 1 ? windows.length : addedSegments - 1
+                const targetRow   = rowIndexOfWindow(newWindows, targetIndex)
+                const rows        = buildRows(newWindows, capturedEntity.start)
+                const version     = (displayRef.current.scrollToVersion ?? 0) + 1
+                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, scrollTo: targetRow * ROW_HEIGHT, scrollToVersion: version })
+            } catch (e) {
+                if (generationRef.current === capturedGen) setError(e.message)
+            } finally {
+                loadingMoreRef.current = false
+                if (generationRef.current === capturedGen) setLoading(false)
+            }
+        })()
+    }
+
+    // Jump to the segment right after/before whatever the viewport is currently showing —
+    // currentRowIndex is the caller's own scroll-derived row (TrafficView.js already
+    // tracks this for its "remember stream position" leave-effect). Already-loaded
+    // neighbor: instant, no fetch. Not loaded yet: fetchAndJump reuses the same adapter
+    // machinery a real scroll would.
+    function jumpToNextSegment(currentRowIndex) {
+        if (!entityRef.current || loadingMoreRef.current) return
+        const windows = windowsRef.current
+        const idx = windowIndexAtRow(windows, currentRowIndex)
+        if (idx === -1) return
+
+        if (idx + 1 < windows.length) { scrollToWindow(windows, idx + 1); return }
+        if (reachedForwardRef.current) return
+        fetchAndJump(1, windows)
+    }
+
+    function jumpToPrevSegment(currentRowIndex) {
+        if (!entityRef.current || loadingMoreRef.current) return
+        const windows = windowsRef.current
+        const idx = windowIndexAtRow(windows, currentRowIndex)
+        if (idx === -1) return
+
+        if (idx > 0) { scrollToWindow(windows, idx - 1); return }
+        if (reachedBackwardRef.current) return
+        fetchAndJump(-1, windows)
+    }
+
     // Stable callback — reads all mutable state via refs, same discipline
     // useChunkBuffer.js's own handleScrollEnd uses.
     const handleScrollEnd = useCallback(async (scrollDir) => {
@@ -229,7 +328,9 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
         try {
             const dir  = goingForward ? 1 : -1
             const edge = goingForward ? windows[windows.length - 1] : windows[0]
-            const initialResume = isWindowFull(edge) ? null : edge
+            // Passed even when edge is already fully loaded — see byteBufferCore.js's
+            // fillToTarget for why (a tied-stid sibling left over at that same stid).
+            const initialResume = edge
             const boundary = edge.segment.stid
 
             const fill = goingForward ? fillForward : fillBackward
@@ -271,5 +372,8 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
         }
     }, [])
 
-    return { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom }
+    return {
+        display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
+        jumpToTop, jumpToBottom, jumpToNextSegment, jumpToPrevSegment,
+    }
 }

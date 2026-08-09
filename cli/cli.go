@@ -1,18 +1,23 @@
 package cli
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"tlstap/intercept/bridge"
 	"tlstap/intercept/dbdump"
@@ -24,6 +29,14 @@ import (
 	"tlstap/logging"
 	"tlstap/proxy"
 	tlstapweb "tlstap/web"
+)
+
+// Graceful-shutdown timeouts. Hardcoded rather than exposed in config.json for now — easy
+// to make configurable later if these prove wrong in practice.
+const (
+	drainTimeout       = 10 * time.Second // waiting for in-flight proxy connections to finish
+	finalizeTimeout    = 5 * time.Second  // waiting for every interceptor's Finalize()
+	apiShutdownTimeout = 5 * time.Second  // waiting for the API server's Shutdown()
 )
 
 // known interceptor
@@ -77,6 +90,8 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	apiMux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ui/", http.StatusFound)
 	})
+
+	var allProxies []*proxy.Proxy
 
 	for _, configName := range enabledConfigs {
 		config, ok := configFile.Proxies[configName]
@@ -144,22 +159,97 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 			checkFatal(&mainLogger, err)
 		}
 
+		allProxies = append(allProxies, proxy)
 		go startProxy(proxy, &mainLogger)
 	}
 
+	var apiServer *http.Server
 	if configFile.Api != nil && configFile.Api.Listen != "" {
 		mainLogger.Info("Starting API server at %s", configFile.Api.Listen)
+		apiServer = &http.Server{Addr: configFile.Api.Listen, Handler: apiMux}
 		go func() {
-			if err := http.ListenAndServe(configFile.Api.Listen, apiMux); err != nil {
+			if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				mainLogger.Error("API server: %v", err)
 			}
 		}()
 	}
 
-	// TODO: can we do better?
-	var wg sync.WaitGroup
-	wg.Add(1)
-	wg.Wait()
+	// sigCh receives every SIGINT/SIGTERM for the rest of the process's life: the first
+	// one (blocked on below) starts the graceful sequence; shutdown() itself keeps reading
+	// from the same channel so a second one, received at any point, forces an immediate exit.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	mainLogger.Info("Shutdown signal received, shutting down gracefully...")
+
+	shutdown(allProxies, apiServer, sigCh, &mainLogger)
+}
+
+// shutdown runs the graceful-shutdown sequence: stop accepting new work everywhere (close
+// every proxy's listener, start the API server's Shutdown), let both drain concurrently
+// bounded by their own timeouts, then finalize every interceptor. A second SIGINT/SIGTERM
+// arriving on sigCh at any point during this forces an immediate os.Exit(1) instead of
+// waiting for the sequence to finish on its own.
+func shutdown(proxies []*proxy.Proxy, apiServer *http.Server, sigCh <-chan os.Signal, logger *logging.Logger) {
+	go func() {
+		<-sigCh
+		logger.Warn("Second shutdown signal received, forcing immediate exit.")
+		os.Exit(1)
+	}()
+
+	for _, p := range proxies {
+		p.Stop()
+	}
+
+	var drainWg sync.WaitGroup
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancelDrain()
+
+	drainWg.Add(len(proxies))
+	for _, p := range proxies {
+		go func(p *proxy.Proxy) {
+			defer drainWg.Done()
+			if !p.WaitForConnections(drainCtx) {
+				logger.Warn("Timed out waiting for in-flight connections on %s to finish.", p.Config.Name)
+			}
+		}(p)
+	}
+
+	if apiServer != nil {
+		drainWg.Add(1)
+		go func() {
+			defer drainWg.Done()
+			apiCtx, cancelApi := context.WithTimeout(context.Background(), apiShutdownTimeout)
+			defer cancelApi()
+			if err := apiServer.Shutdown(apiCtx); err != nil {
+				logger.Warn("API server shutdown: %v", err)
+			}
+		}()
+	}
+	drainWg.Wait()
+
+	finalizeDone := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(proxies))
+		for _, p := range proxies {
+			go func(p *proxy.Proxy) {
+				defer wg.Done()
+				p.Finalize()
+			}(p)
+		}
+		wg.Wait()
+		close(finalizeDone)
+	}()
+
+	select {
+	case <-finalizeDone:
+		logger.Info("All interceptors finalized.")
+	case <-time.After(finalizeTimeout):
+		logger.Warn("Timed out waiting for interceptors to finalize; exiting anyway.")
+	}
+
+	logger.Info("Shutdown complete.")
 }
 
 func resolveMuxHandlers(config *proxy.ProxyConfig, configFile *proxy.ConfigFile, mainLogger *logging.Logger) ([]proxy.ResolvedMuxHandler, error) {
@@ -309,10 +399,10 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 	if mode == proxy.ModeMux {
 		mux := proxy.NewMux(handlers)
 		p.Mux = mux
-		mux.SetProxy(&p)
+		mux.SetProxy(p)
 	}
 
-	return &p, nil
+	return p, nil
 }
 
 func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (proxy.Interceptor, error) {

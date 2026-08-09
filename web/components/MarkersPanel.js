@@ -48,18 +48,17 @@ function parseImport(text) {
 
 // ── component ─────────────────────────────────────────────────────────────────
 
-export default function MarkersPanel({ markers, onRemove, onUpdateLabel, onJump, onImport, collapsed, onToggle, width }) {
+// "Markers" bottom-panel tab of the Analysis view: every marker in the current session
+// (across all its streams — a marker's own stream is shown per row since more than one
+// can appear here), a table row each. Session-scoped rather than stream-scoped, same
+// filter-by-session convention as before this moved out of TrafficView.js's side panel.
+export default function MarkersPanel({ session, markers, onRemove, onUpdateLabel, onJump, onImport }) {
     const [ioMethod, setIoMethod] = useState('clipboard')
     const [status,   setStatus]   = useState(null)  // null | { ok: bool, msg: string }
 
-    if (collapsed) {
-        return html`
-            <div class="markers-strip" onclick=${onToggle} title="Expand markers">
-                <span class="markers-strip-triangle">◀</span>
-                <span class="markers-strip-label">Markers</span>
-            </div>
-        `
-    }
+    if (!session) return html`<div class="panel-placeholder">Select a session first</div>`
+
+    const sessionMarkers = (markers ?? []).filter(m => m.session === session.id)
 
     // ── export ────────────────────────────────────────────────────────────────
 
@@ -139,15 +138,12 @@ export default function MarkersPanel({ markers, onRemove, onUpdateLabel, onJump,
     // ── render ────────────────────────────────────────────────────────────────
 
     return html`
-        <div class="markers-side" style=${`width: ${width}px`}>
-            <div class="markers-side-header">
-                <span>Markers</span>
-                <span class="markers-collapse-btn" onclick=${onToggle} title="Collapse">▶</span>
-            </div>
-            <div class="markers-side-list">
-                ${markers.length === 0
-                    ? html`<div class="markers-empty">No markers set</div>`
-                    : markers.map(m => html`
+        <div class="markers-tab">
+            <div class="markers-tab-header">${sessionMarkers.length} marker${sessionMarkers.length === 1 ? '' : 's'}</div>
+            <div class="markers-tab-list">
+                ${sessionMarkers.length === 0
+                    ? html`<div class="empty">No markers set</div>`
+                    : sessionMarkers.map(m => html`
                         <${MarkerRow}
                             key=${m.id}
                             marker=${m}
@@ -187,37 +183,34 @@ function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
     }
 
     return html`
-        <div class="marker-row" onclick=${() => onJump(marker)}>
-            <div class="marker-row-top">
-                <span class="marker-loc">
-                    [${marker.stream}]
-                    <span class=${'marker-dir ' + dir}>${label}</span>
-                    <span class="marker-off">0x${marker.offset.toString(16).padStart(8, '0')}</span>
-                </span>
-                <span class="marker-del" onclick=${e => { e.stopPropagation(); onRemove(marker.id) }} title="Delete">×</span>
-            </div>
+        <div class="markers-tab-row">
+            <span class="mtab-session">#${marker.session}</span>
+            <span class="mtab-stream">#${marker.stream}</span>
+            <span class=${'mtab-dir ' + dir}>${label}</span>
+            <span class="mtab-off">0x${marker.offset.toString(16).padStart(8, '0')}</span>
             ${editing
                 ? html`
                     <input
-                        class="marker-label-input"
+                        class="mtab-label-input"
                         value=${draft}
                         oninput=${e => setDraft(e.target.value)}
                         onblur=${commitEdit}
                         onkeydown=${e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') { setDraft(marker.label); setEditing(false) } }}
-                        onClick=${e => e.stopPropagation()}
                         ref=${el => el?.focus()}
                     />
                 `
                 : html`
-                    <div
-                        class=${'marker-label' + (marker.label ? '' : ' marker-label-empty')}
-                        onclick=${e => { e.stopPropagation(); setDraft(marker.label); setEditing(true) }}
+                    <span
+                        class=${'mtab-label' + (marker.label ? '' : ' mtab-label-empty')}
+                        onclick=${() => { setDraft(marker.label); setEditing(true) }}
                         title="Click to edit"
                     >
                         ${marker.label || 'click to add note…'}
-                    </div>
+                    </span>
                 `
             }
+            <button class="btn mtab-go" type="button" onclick=${() => onJump(marker)}>Go</button>
+            <span class="mtab-del" onclick=${() => onRemove(marker.id)} title="Delete">×</span>
         </div>
     `
 }

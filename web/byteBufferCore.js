@@ -118,6 +118,48 @@ export function evict(windows, dir, maxBytes, maxSegments) {
     return { windows: out, removedRows }
 }
 
+// Every already-loaded segment id sharing stid, scanning inward from the buffer's edge —
+// dir=1 walks backward from the tail, dir=-1 forward from the head. A tied-stid group is
+// always contiguous at whichever end is currently being extended (segments are appended/
+// prepended in stid order), so this stops at the first entry belonging to a different
+// stid rather than scanning the whole array. Used to tell an adapter every id it has
+// already consumed at the current boundary stid — not just the most recently finished
+// one — since a tied group can (and here, routinely does) have more than two members and
+// each fillForward/fillBackward round resolves only one more of them.
+export function idsAtStid(windows, dir, stid) {
+    const ids = []
+    if (dir === 1) {
+        for (let i = windows.length - 1; i >= 0 && windows[i].segment.stid === stid; i--) ids.push(windows[i].segment.id)
+    } else {
+        for (let i = 0; i < windows.length && windows[i].segment.stid === stid; i++) ids.push(windows[i].segment.id)
+    }
+    return ids
+}
+
+// The index into `windows` whose row-span contains `rowIndex`, as `buildRows` would
+// flatten them (each window contributes `windowRows(w)` consecutive rows, in order) — or
+// -1 if `rowIndex` is out of range. Used to find "the segment the viewport is currently
+// showing" from a scroll-derived row index, for jumpToNextSegment/jumpToPrevSegment
+// (useByteBuffer.js).
+export function windowIndexAtRow(windows, rowIndex) {
+    let row = 0
+    for (let i = 0; i < windows.length; i++) {
+        const span = windowRows(windows[i])
+        if (rowIndex < row + span) return i
+        row += span
+    }
+    return -1
+}
+
+// The row index of windows[index]'s own header row — the inverse companion to
+// windowIndexAtRow, used once a target segment's index is known to compute where to
+// scroll to.
+export function rowIndexOfWindow(windows, index) {
+    let row = 0
+    for (let i = 0; i < index; i++) row += windowRows(windows[i])
+    return row
+}
+
 // Repeatedly calls fill (fillForward or fillBackward) in WINDOW_STEP/SEGMENT_STEP-sized
 // quanta, mutating windows in place — appended at the tail for dir=1, prepended at the
 // head for dir=-1 — until targetBytes or targetSegments of *new* data has been added, the
@@ -137,6 +179,10 @@ export async function fillToTarget(fill, handle, entity, windows, dir, boundaryS
         const remainingSegments = targetSegments - addedSegments
         const req = {
             resumeWindow,
+            // Every id already loaded at exactly `boundary` — a tied-stid-aware adapter
+            // needs the whole set, not just resumeWindow's own id, once more than one
+            // sibling at that stid has been consumed across successive rounds.
+            excludeIds:  resumeWindow ? idsAtStid(windows, dir, boundary) : [],
             maxBytes:    Math.min(WINDOW_STEP, remainingBytes),
             maxSegments: Math.min(SEGMENT_STEP, remainingSegments),
         }
@@ -151,7 +197,11 @@ export async function fillToTarget(fill, handle, entity, windows, dir, boundaryS
 
         let rest = got
         let progressed = false
-        if (resumeWindow) {
+        // got[0] only replaces resumeWindow if it's genuinely a continuation of the same
+        // segment (matched by stid+id) — resumeWindow is now carried forward even once
+        // fully loaded (see below), so a same-stid got[0] that's actually a *different*
+        // segment (a tied sibling) must fall through to the "new segment" branch instead.
+        if (resumeWindow && got[0].segment.stid === resumeWindow.segment.stid && got[0].segment.id === resumeWindow.segment.id) {
             const replaced  = got[0]
             const byteDelta = windowBytes(replaced) - windowBytes(resumeWindow)
             const rowDelta  = windowHexRows(replaced) - windowHexRows(resumeWindow)
@@ -176,7 +226,14 @@ export async function fillToTarget(fill, handle, entity, windows, dir, boundaryS
 
         const edge = dir === 1 ? windows[windows.length - 1] : windows[0]
         boundary     = edge.segment.stid
-        resumeWindow = isWindowFull(edge) ? null : edge
+        // Passed on even once edge is fully loaded, unlike before (previously nulled
+        // here) — a stid can hold more than one segment (a tied group, e.g. two frames
+        // completing on the same raw chunk), and an adapter needs to see the just-finished
+        // one to requery inclusively of its own stid rather than skipping past a sibling
+        // left over there. isWindowFull(edge) is still what tells an adapter whether to
+        // extend it (frameSegments.js) or treat it as closed and requery (chunk mode
+        // ignores resumeWindow either way, per its own doc comment).
+        resumeWindow = edge
 
         if (!progressed || reachedEnd) break
     }

@@ -1,19 +1,70 @@
 import { h } from 'preact'
-import { useState, useEffect } from 'preact/hooks'
 import htm from 'htm'
 import { listScripts, getScript, putScript, deleteScript } from '../tamperApi.js'
-import ScriptEditor from './ScriptEditor.js'
+import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
+import { NUMBER_TYPES } from '../transforms/numbers.js'
+import { camelCaseOpId, capitalizeTypeId } from '../transformWorkerApi.js'
+import ScriptsCrudPanel from './ScriptsCrudPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { useResizableLayout } from '../useResizableLayout.js'
 import { downloadBlob } from '../download.js'
 
 const html = htm.bind(h)
 
-// "Scripts" sub-tab of the Tamper view: CRUD over the server-side script store plus
-// Run/Stop for the one script instance that can be active at a time. The running script
-// and its log survive switching away from this sub-tab (both are lifted to the parent);
-// the list/editor/selection here are local and simply refetched each time this panel
-// mounts.
+// Reflection-only mirror of the real self.tamper API, for scopeCompletionSource to read
+// property names/types off of — never called. transform's shape is generated from
+// OPERATIONS_BY_CATEGORY/camelCaseOpId, number's from NUMBER_TYPES/capitalizeTypeId — the
+// same inputs the real API uses, so a new transform op or number type appears here
+// without a separate update.
+const TAMPER_COMPLETION_SHAPE = {
+    register: () => {},
+    peek: () => {},
+    release: () => {},
+    dropConnection: () => {},
+    setIntercept: () => {},
+    listStreams: () => {},
+    fs: {
+        listFiles: () => {},
+        readFile: () => {},
+        writeFile: () => {},
+        appendFile: () => {},
+    },
+    transform: Object.fromEntries(Object.entries(OPERATIONS_BY_CATEGORY).map(([category, ops]) =>
+        [category, Object.fromEntries(Object.keys(ops).map(opId => [camelCaseOpId(opId), () => {}]))])),
+    encode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
+    decode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
+    number: Object.fromEntries(NUMBER_TYPES.flatMap(t => {
+        const suffix = capitalizeTypeId(t.id)
+        return [[`decode${suffix}`, () => {}], [`encode${suffix}`, () => {}]]
+    })),
+    log: () => {},
+}
+
+// Same idea as TAMPER_COMPLETION_SHAPE, mirroring the real ctx object handed to
+// onReceive (minus __flush, internal-only there). scopeCompletionSource matches on
+// identifier text alone, not real lexical scope, so `ctx.` completes anywhere in the
+// document, including outside an onReceive callback — a one-time, deliberate
+// imprecision: harmless since it only ever adds unwanted suggestions, never blocks or
+// slows typing.
+const CTX_COMPLETION_SHAPE = {
+    conn: 0,
+    direction: 'c2s',
+    newLength: 0,
+    get: () => {},
+    set: () => {},
+    append: () => {},
+    release: () => {},
+    drop: () => {},
+    pause: () => {},
+    log: () => {},
+}
+
+const COMPLETIONS = { tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE }
+
+// "Scripts" sub-tab of the Tamper view: ScriptsCrudPanel.js's generic list+editor chrome
+// plus Run/Stop for the one script instance that can be active at a time, and a resizable
+// log panel. The running script and its log survive switching away from this sub-tab
+// (both are lifted to the parent, TamperView.js).
 //
 // logFile ({enabled, filename}) and bypassBrowserLog/onBypassBrowserLogChange are also
 // owned by the parent — the actual decisions of whether to persist a line server-side
@@ -23,72 +74,9 @@ export default function TamperScriptsPanel({
     connected, running, onRun, onStop, logLines, onClearLog, refreshSignal,
     logFile, bypassBrowserLog, onBypassBrowserLogChange,
 }) {
-    const [scripts,      setScripts]      = useState([])
-    const [selectedName, setSelectedName] = useState(null)
-    const [source,       setSource]       = useState('')
-    const [savedSource,  setSavedSource]  = useState('')
-    const [loading,      setLoading]      = useState(false)
-    const [saving,       setSaving]       = useState(false)
-    const [status,       setStatus]       = useState(null) // null | { ok, msg }
-    const [creatingNew,  setCreatingNew]  = useState(false)
-    const [newName,      setNewName]      = useState('')
-    // Handle sits after the list panel in DOM order, so a positive deltaX (dragging
-    // right) grows it.
-    const [listWidth, handleListResize] = useResizableLayout('scriptsListWidth', { min: 150, max: 500 })
     // Handle sits before the log panel (above it), so a negative deltaY (dragging up)
     // grows it.
     const [logHeight, handleLogResize]  = useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
-    // Bumped exactly once per genuine external reset of the editor's content (initial
-    // load, script switch, Reload) — must be an explicit signal rather than inferred
-    // from `source` changing, since ordinary typing also changes `source`.
-    const [loadVersion,  setLoadVersion]  = useState(0)
-
-    function refreshList() {
-        listScripts().then(setScripts).catch(err => setStatus({ ok: false, msg: err.message }))
-    }
-
-    useEffect(refreshList, [refreshSignal])
-
-    function loadScript(name) {
-        setLoading(true)
-        setStatus(null)
-        getScript(name)
-            .then(text => { setSource(text); setSavedSource(text); setLoadVersion(v => v + 1) })
-            .catch(err => setStatus({ ok: false, msg: err.message }))
-            .finally(() => setLoading(false))
-    }
-
-    useEffect(() => { if (selectedName) loadScript(selectedName) }, [selectedName])
-
-    const dirty = source !== savedSource
-
-    function selectScript(name) {
-        setCreatingNew(false)
-        setSelectedName(name)
-    }
-
-    function handleSave() {
-        setSaving(true)
-        setStatus(null)
-        putScript(selectedName, source)
-            .then(() => { setSavedSource(source); refreshList() })
-            .catch(err => setStatus({ ok: false, msg: err.message }))
-            .finally(() => setSaving(false))
-    }
-
-    function handleReload() {
-        loadScript(selectedName)
-    }
-
-    function handleDelete(name) {
-        if (!window.confirm(`Delete script "${name}"?`)) return
-        deleteScript(name)
-            .then(() => {
-                refreshList()
-                if (selectedName === name) { setSelectedName(null); setSource(''); setSavedSource('') }
-            })
-            .catch(err => setStatus({ ok: false, msg: err.message }))
-    }
 
     // Only rendered/reachable when no server-side log file is configured — once one is,
     // "Logged to <filename>" replaces this button entirely. Plain per-line text; error
@@ -102,80 +90,19 @@ export default function TamperScriptsPanel({
         downloadBlob(text, 'tamper-script-log.txt', 'text/plain')
     }
 
-    function handleCreate() {
-        const name = newName.trim()
-        if (!name) return
-        const existing = scripts.find(s => s.name === name)
-        if (existing) { selectScript(name); setCreatingNew(false); setNewName(''); return }
-        putScript(name, '')
-            .then(() => { refreshList(); selectScript(name); setNewName(''); setCreatingNew(false) })
-            .catch(err => setStatus({ ok: false, msg: err.message }))
-    }
-
     return html`
         <div class="tamper-scripts-view">
-            <div class="tamper-scripts-main">
-                <div class="panel tamper-scripts-list-panel" style=${`width: ${listWidth}px`}>
-                    <div class="panel-header">
-                        Scripts
-                        <span class="badge">${scripts.length}</span>
-                        <button class="btn btn-sm" onclick=${() => { setCreatingNew(v => !v); setNewName('') }}>+ New</button>
-                    </div>
-                    ${creatingNew && html`
-                        <div class="tamper-script-new-row">
-                            <input
-                                class="tamper-script-new-input"
-                                type="text"
-                                placeholder="script name"
-                                value=${newName}
-                                spellcheck="false"
-                                onkeydown=${e => { if (e.key === 'Enter') handleCreate(); if (e.key === 'Escape') setCreatingNew(false) }}
-                                oninput=${e => setNewName(e.target.value)}
-                            />
-                            <button class="btn btn-sm" onclick=${handleCreate}>Create</button>
-                        </div>
-                    `}
-                    <div class="panel-list">
-                        ${scripts.length === 0 && html`<div class="empty">No scripts</div>`}
-                        ${scripts.map(s => html`
-                            <div
-                                key=${s.name}
-                                class=${'list-item tamper-script-row' + (selectedName === s.name ? ' selected' : '')}
-                                onclick=${() => selectScript(s.name)}
-                            >
-                                <span class="tamper-script-name">
-                                    ${running === s.name && html`<span class="tamper-script-running-dot">●</span>`}
-                                    ${s.name}
-                                </span>
-                                <span class="tamper-script-size">${s.size} B</span>
-                            </div>
-                        `)}
-                    </div>
-                </div>
-                <${ResizeHandle} orientation="v" onResize=${handleListResize} />
-                <div class="tamper-scripts-editor-wrap">
-                    ${!selectedName && html`<div class="panel-placeholder">Select or create a script</div>`}
-                    ${selectedName && html`
-                        <div class="tamper-scripts-toolbar">
-                            <span class="tamper-scripts-title">${selectedName}${dirty ? ' *' : ''}</span>
-                            <button class="btn" disabled=${!dirty || saving} onclick=${handleSave}>${saving ? 'Saving…' : 'Save'}</button>
-                            <button class="btn" disabled=${loading} onclick=${handleReload}>Reload</button>
-                            <button class="btn" onclick=${() => handleDelete(selectedName)}>Delete</button>
-                            <span class="tamper-scripts-toolbar-spacer" />
-                            ${running === selectedName
-                                ? html`<button class="btn" onclick=${onStop}>■ Stop</button>`
-                                : html`<button class="btn" disabled=${!connected} onclick=${() => onRun(selectedName, source)}>▶ Run</button>`}
-                        </div>
-                        <${ScriptEditor}
-                            value=${source}
-                            onChange=${setSource}
-                            loadVersion=${loadVersion}
-                            readOnly=${loading}
-                        />
-                    `}
-                    ${status && html`<div class=${'tamper-scripts-status ' + (status.ok ? 'extract-status-ok' : 'extract-status-err')}>${status.msg}</div>`}
-                </div>
-            </div>
+            <${ScriptsCrudPanel}
+                className="tamper-scripts-main"
+                list=${listScripts} get=${getScript} put=${putScript} del=${deleteScript}
+                completions=${COMPLETIONS}
+                refreshSignal=${refreshSignal}
+                listWidthKey="scriptsListWidth"
+                rowDecoration=${name => running === name && html`<span class="tamper-script-running-dot">●</span>`}
+                controls=${(name, source) => running === name
+                    ? html`<button class="btn" onclick=${onStop}>■ Stop</button>`
+                    : html`<button class="btn" disabled=${!connected} onclick=${() => onRun(name, source)}>▶ Run</button>`}
+            />
             <${ResizeHandle} orientation="h" onResize=${handleLogResize} />
             <div class="tamper-scripts-log" style=${`height: ${logHeight}px`}>
                 <div class="panel-header">

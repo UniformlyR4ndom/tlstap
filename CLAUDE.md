@@ -334,6 +334,19 @@ sizable, fairly self-contained document that mirrors the API rather than definin
 - Package name in `proxy/` is `proxy`, matching the directory name. Import as `"tlstap/proxy"`.
 - `bufSize = 1<<16` (64 KB) — single shared read buffer per direction per connection.
 - `drainTimeoutMs = 10` microseconds (not milliseconds despite the name).
+- **Graceful shutdown** (`cli.StartWithCli`, `proxy.Proxy`): `SIGINT`/`SIGTERM` trigger a
+  bounded sequence — stop every proxy's listener (`Proxy.Stop()`) and start the API
+  server's `http.Server.Shutdown()` together, wait (bounded, `drainTimeout`/
+  `apiShutdownTimeout`) for in-flight connections/requests to drain, *then* call every
+  interceptor's `Finalize()` (`Proxy.Finalize()`, concurrently, bounded by
+  `finalizeTimeout`) — draining before finalizing is what stops `Finalize()` (e.g.
+  `dbdump` closing its DB) from racing a still-in-flight `Intercept()`/REST call against
+  the same interceptor instance. A second signal at any point forces an immediate
+  `os.Exit(1)`. `Proxy.InterceptorsAll` plus each `Mux` handler's own `InterceptorAll`
+  are already the complete, de-duplicated set of every interceptor instance built for
+  that proxy — no separate registry needed. Known accepted gap: hijacked WebSocket
+  connections (`tamper`/`dbdump`'s control/watch/segments sockets) aren't drained by
+  `http.Server.Shutdown()` (documented Go behavior) — simply abandoned at exit.
 
 ## Web Frontend (`web/`)
 
@@ -374,10 +387,25 @@ Known gaps and deferred work, collected here so they aren't rediscovered from sc
   zero resulting frames (stale `frame_progress`, or a script that legitimately finds
   nothing for that stream) renders silently blank in `TrafficView.js`, indistinguishable
   from "still loading." Low-risk, small; do it if asked, not proactively.
-- **No in-app framer-script editor.** dbdump's framer scripts have no create/edit/delete
-  UI in the browser yet (deferred, to eventually reuse `TamperScriptsPanel.js`'s generic
-  parts) — scripts must be added via `curl`/`tapctl` against dbdump's `/scripts`
-  endpoints for now.
+- **Framer return protocol could avoid enumerating `{offset, length}` per frame.** A
+  script currently returns a `frames` array explicitly, one entry per frame, each call.
+  An alternative: the script just reports "the current frame ends at position N" (an
+  incremental watermark), and the platform derives each frame's `[start, end)` from
+  successive watermarks itself — fewer round-tripped fields per frame, closer to the
+  "pure function over bytes" framer already aims for. A genuine protocol redesign, not a
+  drive-by fix — needs its own scoping pass before starting.
+- **`isWindowFull` (`web/byteBufferCore.js`) can't tell a backward-opened huge frame is
+  still incomplete.** It only checks the *end* boundary (`loadedEnd >= segment.offset +
+  segment.length`); a window opened while scrolling backward into a huge frame has
+  `loadedEnd` pinned to the segment's true end from its very first partial load (see
+  `initialWindowRange`'s backward case in `web/CLAUDE.md`'s "Byte-budgeted segment
+  buffer"), so it reads as "full" immediately even while its front is still unloaded.
+  Practical effect: `extendResumeWindow` for backward is unreachable once that window's
+  boundary is revisited, so scrolling further up into a huge frame silently stops growing
+  its loaded range instead of continuing to load its front. Needs a real
+  backward-completeness check (e.g. tracking `loadedStart <= segment.offset` separately)
+  plus a test exercising backward extension of an oversized segment across multiple
+  quanta, which nothing currently does.
 
 ## Dependencies
 

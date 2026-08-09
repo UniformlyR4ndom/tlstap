@@ -967,6 +967,40 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/i/dbdump/frames/clear:
+    post:
+      tags: [framer]
+      summary: Enforce "at most one framing view per stream"
+      description: |
+        Deletes every persisted `frames`/`frame_progress` row for the given
+        stream (both directions) whose `(script, script_version)` isn't the
+        one given here. Meant to be called before *every* framing run (not
+        just on a script edit/delete, unlike the automatic cleanup a script
+        `PUT`/`DELETE` triggers — see `intercept/dbdump/CLAUDE.md`'s
+        `purgeOtherFrameVersions`), so a stream can never end up with more
+        than one script's — or one script version's — frame data at once,
+        regardless of how the previous run's script changed (a different
+        script picked, a new version of the same script, or even a script
+        file edited directly on disk, invisible to the `PUT`-triggered
+        cleanup). A request whose `(script, script_version)` matches what's
+        already stored for this stream is a no-op — that data is left intact
+        so the caller can resume framing from its existing progress instead
+        of reprocessing from scratch.
+      operationId: clearStreamFrames
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FrameTimelineKey'
+      responses:
+        '204':
+          description: Cleared (or already only this (script, script_version) was present)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/i/tamper/control:
     get:
       tags: [tamper]

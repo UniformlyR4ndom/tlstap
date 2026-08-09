@@ -148,21 +148,36 @@ fillBackward(handle, entity, { beforeStid, resumeWindow?, maxBytes, maxSegments 
   → { windows: SegmentWindow[], reachedEnd }
 ```
 
-- `afterStid` / `beforeStid`: stid boundary to open *new* segments beyond (exclusive).
-  Deliberately two distinctly-named functions/fields rather than one taking a
-  `direction: 'forward'|'backward'` parameter — a generic `direction` field would collide
-  with `Segment.direction` (client→server vs. server→client), an unrelated axis already
-  using that name throughout this same protocol. Keeping `fillForward`/`fillBackward` (and,
-  on the wire, `afterStid`/`beforeStid`) separate avoids the name meaning two different
-  things depending on which object it's read off.
-- `resumeWindow` (optional): the buffer's current edge `SegmentWindow`, when it isn't yet
-  fully loaded (a still-growing huge frame). Its `.segment` already carries
+- `afterStid` / `beforeStid`: stid boundary to open *new* segments beyond. Exclusive when
+  `resumeWindow` is absent (a genuinely fresh boundary with nothing loaded there yet); an
+  adapter that supports tied-stid groups (frame mode) treats it as *inclusive* whenever
+  `resumeWindow` is present, so it can requery a stid it has already partly consumed — see
+  `resumeWindow` below for why. Deliberately two distinctly-named functions/fields rather
+  than one taking a `direction: 'forward'|'backward'` parameter — a generic `direction`
+  field would collide with `Segment.direction` (client→server vs. server→client), an
+  unrelated axis already using that name throughout this same protocol. Keeping
+  `fillForward`/`fillBackward` (and, on the wire, `afterStid`/`beforeStid`) separate avoids
+  the name meaning two different things depending on which object it's read off.
+- `resumeWindow` (optional): the buffer's current edge `SegmentWindow` — passed **whether
+  or not it's fully loaded**, not just while still growing. Its `.segment` already carries
   `offset`/`length`/`direction` — no re-lookup needed; always `resumeWindow.segment.stid
-  === afterStid`/`beforeStid` (same edge, not a conflict). The adapter extends it (fetching
-  more from `resumeWindow.loadedEnd` forward, or before `loadedStart` backward) and
-  returns the same window with `bytes`/`loadedEnd`(or `loadedStart`) extended, as the
-  first entry of `windows` — the adapter already has both old and new bytes in hand, so it
-  does the concatenation; the hook just replaces the old buffer entry with the returned one.
+  === afterStid`/`beforeStid` (same edge, not a conflict). While not yet fully loaded (a
+  still-growing huge frame), the adapter extends it (fetching more from
+  `resumeWindow.loadedEnd` forward, or before `loadedStart` backward) and returns the same
+  window with `bytes`/`loadedEnd` (or `loadedStart`) extended, as the first entry of
+  `windows` — the adapter already has both old and new bytes in hand, so it does the
+  concatenation; the hook just replaces the old buffer entry with the returned one (matched
+  by `stid`+`id`, not merely "a resumeWindow was passed" — see below). Once fully loaded,
+  `resumeWindow` is still handed to the adapter on the next call (not nulled) precisely so
+  a tied-stid-aware adapter can requery its own stid inclusively instead of skipping past a
+  sibling segment left over there (see "Known gaps fixed after the fact" below) — a plain
+  adapter (chunk mode) is free to ignore it once `isWindowFull` is true, same as before.
+- `excludeIds` (present whenever `resumeWindow` is): every segment id already consumed at
+  exactly the boundary stid so far — not just `resumeWindow`'s own id, since a tied group
+  can have more than two members and each round resolves only one more of them. Computed
+  by the hook straight from the buffer's own contents (`idsAtStid`, `byteBufferCore.js`), so
+  an adapter requerying inclusively never needs to remember anything across calls itself. A
+  plain adapter (chunk mode) ignores this too.
 - `maxBytes`/`maxSegments`: this call's own budget (the quantum, not the whole fill
   target). Every newly-opened segment is loaded in full except possibly the last one
   returned, truncated if it alone would exceed `maxBytes` — that truncated entry becomes
@@ -203,6 +218,12 @@ protocol note below on truncation applying to chunks too, not just frames).
 - `resumeWindow` for frame mode is the real case this whole rework exists for: extending
   a still-partially-loaded giant frame by one more `/segments`-backed byte range each
   round.
+- Once `resumeWindow`'s own segment finishes loading, `fillForward`/`fillBackward` requery
+  `/frames/timeline` **inclusive** of its stid (not the usual "+1"/exclusive cursor) and
+  filter out exactly that one already-loaded `(stid, id)` from the result — this is what
+  lets a tied-stid sibling (a second, smaller frame completing on the same raw chunk as a
+  first, oversized one) still be found instead of silently skipped; see "Known gaps fixed
+  after the fact" below.
 
 ## Hook contract
 
@@ -311,6 +332,52 @@ without touching the working raw-chunk path first:
 5. Delete the old path (`useChunkBuffer.js`'s internals or the whole file depending on
    step 4's outcome, `frameFetchPage`/`frameBuildRows`/`frameGetId`, `sliceFrameBytes`)
    once nothing references it.
+
+## Known gaps fixed after the fact
+
+- **Frame mode could permanently drop a tied-stid sibling frame (2026-08-08).** Two frames
+  completing on the same raw chunk share a `stid` (routine, not an edge case — e.g. two
+  length-prefixed messages both arriving in one read). When the first of them was large
+  enough to need `resumeWindow`-based incremental loading, `selectByBudget` (correctly)
+  deferred its sibling rather than truncating it — but once the oversized frame finished
+  loading, `fillToTarget` nulled out `resumeWindow` and advanced the boundary to
+  `edge.segment.stid`, and the next metadata query was *exclusive* of that stid. The
+  sibling — real, already-listed metadata that was simply never consumed — was then
+  permanently unreachable: that stid is never revisited once passed. Symptom: a stream
+  whose framer produced N frames only ever showed N-1 in the UI, always missing the last
+  one in each affected direction.
+  Fix: `fillToTarget` now always passes the current edge as `resumeWindow`, fully loaded or
+  not (`byteBufferCore.js`); a tied-stid-aware adapter (`frameSegments.js`) requeries
+  inclusively of an already-loaded `resumeWindow`'s stid to let an unconsumed sibling
+  surface on the very next round instead of being skipped. `computeReachedEnd`
+  (`frameSegmentsCore.js`) gained an explicit `rawCount` parameter so that filtering
+  doesn't get misread as the server having no more data. `selectByBudget` itself is
+  unchanged.
+
+  **First attempt regressed into an infinite duplicate/oscillation loop** (caught live,
+  same day, restarting after the fix above): filtering only `resumeWindow`'s own single
+  `(stid, id)` forgets every *other* sibling already consumed earlier at that same stid
+  once the boundary moves on to consume the next one — the requery then finds the
+  earlier-consumed sibling again, "new", and re-adds it, while the *previous* round's
+  sibling becomes the thing forgotten this time, oscillating between them forever (or
+  until the fill target/segment cap cuts it off, by which point the buffer is full of
+  duplicates of the same one or two frames). Symptom: one raw-chunk's worth of content
+  appearing to repeat endlessly in one direction's frame view.
+  Fix: track *every* id already consumed at the current boundary stid, not just the most
+  recent one — `byteBufferCore.js`'s `idsAtStid(windows, dir, boundary)` derives the full
+  set directly from the buffer's own contents (a tied group is always contiguous at
+  whichever end is being extended, so this is a short scan, not a full pass) and threads
+  it through `fillToTarget`'s `req.excludeIds`; `frameSegmentsCore.js`'s
+  `excludeAlreadyLoaded(frames, stid, excludeIds)` (the pure filter, now testable and
+  tested directly) replaces the single-id version in `frameSegments.js`.
+
+  Regression coverage: `byteBufferCore.test.js`'s "keeps passing the completed edge as
+  resumeWindow..." test, `frameSegmentsCore.test.js`'s `computeReachedEnd` `rawCount`
+  tests, `excludeAlreadyLoaded`/`idsAtStid` unit tests, and (most directly)
+  `frameSegmentsCore.test.js`'s "two tied-stid groups (each oversized-then-small)..."
+  integration test, which wires the real `selectByBudget`/`computeReachedEnd`/
+  `excludeAlreadyLoaded`/`wantRangeFor` into a fake adapter driven by `fillToTarget` and
+  asserts every frame across two multi-member groups loads exactly once.
 
 ## TODO items this resolves
 

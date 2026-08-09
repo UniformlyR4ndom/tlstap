@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 
 	"tlstap/assert"
 	"tlstap/logging"
@@ -29,10 +32,18 @@ type Proxy struct {
 	serverNextProtos []string
 
 	prober Prober
+
+	listener   net.Listener   // set once the accept loop starts; closed by Stop()
+	listenAddr net.TCPAddr    // set alongside listener, reused by Finalize()
+	connWg     sync.WaitGroup // tracks in-flight HandleConnection goroutines, for WaitForConnections
 }
 
-func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) Proxy {
-	proxy := Proxy{
+// NewProxy returns a *Proxy, not a Proxy, since Proxy now embeds a sync.WaitGroup
+// (connWg) — copying it by value after construction is what go vet's copylocks check
+// (rightly) flags, even though the copy itself would only ever happen before connWg is
+// first used.
+func NewProxy(config ResolvedProxyConfig, mode Mode, iUp, iDown, iAll []Interceptor, logger logging.Logger) *Proxy {
+	proxy := &Proxy{
 		Config:           config,
 		Mode:             mode,
 		InterceptorsUp:   iUp,
@@ -161,11 +172,17 @@ func (p *Proxy) startPlainProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	p.listener = listener
+	p.listenAddr = *tcpAddr
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				p.logger.Info("Listener closed, stopping accept loop.")
+				return nil
+			}
 			p.logger.Error("failed to establish connection: %v", err)
 			continue
 		}
@@ -173,7 +190,7 @@ func (p *Proxy) startPlainProxy() error {
 		handler, err := p.newHandler(ModePlain, nil, "")
 		CheckFatal(err)
 
-		go handler.HandleConnection(conn)
+		p.trackConnection(func() { handler.HandleConnection(conn) })
 	}
 }
 
@@ -186,11 +203,17 @@ func (p *Proxy) startTlsProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	p.listener = listener
+	p.listenAddr = *tcpAddr
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				p.logger.Info("Listener closed, stopping accept loop.")
+				return nil
+			}
 			p.logger.Error("failed to establish connection: %v", err)
 			continue
 		}
@@ -224,7 +247,7 @@ func (p *Proxy) startTlsProxy() error {
 		}
 
 		logClientConfigInfo(handler.ConnId, handler.logger, handler.Setting.TlsClientConfig)
-		go handler.HandleConnection(tlsConn)
+		p.trackConnection(func() { handler.HandleConnection(tlsConn) })
 	}
 }
 
@@ -237,11 +260,17 @@ func (p *Proxy) startDetectTlsProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	p.listener = listener
+	p.listenAddr = *tcpAddr
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				p.logger.Info("Listener closed, stopping accept loop.")
+				return nil
+			}
 			p.logger.Error("failed to establish connection: %v", err)
 			continue
 		}
@@ -249,7 +278,7 @@ func (p *Proxy) startDetectTlsProxy() error {
 		handler, err := p.newHandler(ModeDetectTls, nil, "")
 		CheckFatal(err)
 
-		go handler.HandleConnection(conn)
+		p.trackConnection(func() { handler.HandleConnection(conn) })
 	}
 }
 
@@ -268,6 +297,8 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
+	p.listener = listener
+	p.listenAddr = *tcpAddr
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for _, h := range mux.handlers {
@@ -277,6 +308,10 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				p.logger.Info("Listener closed, stopping accept loop.")
+				return nil
+			}
 			p.logger.Error("failed to establish connection: %v", err)
 			continue
 		}
@@ -313,7 +348,7 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 		}
 
 		logClientConfigInfo(handler.ConnId, handler.logger, handler.Setting.TlsClientConfig)
-		go handler.HandleConnection(conn)
+		p.trackConnection(func() { handler.HandleConnection(conn) })
 	}
 }
 
@@ -371,6 +406,68 @@ func notifyInit(interceptors []Interceptor, listenAddress net.TCPAddr) error {
 	}
 
 	return nil
+}
+
+// trackConnection runs fn (a connection handler) in a new goroutine, tracked by connWg so
+// WaitForConnections can observe when every in-flight connection has finished.
+func (p *Proxy) trackConnection(fn func()) {
+	p.connWg.Add(1)
+	go func() {
+		defer p.connWg.Done()
+		fn()
+	}()
+}
+
+// Stop closes the proxy's listener, causing its accept loop to return nil. Safe to call
+// once Start() has set up the listener; a no-op before that.
+func (p *Proxy) Stop() {
+	if p.listener != nil {
+		p.listener.Close()
+	}
+}
+
+// WaitForConnections blocks until every in-flight connection handler has returned, or ctx
+// is done, whichever comes first. Returns true if every connection finished, false on
+// timeout/cancellation — some connections may still be running in that case.
+func (p *Proxy) WaitForConnections(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() {
+		p.connWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Finalize calls Finalize on every interceptor this proxy owns — its own InterceptorsAll,
+// plus every mux handler's own InterceptorAll in ModeMux — exactly once each, concurrently
+// so one slow interceptor doesn't delay its siblings. Only meaningful to call after the
+// accept loop has stopped (or at least after Stop() was called); listenAddr is set once,
+// when the accept loop starts, and never mutated again.
+func (p *Proxy) Finalize() {
+	var wg sync.WaitGroup
+	notifyFinalize(&wg, p.InterceptorsAll, p.listenAddr)
+	if p.Mux != nil {
+		for _, h := range p.Mux.handlers {
+			notifyFinalize(&wg, h.InterceptorAll, p.listenAddr)
+		}
+	}
+	wg.Wait()
+}
+
+func notifyFinalize(wg *sync.WaitGroup, interceptors []Interceptor, listenAddress net.TCPAddr) {
+	for _, i := range interceptors {
+		wg.Add(1)
+		go func(i Interceptor) {
+			defer wg.Done()
+			i.Finalize(listenAddress)
+		}(i)
+	}
 }
 
 func (p *Proxy) getServerConfig(info *tls.ClientHelloInfo) (*tls.Config, error) {

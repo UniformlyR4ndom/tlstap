@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { OPERATIONS } from './numbers.js'
+import { OPERATIONS, decodeNumberValue, encodeNumberValue } from './numbers.js'
 
 // Mirrors (but doesn't import) numbers.js's private NUMBER_TYPES table, so the test data is
 // independent of the implementation it's checking.
@@ -231,3 +231,47 @@ for (const vector of BOUNDARY_VECTORS) {
         }
     }
 }
+
+// decodeNumberValue/encodeNumberValue: the pure number<->bytes core numberDecode/
+// numberEncode above (and framer.number.*/tamper.number.* — see transformWorkerApi.js)
+// build on, deliberately independent of OPERATIONS' decimal-text convention. Own minimal
+// type literals here, not imported from numbers.js, same independence rationale as TYPES
+// above.
+const U16BE = { label: 'UInt16 (big endian)', bytes: 2, signed: false, get: 'getUint16', set: 'setUint16', le: false }
+const I32LE = { label: 'Int32 (little endian)', bytes: 4, signed: true, get: 'getInt32', set: 'setInt32', le: true }
+const U64BE = { label: 'UInt64 (big endian)', bytes: 8, signed: false, get: 'getBigUint64', set: 'setBigUint64', le: false, big: true }
+
+test('decodeNumberValue/encodeNumberValue round-trip a plain number', () => {
+    const bytes = encodeNumberValue(256, U16BE)
+    assert.deepEqual([...bytes], [0x01, 0x00])
+    assert.equal(decodeNumberValue(bytes, U16BE), 256)
+})
+
+test('decodeNumberValue/encodeNumberValue round-trip a negative number', () => {
+    const bytes = encodeNumberValue(-1, I32LE)
+    assert.deepEqual([...bytes], [0xff, 0xff, 0xff, 0xff])
+    assert.equal(decodeNumberValue(bytes, I32LE), -1)
+})
+
+test('decodeNumberValue/encodeNumberValue round-trip a BigInt for a 64-bit type', () => {
+    const bytes = encodeNumberValue(123456789012345n, U64BE)
+    assert.equal(decodeNumberValue(bytes, U64BE), 123456789012345n)
+})
+
+test('decodeNumberValue rejects the wrong byte length', () => {
+    assert.throws(() => decodeNumberValue(new Uint8Array(1), U16BE))
+    assert.throws(() => decodeNumberValue(new Uint8Array(3), U16BE))
+})
+
+test('encodeNumberValue rejects an out-of-range value', () => {
+    assert.throws(() => encodeNumberValue(65536, U16BE))
+    assert.throws(() => encodeNumberValue(-1, U16BE))
+})
+
+test('encodeNumberValue rejects a plain number for a 64-bit (BigInt) type', () => {
+    assert.throws(() => encodeNumberValue(1, U64BE))
+})
+
+test('encodeNumberValue rejects a BigInt for a non-64-bit type', () => {
+    assert.throws(() => encodeNumberValue(1n, U16BE))
+})

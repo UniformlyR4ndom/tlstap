@@ -16,18 +16,11 @@ const CONTENT_TYPES = {
     24: 'heartbeat',
 }
 
-function bytesToBase64(bytes) {
-    return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''))
-}
-
-function base64ToBytes(b64) {
-    return Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-}
-
 function frame(state, chunk) {
     // `state.carry` holds whatever tail bytes didn't yet form a complete record last
-    // time (undefined on the very first call for this direction).
-    const carry = state && state.carry ? base64ToBytes(state.carry) : new Uint8Array(0)
+    // time (undefined on the very first call for this direction) — a plain Uint8Array;
+    // dbdumpFramerApi.js base64-encodes it only when state actually crosses the wire.
+    const carry = state && state.carry ? state.carry : new Uint8Array(0)
 
     const buf = new Uint8Array(carry.length + chunk.data.length)
     buf.set(carry, 0)
@@ -43,10 +36,11 @@ function frame(state, chunk) {
         const type    = buf[pos]
         const verMaj  = buf[pos + 1]
         const verMin  = buf[pos + 2]
-        const length  = (buf[pos + 3] << 8) | buf[pos + 4]
+        const length  = framer.number.decodeU16be(buf.subarray(pos + 3, pos + 5))
 
         if (length > MAX_FRAGMENT_LENGTH) {
-            throw new Error(`implausible TLS record length ${length} at offset ${bufBaseOffset + pos} — probably misaligned, not a real record boundary`)
+            const headerHex = framer.encode.hex(buf.subarray(pos, pos + HEADER_LEN))
+            throw new Error(`implausible TLS record length ${length} (header bytes ${headerHex}) at offset ${bufBaseOffset + pos} — probably misaligned, not a real record boundary`)
         }
         if (buf.length - pos < HEADER_LEN + length) break // record not fully arrived yet
 
@@ -65,6 +59,8 @@ function frame(state, chunk) {
 
     return {
         frames,
-        state: { carry: bytesToBase64(buf.subarray(pos)) },
+        // .slice(), not .subarray(): a view would keep the whole (possibly much larger)
+        // accumulated buf alive in memory for as long as this carry is held.
+        state: { carry: buf.slice(pos) },
     }
 }

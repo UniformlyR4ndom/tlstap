@@ -125,6 +125,13 @@ export function fmtByteSize(n) {
     return `${(n / 1048576).toFixed(1)} MB`
 }
 
+// Formats a byte count with thousands separators, e.g. "2,733B". Negative n (e.g. a
+// not-yet-known total) formats as '?'.
+export function fmtByteCount(n) {
+    if (n < 0) return '?'
+    return `${n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')} B`
+}
+
 // Formats start→end (ms epoch) as e.g. "12.34s". If end is falsy, measures against
 // Date.now() and appends " (ongoing)".
 export function fmtDuration(start, end) {
@@ -140,4 +147,15 @@ export function fmtDuration(start, end) {
 export function fmtRelTime(ms, base) {
     const d = ms - base
     return `+${Math.floor(d / 1000)}.${String(d % 1000).padStart(3, '0')}s`
+}
+
+// Stringifies a script's log(...) arguments (tamper.log/ctx.log, framer.log) into one
+// display line — arguments arrive over postMessage structured clone, so they can be
+// arbitrary values, not just strings.
+export function fmtLogArgs(args) {
+    return args.map(a => {
+        if (typeof a === 'string') return a
+        if (a instanceof Uint8Array) return `Uint8Array(${a.length})`
+        try { return JSON.stringify(a) } catch { return String(a) }
+    }).join(' ')
 }

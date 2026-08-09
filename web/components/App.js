@@ -6,10 +6,12 @@ import StreamList from './StreamList.js'
 import TrafficView from './TrafficView.js'
 import CombinedView from './CombinedView.js'
 import GoToPanel from './GoToPanel.js'
+import MarkersPanel from './MarkersPanel.js'
 import SearchPanel from './SearchPanel.js'
 import ExtractPanel from './ExtractPanel.js'
 import TransformPanel from './TransformPanel.js'
 import TamperView from './TamperView.js'
+import FramingPanel from './FramingPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
 import { useResizableLayout } from '../useResizableLayout.js'
@@ -22,6 +24,7 @@ import { DIRNUM_C2S } from '../direction.js'
 const html = htm.bind(h)
 
 const POLL_INTERVAL_MS = 500
+const FRAME_LOG_LIMIT = 500
 
 function posKey(s) { return `${s.session}:${s.id}` }
 
@@ -34,9 +37,12 @@ export default function App() {
     const [refreshKey,   setRefreshKey]   = useState(0)
     const [openMenu,     setOpenMenu]     = useState(null)
     const [globalOffset, setGlobalOffset] = useState(true)
+    const [sizeFormat,   setSizeFormat]   = useState('size')  // 'size' | 'count', chunk header banner
+    const [pinHeader,    setPinHeader]    = useState(true)    // pin a scrolled-past chunk header to the top
     const [rememberPosition, setRememberPosition] = useState(false)
     const [viewMode,     setViewMode]     = useState('single')
-    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'search' | 'extract' | 'transform'
+    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'markers' | 'search' | 'extract' | 'transform' | 'framing'
+    const [frameLog,     setFrameLog]     = useState([])  // [{direction, text, level}], scoped to the current stream — see handleFramerLogReset
     const [jumpTo,       setJumpTo]       = useState(null)
     const [markers,      setMarkers]      = useState(() => loadMarkers())
     const [extractDir,   setExtractDir]   = useState(String(DIRNUM_C2S))
@@ -49,9 +55,10 @@ export default function App() {
     const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
     const pendingJumpRef = useRef(null)  // { stream: id, direction, offset } waiting for StreamList load
+    const autoSelectFirstRef = useRef(false)  // set on session select, consumed by the next StreamList load
     const positionsRef       = useRef(new Map())  // posKey(stream) -> { direction, offset }, in-memory only
     const rememberPositionRef = useRef(rememberPosition)
-    const viewJumpRef    = useRef({ jumpToTop: () => {}, jumpToBottom: () => {} })  // whichever of TrafficView/CombinedView is mounted registers here
+    const viewJumpRef    = useRef({ jumpToTop: () => {}, jumpToBottom: () => {} })  // whichever of TrafficView/CombinedView is mounted registers here — jumpToNextSegment/jumpToPrevSegment (TrafficView.js only) are called via optional chaining below, since CombinedView.js's registration doesn't provide them
 
     useEffect(() => { saveMarkers(markers) }, [markers])
     useEffect(() => { rememberPositionRef.current = rememberPosition }, [rememberPosition])
@@ -115,6 +122,15 @@ export default function App() {
     }
     function handleGoTo(args) { setJumpTo(prev => ({ ...args, version: (prev?.version ?? 0) + 1 })) }
 
+    // frameLog is scoped to whichever stream is currently selected — TrafficView.js's own
+    // stream-switch reset effect calls onFramerLogReset, since that's also where
+    // frameState/frameScriptRunning reset (a framer run has no continuity across a
+    // stream switch, unlike tamper's single proxy-wide running script).
+    function handleFramerLog(direction, text, level) {
+        setFrameLog(log => [...log, { direction, text, level }].slice(-FRAME_LOG_LIMIT))
+    }
+    function handleFramerLogReset() { setFrameLog([]) }
+
     function jumpToOffset(streamObj, direction, offset, align) {
         if (stream?.id !== streamObj.id) setStream(streamObj)
         const unit = direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
@@ -176,6 +192,7 @@ export default function App() {
 
     function selectSession(s) {
         pendingJumpRef.current = null
+        autoSelectFirstRef.current = true
         setSession(s)
         setStream(null)
     }
@@ -183,13 +200,20 @@ export default function App() {
     function handleStreamLoad(ss) {
         setStreamList(ss)
         const pending = pendingJumpRef.current
-        if (!pending) return
-        const target = ss.find(s => s.id === pending.streamId)
-        if (!target) return
-        pendingJumpRef.current = null
-        const unit = pending.direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
-        setStream(target)
-        setJumpTo(prev => ({ value: pending.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
+        if (pending) {
+            const target = ss.find(s => s.id === pending.streamId)
+            if (!target) return
+            pendingJumpRef.current = null
+            autoSelectFirstRef.current = false
+            const unit = pending.direction === DIRNUM_C2S ? 'offset-c2s' : 'offset-s2c'
+            setStream(target)
+            setJumpTo(prev => ({ value: pending.offset, unit, align: 'top', version: (prev?.version ?? 0) + 1 }))
+            return
+        }
+        if (autoSelectFirstRef.current) {
+            autoSelectFirstRef.current = false
+            if (ss.length > 0) setStream(ss[0])
+        }
     }
 
     return html`
@@ -201,6 +225,18 @@ export default function App() {
                 </button>
                 <button class="btn btn-icon" onclick=${() => viewJumpRef.current.jumpToBottom()} title="Jump to bottom">
                     <svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="17" width="14" height="2" rx="1" /><polygon points="12,15 17,9 14,9 14,4 10,4 10,9 7,9" /></svg>
+                </button>
+                <button
+                    class="btn btn-icon" disabled=${viewMode !== 'single'}
+                    onclick=${() => viewJumpRef.current.jumpToPrevSegment?.()} title="Jump to previous segment"
+                >
+                    <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="12,7 18,15 6,15" /></svg>
+                </button>
+                <button
+                    class="btn btn-icon" disabled=${viewMode !== 'single'}
+                    onclick=${() => viewJumpRef.current.jumpToNextSegment?.()} title="Jump to next segment"
+                >
+                    <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="12,17 6,9 18,9" /></svg>
                 </button>
                 <button class="btn btn-refresh" onclick=${() => setRefreshKey(k => k + 1)} title="Refresh">↺</button>
             </header>
@@ -227,6 +263,20 @@ export default function App() {
                             <div class="menu-item" onclick=${() => { setViewMode('combined'); setOpenMenu(null) }}>
                                 <span class="menu-check">${viewMode === 'combined' ? '✓' : ''}</span>
                                 Combined streams
+                            </div>
+                            <div class="menu-sep" />
+                            <div class="menu-item" onclick=${() => { setSizeFormat('size');  setOpenMenu(null) }}>
+                                <span class="menu-check">${sizeFormat === 'size'  ? '✓' : ''}</span>
+                                Size (e.g. 2.7 KB)
+                            </div>
+                            <div class="menu-item" onclick=${() => { setSizeFormat('count'); setOpenMenu(null) }}>
+                                <span class="menu-check">${sizeFormat === 'count' ? '✓' : ''}</span>
+                                Byte count (e.g. 2,733 B)
+                            </div>
+                            <div class="menu-sep" />
+                            <div class="menu-item" onclick=${() => { setPinHeader(v => !v); setOpenMenu(null) }}>
+                                <span class="menu-check">${pinHeader ? '✓' : ''}</span>
+                                Pin header when scrolled past
                             </div>
                             <div class="menu-sep" />
                             <div class="menu-item" onclick=${() => { setRememberPosition(v => !v); setOpenMenu(null) }}>
@@ -271,25 +321,26 @@ export default function App() {
                 <${ResizeHandle} orientation="v" onResize=${handleSidebarResize} />
                 <main class="main">
                     ${viewMode === 'combined'
-                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} refreshKey=${refreshKey} latestSgid=${latest.latest_sgid} jumpRef=${viewJumpRef} />`
+                        ? html`<${CombinedView} session=${session} globalOffset=${globalOffset} sizeFormat=${sizeFormat} pinHeader=${pinHeader} refreshKey=${refreshKey} latestSgid=${latest.latest_sgid} jumpRef=${viewJumpRef} />`
                         : html`<${TrafficView}
                             stream=${stream}
                             jumpRef=${viewJumpRef}
                             globalOffset=${globalOffset}
+                            sizeFormat=${sizeFormat}
+                            pinHeader=${pinHeader}
                             jumpTo=${jumpTo}
                             refreshKey=${refreshKey}
                             latestStid=${latest.latest_stid}
                             markers=${markers}
                             onAddMarker=${addMarker}
                             onRemoveMarker=${removeMarker}
-                            onUpdateMarkerLabel=${updateMarkerLabel}
-                            onMarkerJumpRequest=${handleMarkerJumpRequest}
-                            onImportMarkers=${setMarkers}
                             onSetExtractStart=${handleSetExtractStart}
                             onSetExtractEnd=${handleSetExtractEnd}
                             onSetExtractRange=${handleSetExtractRange}
                             onLeaveStream=${handleLeaveStream}
                             framerScripts=${framerScripts}
+                            onFramerLog=${handleFramerLog}
+                            onFramerLogReset=${handleFramerLogReset}
                           />`
                     }
                 </main>
@@ -298,14 +349,24 @@ export default function App() {
                 ${bottomTab && html`<${ResizeHandle} orientation="h" onResize=${handleBottomResize} />`}
                 <div class="bottom-tabs">
                     <div class=${'bottom-tab' + (bottomTab === 'goto'    ? ' active' : '')} onclick=${() => selectBottomTab('goto')}>Goto</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'markers' ? ' active' : '')} onclick=${() => selectBottomTab('markers')}>Markers</div>
                     <div class=${'bottom-tab' + (bottomTab === 'search'  ? ' active' : '')} onclick=${() => selectBottomTab('search')}>Search</div>
                     <div class=${'bottom-tab' + (bottomTab === 'extract'   ? ' active' : '')} onclick=${() => selectBottomTab('extract')}>Extract</div>
                     <div class=${'bottom-tab' + (bottomTab === 'transform' ? ' active' : '')} onclick=${() => selectBottomTab('transform')}>Transform</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'framing'  ? ' active' : '')} onclick=${() => selectBottomTab('framing')}>Framing</div>
                     ${bottomTab && html`<div class="bottom-collapse" onclick=${() => setBottomTab(null)} title="Collapse">▼</div>`}
                 </div>
                 ${bottomTab && html`
                     <div class="bottom-content" style=${`height: ${bottomHeight}px`}>
                         ${bottomTab === 'goto'    && html`<${GoToPanel}     stream=${stream}   onGoTo=${handleGoTo} />`}
+                        ${bottomTab === 'markers' && html`<${MarkersPanel}
+                            session=${session}
+                            markers=${markers}
+                            onRemove=${removeMarker}
+                            onUpdateLabel=${updateMarkerLabel}
+                            onJump=${handleMarkerJumpRequest}
+                            onImport=${setMarkers}
+                        />`}
                         ${bottomTab === 'search'  && html`<${SearchPanel}   session=${session} stream=${stream} onJump=${handleSearchJump} />`}
                         ${bottomTab === 'extract' && html`<${ExtractPanel}
                             session=${session}
@@ -318,6 +379,7 @@ export default function App() {
                             onToChange=${setExtractTo}
                         />`}
                         ${bottomTab === 'transform' && html`<${TransformPanel} />`}
+                        ${bottomTab === 'framing' && html`<${FramingPanel} refreshSignal=${refreshKey} frameLog=${frameLog} onClearFrameLog=${handleFramerLogReset} />`}
                     </div>`}
             </div>
             `}

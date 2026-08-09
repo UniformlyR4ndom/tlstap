@@ -15,8 +15,8 @@
 //
 // Only one script instance runs at a time — start() tears down any previous worker first.
 
-import { OPERATIONS_BY_CATEGORY } from './transforms.js'
 import { DIRNUM_C2S, DIRNUM_S2C } from './direction.js'
+import { buildTransformApiSource, buildNumberApiSource, HEX_DEFAULTS, BASE64_DEFAULTS } from './transformWorkerApi.js'
 
 // Absolute URLs, so BOOTSTRAP's dynamic import() can resolve their own relative imports
 // (transforms/*, vendor/*) from inside a Blob-URL worker, where a relative specifier
@@ -24,39 +24,21 @@ import { DIRNUM_C2S, DIRNUM_S2C } from './direction.js'
 const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
 const FORMAT_URL = new URL('./format.js', import.meta.url).href
 
-// Maps an op id that can't camelCase into a valid identifier (leads with a digit, e.g.
-// `3des-encrypt`) or that collides with its own inverse (`xor-encrypt`/`xor-decrypt` is a
-// self-inverse repeating-key XOR) to the name actually exposed on tamper.transform.<category>.
-const TRANSFORM_NAME_OVERRIDES = {
-    '3des-encrypt': 'tripleDesEncrypt',
-    '3des-decrypt': 'tripleDesDecrypt',
-    'xor-encrypt': 'xorCrypt',
-    'xor-decrypt': 'xorCrypt',
-}
+// tamper.transform.<category>'s function bodies are Promise-wrapped (callTransform, itself
+// gated by whenReady) since they must be callable before the module import below resolves.
+const TAMPER_TRANSFORM_API_SOURCE = buildTransformApiSource(
+    opId => `(bytes, params) => callTransform(${JSON.stringify(opId)}, bytes, params)`,
+)
 
-// Exported so its output can be mirrored by an autocomplete shape elsewhere.
-export function camelCaseOpId(opId) {
-    return TRANSFORM_NAME_OVERRIDES[opId] ?? opId.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase())
-}
-
-// Built once (the op catalog is static for the page's lifetime) and spliced directly into
-// BOOTSTRAP; the actual OPERATIONS values are looked up inside the Worker itself. A
-// camelCase collision keeps the first op id and skips the rest — safe since a collision
-// only happens between op ids whose run() is the same function.
-function buildTransformApiSource() {
-    const categories = Object.entries(OPERATIONS_BY_CATEGORY).map(([category, ops]) => {
-        const seenNames = new Set()
-        const fns = []
-        for (const opId of Object.keys(ops)) {
-            const fnName = camelCaseOpId(opId)
-            if (seenNames.has(fnName)) continue
-            seenNames.add(fnName)
-            fns.push(`${fnName}: (bytes, params) => callTransform(${JSON.stringify(opId)}, bytes, params)`)
-        }
-        return `${category}: { ${fns.join(', ')} }`
-    })
-    return `{ ${categories.join(', ')} }`
-}
+// tamper.number.decode<Type>/encode<Type> — real numbers/bigints, not decimal text;
+// Promise-wrapped via whenReady like transform.* above, for the same reason. Each type's
+// own shape is inlined so no runtime lookup back into NUMBER_TYPES is needed.
+const TAMPER_NUMBER_API_SOURCE = buildNumberApiSource((type, kind) => {
+    const typeJson = JSON.stringify(type)
+    return kind === 'decode'
+        ? `(bytes) => whenReady(() => decodeNumberValue(bytes, ${typeJson}))`
+        : `(value) => whenReady(() => encodeNumberValue(value, ${typeJson}))`
+})
 
 const BOOTSTRAP = `
 (function () {
@@ -71,6 +53,8 @@ const BOOTSTRAP = `
     // level) falls back to a Promise via whenReady().
     let OPERATIONS = null
     let FORMAT = null
+    let decodeNumberValue = null
+    let encodeNumberValue = null
     let ready = false
     let resolveReady
     const readyPromise = new Promise(r => { resolveReady = r })
@@ -83,10 +67,8 @@ const BOOTSTRAP = `
         return whenReady(() => OPERATIONS[opId].run(bytes, params))
     }
 
-    // Defaults for the no-params case: plain contiguous hex/base64, matching how a digest
-    // is normally printed.
-    const HEX_DEFAULTS = { prefix: '', separator: '' }
-    const BASE64_DEFAULTS = { urlSafe: false }
+    const HEX_DEFAULTS = ${JSON.stringify(HEX_DEFAULTS)}
+    const BASE64_DEFAULTS = ${JSON.stringify(BASE64_DEFAULTS)}
 
     function makeEncoder(opId, defaults) {
         return (bytes, params) => whenReady(() => new TextDecoder().decode(OPERATIONS[opId].run(bytes, { ...defaults, ...params })))
@@ -217,7 +199,7 @@ const BOOTSTRAP = `
         setIntercept: raw.setIntercept,
         listStreams: raw.listStreams,
         fs,
-        transform: ${buildTransformApiSource()},
+        transform: ${TAMPER_TRANSFORM_API_SOURCE},
         encode: {
             hex: callEncodeHex,
             base64: callEncodeBase64,
@@ -228,6 +210,7 @@ const BOOTSTRAP = `
             base64: callDecodeBase64,
             hexdump: callDecodeHexdump,
         },
+        number: ${TAMPER_NUMBER_API_SOURCE},
         log(...args) { postMessage({ kind: 'log', args }) },
     }
 
@@ -307,6 +290,8 @@ const BOOTSTRAP = `
             await transformsMod.warmupWhirlpool()
             OPERATIONS = transformsMod.OPERATIONS
             FORMAT = formatMod
+            decodeNumberValue = transformsMod.decodeNumberValue
+            encodeNumberValue = transformsMod.encodeNumberValue
             ready = true
             resolveReady()
             for (const conn of queues.keys()) pump(conn)

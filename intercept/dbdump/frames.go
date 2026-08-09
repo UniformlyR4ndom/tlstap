@@ -360,6 +360,38 @@ func (i *DbDumpInterceptor) purgeAllFrameVersions(script string) error {
 	return tx.Commit()
 }
 
+// clearStreamFrames enforces "at most one framing view per stream": deletes every
+// persisted frame/progress row for keep's (session, stream) whose (script,
+// script_version) isn't keep's own, across every direction. Unlike
+// purgeOtherFrameVersions/purgeAllFrameVersions above (which purge one script by name,
+// globally, only reachable from a script PUT/DELETE — so never triggered by a script
+// edited directly on disk under scripts-dir, bypassing the REST API), this is meant to
+// be called on every framing run, keyed by whatever's about to run — a rerun of the same
+// (script, script_version) already active for this stream is then a no-op (its
+// frame_progress survives, so catchUpFramer resumes instead of reprocessing); switching
+// to any other script or a new version purges the old one first.
+func (i *DbDumpInterceptor) clearStreamFrames(keep frameTimelineKey) error {
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`DELETE FROM frames WHERE session = ? AND stream = ? AND NOT (script = ? AND script_version = ?)`,
+		keep.Session, keep.Stream, keep.Script, keep.ScriptVersion,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM frame_progress WHERE session = ? AND stream = ? AND NOT (script = ? AND script_version = ?)`,
+		keep.Session, keep.Stream, keep.Script, keep.ScriptVersion,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ── REST handlers ───────────────────────────────────────────────────────────────────
 
 // frameKeyRequest is the JSON shape every frames/frame-progress request shares as its
@@ -516,6 +548,18 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (i *DbDumpInterceptor) handleFramesClear(w http.ResponseWriter, r *http.Request) {
+	var req frameTimelineKeyRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := i.clearStreamFrames(req.key()); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

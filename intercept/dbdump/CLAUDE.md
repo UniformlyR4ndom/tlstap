@@ -147,7 +147,23 @@ REST surface; the browser-side Worker execution and UI are documented in
   history kept, a previous version's persisted data can never be reached again once
   overwritten (or the script deleted outright), so it's deleted rather than left to grow
   the DB forever. Both operate on `script` alone, across every session/stream/direction —
-  a script's identity is global to the whole DB, not scoped to one capture.
+  a script's identity is global to the whole DB, not scoped to one capture. Only reachable
+  from a script `PUT`/`DELETE` through `scriptstore`'s own REST endpoints (below) — a
+  script edited directly on disk under `scripts-dir`, bypassing the API, never triggers
+  either, which is exactly how one dev capture accumulated ~4M stale frame rows from a
+  framer misapplied to the wrong protocol and repeatedly hand-edited; `clearStreamFrames`
+  below is the fix that doesn't depend on the interceptor having observed the edit.
+- `clearStreamFrames(keep frameTimelineKey)` — enforces "at most one framing view per
+  stream": deletes every `frames`/`frame_progress` row for `keep`'s `(session, stream)`
+  whose `(script, script_version)` isn't `keep`'s own, across both directions. Unlike the
+  purge functions above, this is meant to be called on *every* framing run (`web/CLAUDE.md`'s
+  "Framer scripts" section — `TrafficView.js`'s `handleRunFramer` calls it, keyed by
+  whatever's about to run, before `catchUpFramer`), not just on an explicit script
+  edit/delete — so it catches a stream switching to a different script, a new version of
+  the same script, *and* a script edited directly on disk, none of which the PUT-triggered
+  purges above can see. A rerun of the same `(script, script_version)` already active for
+  a stream is a no-op (its `frame_progress` survives, so the client resumes instead of
+  reprocessing from scratch).
 - **Script storage wiring** (`api.go`): `RegisterRoutes` calls `scriptstore.RegisterRoutes(mux,
   basePath, i.scripts, i.onFramerScriptPut, i.onFramerScriptDelete)` — the same REST CRUD
   `tamper` gets, reused as-is. `onFramerScriptPut` re-reads the just-written content via
@@ -174,13 +190,17 @@ REST surface; the browser-side Worker execution and UI are documented in
   `frameKeyRequest` plus
   `{"expected_processed_offset":N,"new_frames":[{"offset":N,"length":N,"meta":"..."|null,"stid":N,"time":N},...],"new_processed_offset":N,"new_state":"<base64>"|null}`
   → `204`, or `409` (body `{"error":"..."}`) on the staleness mismatch described above.
+  `POST /frames/clear` → `frameTimelineKeyRequest` body → `204` — see `clearStreamFrames`
+  above.
   `frameKeyRequest` (embedded by these requests' structs — encoding/json promotes an
   embedded struct's fields into the same JSON object) is
   `{"session":N,"stream":N,"direction":N,"script":"...","script_version":"..."}` — full
   schemas for all of these are in `doc/openapi.yaml` under the `framer` tag.
 - Unit-tested (`frames_test.go`): progress/append/list round-trips (including
   incremental extension and paging), the conflict-on-stale-offset path, both purge
-  functions directly, HTTP-level end-to-end passes for all four REST endpoints, one
+  functions directly, `clearStreamFrames` directly (including the same-version-is-a-no-op
+  case and that other streams/sessions are untouched) plus its own HTTP-level pass,
+  HTTP-level end-to-end passes for all four other REST endpoints, one
   confirming a real script `PUT`/`DELETE` through `RegisterRoutes` triggers the right
   purge, and `listFramesTimeline`'s ordering/tie-break/group-boundary-pagination
   correctness specifically (`TestListFramesTimeline_OrderingAndTieBreak` — the core test
@@ -244,6 +264,7 @@ direction by construction.
 | POST | `/frames` | see "Framer scripts" above | JSON array of persisted frames for one key |
 | POST | `/frames/timeline` | see "Framer scripts" above | JSON array of persisted frames for a stream+script across both directions, merged by stid, forward or backward |
 | POST | `/frames/append` | see "Framer scripts" above | `204`, or `409` on a stale `expected_processed_offset` |
+| POST | `/frames/clear` | see "Framer scripts" above (`clearStreamFrames`) | `204` — purges every other `(script, script_version)`'s frame data for the given stream |
 
 **WebSocket `/stid-stream` protocol:**
 

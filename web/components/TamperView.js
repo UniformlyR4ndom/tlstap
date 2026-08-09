@@ -9,21 +9,11 @@ import TamperScriptsPanel from './TamperScriptsPanel.js'
 import { openTamperControl, peekBuffer, getLogFileInfo, listFs, readFs, writeFs, appendFs } from '../tamperApi.js'
 import { createScriptRuntime } from '../scriptRuntime.js'
 import { useResizableLayout } from '../useResizableLayout.js'
+import { fmtLogArgs } from '../format.js'
 
 const html = htm.bind(h)
 
 const LOG_LIMIT = 500
-
-// Stringifies a running script's tamper.log(...) arguments into one display line —
-// arguments arrive over postMessage structured clone, so they can be arbitrary values,
-// not just strings.
-function formatLogArgs(args) {
-    return args.map(a => {
-        if (typeof a === 'string') return a
-        if (a instanceof Uint8Array) return `Uint8Array(${a.length})`
-        try { return JSON.stringify(a) } catch { return String(a) }
-    }).join(' ')
-}
 
 // Top-level container for the "Tamper" tab: owns the single control connection and
 // all live state, laid out as toolbar / (streams list + queue list) / detail panel.
@@ -89,7 +79,7 @@ export default function TamperView() {
             // distinct even when args is empty (a bare ctx.log() still logs something
             // useful on its own).
             onLog: (level, args, prefix) => {
-                const text = prefix ? (args.length ? `${prefix}\n${formatLogArgs(args)}` : prefix) : formatLogArgs(args)
+                const text = prefix ? (args.length ? `${prefix}\n${fmtLogArgs(args)}` : prefix) : fmtLogArgs(args)
                 // Persistence is independent of the browser copy below: it always happens
                 // while a log file is configured, regardless of the bypass checkbox, which
                 // only controls the memory-bounded browser copy.

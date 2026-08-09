@@ -14,21 +14,26 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 **Layout:** Header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
 
 **Menu bar (`App.js`, `index.html`):**
-- `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), and `rememberPosition` (bool, default `false`).
+- `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), `sizeFormat` (`'size'` | `'count'`, default `'size'`), `pinHeader` (bool, default `true`), and `rememberPosition` (bool, default `false`).
 - A `mousedown` listener on `document` (active only while a menu is open) closes the menu when clicking outside `.menubar`.
-- One menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), **Remember stream position** toggle.
-- `globalOffset` is passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` → `HexRow`.
+- One menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), **Size** / **Byte count** (chunk header banner's `sizeFormat`), **Pin header when scrolled past** toggle (`pinHeader`), **Remember stream position** toggle, **Default framer** select.
+- `globalOffset`/`sizeFormat`/`pinHeader` are each passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` (→ `HexRow` for `globalOffset` specifically).
 - **Remember stream position** (single-stream view only): while on, `App.js` remembers the byte offset/direction at the top of the viewport per stream, in-memory only, keyed by `` `${session}:${id}` `` (stream `id` is only unique within a session). `selectStream(s)` looks up a saved position and jumps to it with `align: 'top'` instead of a plain `setStream(s)`; re-clicking the already-selected stream is a no-op. Switching **View mode** away and back doesn't auto-restore — only reselecting via the Streams list does.
 
 **Refresh (`App.js`):** the header's `↺` button (`.btn-refresh`) increments `refreshKey`, a plain counter threaded into `SessionList`, `StreamList`, `TrafficView`, and `CombinedView`; each re-fetches whatever it owns when the value changes.
 
-**Jump to top / jump to bottom (`App.js`, `.btn-icon`):** two icon buttons placed left of
-Refresh. `App.js` owns `viewJumpRef = useRef({jumpToTop: () => {}, jumpToBottom: () => {}})`,
-passed as `jumpRef` to both `TrafficView`/`CombinedView` (mounted mutually-exclusively under
-`viewMode`); each registers `jumpRef.current = { jumpToTop, jumpToBottom }` in a
-dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`/
-`.jumpToBottom()`; the actual work lives in `useChunkBuffer.js` (see below) as a genuine
-`reloadFrom` of the chunk buffer, not a scroll over already-loaded rows.
+**Jump to top / bottom / next segment / previous segment (`App.js`, `.btn-icon`):** four
+icon buttons placed left of Refresh. `App.js` owns `viewJumpRef =
+useRef({jumpToTop: () => {}, jumpToBottom: () => {}})`, passed as `jumpRef` to both
+`TrafficView`/`CombinedView` (mounted mutually-exclusively under `viewMode`); each
+registers `jumpRef.current = {...}` in a dependency-array-free effect. `jumpToTop`/
+`jumpToBottom` are a genuine `reloadFrom`/backward reload of the buffer, not a scroll over
+already-loaded rows — `useByteBuffer.js` for `TrafficView.js` (both raw and frame mode),
+`useChunkBuffer.js` for `CombinedView.js`. **`jumpToNextSegment`/`jumpToPrevSegment` are
+`TrafficView.js`-only** (`useByteBuffer.js`, see below) — `CombinedView.js`'s registration
+doesn't provide them, so those two buttons are `disabled=${viewMode !== 'single'}` and
+called via `viewJumpRef.current.jumpToNextSegment?.()` (optional chaining, since Combined
+view's own `jumpRef.current` object simply lacks the key rather than providing a no-op).
 
 **Central live poll (`App.js`):**
 - One `usePoll(true, POLL_INTERVAL_MS, tick)` call (`usePoll.js`, 500ms) is the single source of live-ness for the whole Analysis view — `SessionList`, `StreamList`, and whichever of `TrafficView`/`CombinedView` is mounted all react to its output rather than polling themselves.
@@ -37,10 +42,10 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 - A failed `getLatest` call is silently swallowed; the next tick just retries. Each downstream consumer's own "did this number change" comparison treats an unchanged `latest` as a no-op, so a missed tick is invisible.
 
 **Bottom panel (`App.js`):**
-- `bottomTab` state: `null` (collapsed) | `'goto'` | `'search'` | `'extract'` | `'transform'`.
+- `bottomTab` state: `null` (collapsed) | `'goto'` | `'markers'` | `'search'` | `'extract'` | `'transform'` | `'framing'`.
 - `selectBottomTab(name)`: sets tab; does not toggle (panel only collapses via the `▼` button at the right of the tab bar).
-- Tab bar contains: **Goto**, **Search**, **Extract**, **Transform**, and a collapse button (`▼`) on the right.
-- Content area (`.bottom-content`, resizable — see "Resizable panels" below) renders `GoToPanel`, `SearchPanel`, `ExtractPanel`, or `TransformPanel` based on `bottomTab`.
+- Tab bar contains: **Goto**, **Markers**, **Search**, **Extract**, **Transform**, **Framing**, and a collapse button (`▼`) on the right.
+- Content area (`.bottom-content`, resizable — see "Resizable panels" below) renders `GoToPanel`, `MarkersPanel`, `SearchPanel`, `ExtractPanel`, `TransformPanel`, or `FramingPanel` based on `bottomTab` — see "Markers panel" and "Framing panel" below for the latter two.
 - A `ResizeHandle` (`orientation="h"`) sits at the top edge of `.bottom-panel`, shown only while `bottomTab` is set (nothing to resize when collapsed).
 
 **Session/stream list panels (`ListPanel.js`, `SessionList.js`, `StreamList.js`):**
@@ -53,14 +58,14 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 
 **Resizable panels (`ResizeHandle.js`, `layout.js`, `useResizableLayout.js`):**
 - `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the drag; each `mousemove` calls `onResize(ev.movementX)` (`v`) or `onResize(ev.movementY)` (`h`). The caller owns the resulting size state, clamping, and sign convention (a handle placed *after* the sized element treats a positive delta as "grow"; placed *before*, negative is "grow"). `onResize` is read fresh from props at `mousedown` time, never memoized.
-- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` read/write one `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, markersWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight, scriptsListWidth, scriptsLogHeight }`, merged with defaults on load. Also exports `clamp(v, lo, hi)`, used by the hook below and standalone by `TransformPanel.js`.
+- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` read/write one `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight, scriptsListWidth, scriptsLogHeight, framerScriptsListWidth }`, merged with defaults on load. Also exports `clamp(v, lo, hi)`, used by the hook below and standalone by `TransformPanel.js`.
 - `useResizableLayout(key, { sign = 1, min, max })` is what every panel below calls: reads `loadLayout()[key]` for the initial value, applies `clamp(v + sign * delta, min, max)` on each `onResize(delta)`, calls `saveLayoutValue(key, next)`, and returns `[value, onResize]`. `max` may be a plain number or a thunk (`() => number`) — the three window-relative panels pass `() => Math.floor(window.innerHeight * 0.7)` so the bound is re-read at drag time rather than baked in at render time.
 - **Sidebar** (`App.js`): `useResizableLayout('sidebarWidth', { min: 180, max: 600 })` (default 280), handle between `.sidebar` and `.main`.
-- **Bottom panel** (`App.js`): `useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160), handle at the top of `.bottom-panel` (only rendered while a tab is open).
-- **Markers panel** (`TrafficView.js`): `useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })` (default 240), handle between `HexDump`/`HexEditor` and `MarkersPanel` (only rendered while not collapsed); width passed down as a `width` prop to `MarkersPanel`, applied via inline style on `.markers-side`.
+- **Bottom panel** (`App.js`): `useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160), handle at the top of `.bottom-panel` (only rendered while a tab is open). The Markers/Framing bottom tabs (below) have no resizable dimension of their own — they're sized entirely by this one, like every other bottom tab.
 - **Transform panel** (`TransformPanel.js`): `useResizableLayout('encdecOptionsWidth', { min: 100, max: 400 })` (default 160, handle between the options column and the input/output column) and `useResizableLayout('encdecInputHeight', { min: 30, max: 2000 })` (default 120, handle between the input and output areas).
 - **Tamper detail panel** (`TamperView.js`): `useResizableLayout('tamperDetailHeight', { sign: -1, min: 120, max: () => Math.floor(window.innerHeight * 0.7) })` (default 300), handle above `.tamper-detail-wrap`, same sign convention as the bottom panel's handle (also placed before the sized element).
 - **Tamper scripts sub-tab** (`TamperScriptsPanel.js`): `useResizableLayout('scriptsListWidth', { min: 150, max: 500 })` (default 220, handle between the script list and editor) and `useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160, handle above the log panel).
+- **Framer Scripts sub-tab** (`FramerScriptsPanel.js`, via `ScriptsCrudPanel.js`): `useResizableLayout('framerScriptsListWidth', { min: 150, max: 500 })` (default 220) — same key shape as tamper's `scriptsListWidth` but its own persisted value, since the two script lists are independent. No log-height key here — `FramerLogPanel.js` is a separate bottom tab (Framing's own "Log" sub-tab), not a panel nested inside the Scripts sub-tab the way tamper's is.
 - All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins.
 
 **Outside-click/Escape dismissal (`useDismissOnOutsideClick.js`):**
@@ -71,7 +76,7 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 
 **Virtual scroll (`HexDump.js`):**
 - Exports `ROW_HEIGHT = 22`. Constants: `BUFFER = 8` (overdraw rows), `PREFETCH_FRACTION = 0.1`.
-- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`, `onSetMarker`, `onClearMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onViewportChange`, `markers`.
+- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`, `onSetMarker`, `onClearMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onViewportChange`, `markers`, `sizeFormat`, `pinHeader`.
 - Encoding helpers imported from `../format.js` (not defined locally).
 - Flattens all loaded chunks into a flat `rows[]` array: one `{type:'header'}` row + N `{type:'hex'}` rows per chunk.
 - A `ResizeObserver` tracks container height; `onScroll` tracks `scrollTop`. Visible window is `[startIdx, endIdx)`. Inner div height = `rows.length * ROW_HEIGHT`; top/bottom spacer divs fill the rest.
@@ -81,7 +86,8 @@ dependency-array-free effect. The buttons call `viewJumpRef.current.jumpToTop()`
 - **Global/local offset**: `HexRow` displays `row.offset` (stream-global byte offset) when `globalOffset` is true, or `row.localOffset` (offset within the chunk, resets to 0 at each chunk start) when false.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
 - **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
-- **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView). A `⋯ ` prefix (plus a `title` tooltip) marks a `row.continued` header — the byte-budgeted segment buffer's loaded window doesn't start at the segment's own offset, so the real header is further up, out of the loaded range (only possible in `TrafficView.js`'s frame mode today, for a still-growing huge frame).
+- **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView), where the size field is `fmtByteSize`'s or `fmtByteCount`'s output depending on the `sizeFormat` prop (`'size'`/`'count'`, App.js's View-menu toggle — see "Menu bar" above). A `⋯ ` prefix (plus a `title` tooltip) marks a `row.continued` header — the byte-budgeted segment buffer's loaded window doesn't start at the segment's own offset, so the real header is further up, out of the loaded range (only possible in `TrafficView.js`'s frame mode today, for a still-growing huge frame).
+- **Pinned header** (`pinHeader` prop, App.js's View-menu toggle, default on): when the chunk header for whatever row sits at the very top of the viewport has itself been scrolled above it, a second copy is rendered pinned to the top via `position: sticky` inside a zero-height wrapper (`.chunk-hdr-pinned-wrap` — contributes no height to the flow, so it doesn't perturb `topSpacer`/`scrollHeight` math elsewhere) — `.chunk-hdr-pinned`'s own class adds an opaque background/shadow/border so it reads as floating above the rows scrolling underneath, plus a `▲ ` prefix and a distinct tooltip. `headerRowIdxs` (`useMemo`, keyed on `rows`) + a binary search (`lastHeaderIdxAtOrBefore`) finds it in O(log n) rather than scanning back through however many rows the current segment has. Clicking it calls `scrollToRow` to jump back to the real header; its own `onContextMenu` stops propagation so a right-click there doesn't get misattributed to whatever row is underneath at that screen position (the container's context-menu handler maps click position to a row via `scrollTop`, which doesn't account for the pinned banner's fixed on-screen position).
 - **Context menu** (right-click on a hex row or chunk header):
   - Copy as hex / ASCII / hexdump / base64 — copies chunk bytes (header click) or selection/chunk bytes (row click).
   - Separator, then (when right-clicking a hex byte and extract props present):
@@ -187,15 +193,41 @@ that plan; still on `useChunkBuffer.js`/`buildRows` as documented above.
   `relTime` is unconditional, since `segment.time` is always present for both entity
   types; `ChunkHeader` in `HexDump.js` no longer special-cases a missing one), `evict`
   (byte-budgeted, row-aligned mid-segment trimming — fixes the tied-`stid`-group eviction
-  gap the old chunk-count model had), `fillToTarget` (the quantized fill loop driving an
+  gap the old chunk-count model had), `idsAtStid` (every segment id already loaded at a
+  given stid, scanning inward from whichever buffer edge is being extended — a stid can
+  hold more than one segment, a tied group, so an adapter requerying that stid needs the
+  whole set, not just the most recently finished one, to avoid re-surfacing an
+  already-consumed sibling as "new"), `fillToTarget` (the quantized fill loop driving an
   adapter's `fillForward`/`fillBackward` toward a target, with generation-based
-  cancellation between quanta).
+  cancellation between quanta), `windowIndexAtRow`/`rowIndexOfWindow` (row↔segment-index
+  lookups over `windows`, using the same per-window row-span math `buildRows` does — back
+  `useByteBuffer.js`'s `jumpToNextSegment`/`jumpToPrevSegment`, the same role
+  `HexDump.js`'s own `headerRowIdxs` binary search plays for its pinned-header feature,
+  just exposed at the level that can also decide to fetch).
 - **`useByteBuffer.js`**: the Preact hook wrapping that core — same external contract as
   `useChunkBuffer.js` above (`display`, `loading`, `error`, `setError`, `handleScrollEnd`,
-  `reloadFrom`, `displayRef`, `jumpToTop`, `jumpToBottom`), so migrating a view onto it is
+  `reloadFrom`, `displayRef`, `jumpToTop`, `jumpToBottom`, plus `jumpToNextSegment`/
+  `jumpToPrevSegment` — see below), so migrating a view onto it is
   meant to be a small change. Caller props shrink to `{entity, refreshKey, openConnection,
   fillForward, fillBackward, isClosed, latestId}` — no `fetchPage`/`getId`/`buildRows`,
   since pagination is now the adapter's own concern and row-building is shared.
+- **`jumpToNextSegment(currentRowIndex)`/`jumpToPrevSegment(currentRowIndex)`**: jump to
+  the segment right after/before whatever row the caller says the viewport is currently
+  showing (`TrafficView.js` derives this from its own `scrollTopRef`, see above — the hook
+  has no scroll-position awareness of its own). Already-loaded neighbor
+  (`windowIndexAtRow`/`rowIndexOfWindow` locate it): instant, `scrollTo`/`scrollToVersion`
+  only, no fetch. Not loaded yet: `fetchAndJump` asks for exactly one more segment via
+  `fillToTarget` (`targetSegments: 1`, `targetBytes: Infinity` — segment count alone ends
+  the fetch, not a byte budget) and scrolls to it once it arrives. Passes a *synthetic*
+  stand-in for the current edge segment, reported as fully loaded via `isWindowFull`
+  regardless of its real state, so a tied-aware adapter (`frameSegments.js`) treats it as
+  settled and looks for what comes next/before instead of extending its own byte range —
+  jumping past a still-loading huge segment shouldn't have to wait for it to finish first
+  (`idsAtStid`, called inside `fillToTarget`, still sees the segment's real entry in the
+  actual `windows` array passed alongside the stand-in, so a tied sibling at the same stid
+  is still found rather than mistaken for "already past"). `isWindowFull`'s own
+  end-boundary-only limitation (root `CLAUDE.md`'s TODO section) doesn't affect this —
+  `fetchAndJump` wants exactly that "treat as settled" behavior anyway.
 - **Adapters** — one per entity type, each implementing `openConnection`/`fillForward`/
   `fillBackward` against `/segments` (see `intercept/dbdump/CLAUDE.md`'s "WebSocket
   `/segments` protocol"):
@@ -215,18 +247,35 @@ that plan; still on `useChunkBuffer.js`/`buildRows` as documented above.
     *start* when opened while scrolling forward into it, so later extension grows
     `loadedEnd`; anchors at the segment's *end* when opened scrolling backward into it, so
     later extension shrinks `loadedStart` instead — in both cases the loaded window grows
-    toward whatever's already visible) — tested directly (`frameSegmentsCore.test.js`).
+    toward whatever's already visible), and `excludeAlreadyLoaded` (drops every id in a
+    given set from a `stid`-inclusive `/frames/timeline` fetch, turning it back into
+    "only what's genuinely new") — tested directly (`frameSegmentsCore.test.js`).
     `frameSegments.js` is the thin async glue calling the real REST/WS endpoints,
     including `sliceFrameBytes` — now the only copy; `TrafficView.js`'s own was deleted
-    once frame mode moved onto this adapter.
+    once frame mode moved onto this adapter. `fillForward`/`fillBackward` query
+    `/frames/timeline` inclusively (not the usual exclusive "+1" cursor) whenever
+    `resumeWindow` is given, since a tied-stid group's members can't all be resolved in
+    one round — `excludeIds` (from `idsAtStid`, above) plus `excludeAlreadyLoaded` turn
+    that back into an exclusive-feeling result without ever losing a sibling to the
+    boundary stid being passed and never revisited.
 
 **`TrafficView.js`-specific layer on top of its raw-mode `useByteBuffer.js` instance**
 (frame mode's own layer is documented in "Framer scripts" below):
-- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onUpdateMarkerLabel`, `onMarkerJumpRequest`, `onImportMarkers`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`, `jumpRef`.
-- `jumpRef`: a ref `App.js` owns; a dependency-array-free effect keeps it pointed at the
-  raw-mode hook's current `jumpToTop`/`jumpToBottom` every render (frame mode has its own
-  instance but doesn't feed `jumpRef` — see "Framer scripts" below). `CombinedView.js` has
-  the identical effect over its own (`useChunkBuffer.js`) hook.
+- Props: `stream`, `globalOffset`, `jumpTo`, `markers`, `onAddMarker`, `onRemoveMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onLeaveStream`, `jumpRef`. `markers`/`onAddMarker`/`onRemoveMarker` are only for `HexDump.js`'s per-byte marker highlighting and its right-click Set/Clear marker items — the marker *list* itself lives in the Analysis bottom panel's Markers tab (`MarkersPanel.js`, owned directly by `App.js`), not here.
+- `jumpRef`: a ref `App.js` owns; a dependency-array-free effect keeps it pointed at
+  whichever hook's `jumpToTop`/`jumpToBottom`/`jumpToNextSegment`/`jumpToPrevSegment` is
+  actually on screen — the raw-mode instance normally, the frame-mode instance while
+  `inFrameView` (see "Framer scripts" below; frame mode's hook is given the same
+  `latestStid` prop as raw mode's, purely so its own `jumpToBottom` has a boundary to fill
+  backward from — a frame's own `stid` is always that of the raw chunk containing its last
+  byte, so `latestStid` is a valid upper bound for "the end" of the frame timeline too).
+  `jumpToNextSegment`/`jumpToPrevSegment` are wrapped in a local zero-arg closure here that
+  reads `Math.floor(scrollTopRef.current / ROW_HEIGHT)` at call time (same ref/math the
+  leave-effect below already uses) and forwards it to the hook, which doesn't track the
+  viewport's scroll position itself — this keeps `App.js`'s buttons on the same zero-arg
+  call signature as `jumpToTop`/`jumpToBottom`. `CombinedView.js` has the identical
+  effect over its own (`useChunkBuffer.js`) hook, with no frame-mode counterpart to
+  switch between.
 - `handleSetMarker` / `handleClearMarker` are local (not lifted); `onSetExtractStart/End/Range` are forwarded directly to `HexDump`.
 - `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state, independent of either hook's `display`, mirrored via its own small effect on `stream?.id`.
 - **Jump effect** (`useEffect([jumpTo?.version])`, no `CombinedView.js` equivalent, and not
@@ -289,7 +338,8 @@ threaded to `<HexDump>` at all.
 - `fmtUintHex(n, width)` / `parseUintField(text, label, width)` — fixed-width `0x`-hex formatting/parsing for a single integer param (`0x`/decimal/bare-hex accepted); used by `transforms/checksum.js`'s CRC variant fields.
 - `parseIntInRange(value, min, max, label)` — rounds and range-validates a numeric param; used by `transforms/basic.js`'s Base-N `base` field.
 - `mergeUint8Arrays(arrays)` — concatenates an array of `Uint8Array`s into one.
-- `fmtByteSize(n)` — human-readable byte count (`B`/`KB`/`MB`; negative `n` formats as `'?'`, for a not-yet-known total). Used by `HexDump.js` (chunk header) and `TrafficView.js` (stream meta bar).
+- `fmtByteSize(n)` — human-readable byte count (`B`/`KB`/`MB`; negative `n` formats as `'?'`, for a not-yet-known total). Used by `HexDump.js` (chunk header, when `sizeFormat === 'size'`) and `TrafficView.js` (stream meta bar, unconditionally).
+- `fmtByteCount(n)` — byte count with thousands separators, e.g. `"2,733 B"` (negative `n` formats as `'?'`, same convention as `fmtByteSize`). Used by `HexDump.js`'s chunk header when `sizeFormat === 'count'`.
 - `fmtDuration(start, end)` — see "Duration formatting" below.
 - `fmtRelTime(ms, base)` — formats a chunk timestamp relative to a stream/session start as `"+T.TTTs"`. Used by `TrafficView.js`'s and `CombinedView.js`'s `buildRows`.
 - Imported by `HexDump.js`, `ExtractPanel.js`, `transforms.js`, `TamperDetailPanel.js`, and others. **Any new top-level `.js` file under `web/` must be added to the `//go:embed` directive in `web/server.go` explicitly** — same for a new `transforms/*.js` category module, listed there by name (test files must not be, so they're never pulled into the binary).
@@ -326,7 +376,11 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - **Category module contract** (e.g. `transforms/basic.js`, `transforms/numbers.js`): each exports
   - `OPERATIONS` — object keyed by op id, each entry `{ label, params?, run(bytes, params) }`. `run` returns the transformed `Uint8Array` or throws a plain `Error` with a human-readable message (caught by `TransformPanel`'s `handleGo`).
   - one or more plain catalog arrays of `{ label, op }`, named for the UI slot(s) they feed (e.g. `ENCODE_ALGORITHMS`/`DECODE_ALGORITHMS`).
-  - All other helpers/tables (e.g. `HEX_SEPARATOR_CHARS`, `NUMBER_TYPES`) are private to the module.
+  - All other helpers/tables (e.g. `HEX_SEPARATOR_CHARS`) are private to the module.
+    `transforms/numbers.js` is the one exception: `NUMBER_TYPES` (the type table) and
+    `decodeNumberValue`/`encodeNumberValue` (the pure bytes↔number core `numberDecode`/
+    `numberEncode` below wrap) are exported for `transformWorkerApi.js`'s `number.*`
+    surface — see "Scripted interception"'s `tamper.number.*`/`framer.number.*` note.
 - **`transforms.js`**:
   - `OPERATIONS`: merges every category module's `OPERATIONS` into one registry.
   - `ALGORITHM_SECTIONS`: catalog grouped into UI sections — `Basic` (subsections `Encode`/`Decode`, sourced from `transforms/basic.js`), `Numeric` (subsections `Encode`/`Decode`, sourced from `transforms/numbers.js`'s two catalog arrays), `Compression` (subsections `Compress`/`Uncompress`, each concatenating `transforms/compression.js`'s and `transforms/zip.js`'s algorithm arrays — two category modules feeding the same UI subsection), `Checksum` (sourced from `transforms/checksum.js`'s `CHECKSUM_ALGORITHMS`), `Encryption` (subsections `Encrypt`/`Decrypt`, sourced from `transforms/encryption.js`'s `ENCRYPT_ALGORITHMS`/`DECRYPT_ALGORITHMS`), `Hash` (sourced from `transforms/hash.js`'s `HASH_ALGORITHMS`) — and `MAC` (sourced from `transforms/mac.js`'s `MAC_ALGORITHMS`; flat like `Hash`, not split into subsections, since HMAC has no inverse operation any more than hashing does). Each leaf is `{ label, op }`.
@@ -337,7 +391,7 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
   - `base64-encode`/`base64-decode` (`transforms/basic.js`): `urlSafe` boolean (default `false`).
   - `octal-encode`/`octal-decode` (`transforms/basic.js`): 3-digit zero-padded octal per byte, space-separated.
   - `basen-encode`/`basen-decode` (`transforms/basic.js`): `base` param (2–64, default 64); arbitrary-base big-integer encoding via `BigInt`, Base58-style leading-zero handling.
-  - `encnum-*`/`decnum-*` (`transforms/numbers.js`; 14 fixed-width integer types, big/little endian): decode requires the exact byte width; encode validates range; 64-bit types use `BigInt` throughout.
+  - `encnum-*`/`decnum-*` (`transforms/numbers.js`; 14 fixed-width integer types, big/little endian): decode requires the exact byte width; encode validates range; 64-bit types use `BigInt` throughout. Decodes to/encodes from decimal *text* (as `Uint8Array`), matching every other op's bytes-in/bytes-out contract — for a real number/bigint instead, see `tamper.number.*`/`framer.number.*` in "Scripted interception".
   - `gzip-compress`/`gzip-decompress`, `deflate-compress`/`deflate-decompress`, `zlib-compress`/`zlib-decompress` (`transforms/compression.js`, via `fflate`'s sync functions, no params, `run()` returns a plain `Uint8Array`): `deflate-*` is raw DEFLATE; `zlib-*` is the zlib-wrapped format (Node's `zlib.deflateSync` is this format, not raw DEFLATE).
   - `zip-compress`/`zip-decompress` (`transforms/zip.js`, via `fflate`'s `zipSync`/`unzipSync`): `zip-compress` has a `filename` param; `zip-decompress` has an `entry` param (empty = auto-extract if exactly one entry, otherwise throws listing available names).
   - `md2`/`md4`/`ntlm`/`md5`/`sha1`/`sha224`/`sha256`/`sha384`/`sha512`/`whirlpool` (`transforms/hash.js`, no params): MD5/SHA-1/SHA-2 family via vendored `crypto-js`; MD2/MD4 hand-rolled (no established JS library covers them); NTLM is `md4(UTF-16LE(text))`; Whirlpool via vendored `hash-wasm` (WASM-backed), lazily warmed up via `warmupWhirlpool()` — its first call anywhere returns a `Promise<Uint8Array>`, every call after that a plain one.
@@ -350,18 +404,30 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
 - Neither `package.json` nor any `*.test.js` file is embedded into the binary (see the `format.js` embed note above).
 - Each category module's tests check known vectors (cross-checked against Node's `crypto`/`zlib` or an independent reference implementation before use), round-trips, boundary/error cases, and that distinguishing parameters (mode, variant, key size, ...) actually change the output.
 
-**Markers panel (`MarkersPanel.js`):**
-- Props: `markers[]`, `onRemove`, `onUpdateLabel`, `onJump`, `onImport(markers[])`, `collapsed`, `onToggle`, `width` (px, applied as inline style on `.markers-side`; see "Resizable panels" above — not used when `collapsed`).
-- `collapsed` renders a vertical strip (`◀ Markers`); expanded renders the full side panel.
-- Marker rows: show `[streamId] direction  0xOFFSET` + inline editable label. Click row → `onJump`; `×` → `onRemove`.
-- **Import/export** (bottom bar of expanded panel): `[clipboard ▾] [Import] [Export]` + status line.
+**Markers panel (`MarkersPanel.js`) — "Markers" Analysis bottom-panel tab:**
+- A bottom tab, positioned right after Goto (`Goto | Markers | Search | ...`) — moved out of
+  `TrafficView.js`'s side panel so the traffic view's right edge is free for a future frame
+  dissector panel (`doc/design/packet-dissector.md`). `App.js` renders it directly off state
+  it already owns (`markers`, `removeMarker`, `updateMarkerLabel`, `handleMarkerJumpRequest`,
+  `setMarkers`) — no lifting needed, unlike the Framing tab's log (markers were already
+  centrally owned).
+- Props: `session`, `markers[]`, `onRemove`, `onUpdateLabel`, `onJump`, `onImport(markers[])`.
+  "Select a session first" placeholder when no session selected (same convention as
+  `SearchPanel.js`). Session-scoped, not stream-scoped: shows every marker in the current
+  session across all its streams (`markers.filter(m => m.session === session.id)`) — a
+  marker's own stream is shown per row since more than one can appear here.
+- Marker rows (`.markers-tab-row`/`.mtab-*`, a single-line table row — replaced the old
+  side panel's multi-line card layout, a better fit for a wide/short bottom panel):
+  session, stream, direction, offset, an inline-editable label, a **Go** button (`onJump`),
+  and `×` (`onRemove`). Clicking **Go** doesn't collapse the bottom panel — same convention
+  `GoToPanel.js`/`SearchPanel.js` already follow for their own jumps.
+- **Import/export** (bottom bar): `[clipboard ▾] [Import] [Export]` + status line.
   - File format: deflate-compressed JSON, base64-encoded, extension `.tlstap-markers`. Content is the raw `tlstap-markers` localStorage JSON (`{ version: 1, markers: [{id, session, stream, direction, offset, label?}] }`).
   - `compress(str)` / `decompress(b64)`: use `CompressionStream`/`DecompressionStream` with `'deflate'` (Chrome 80+, Firefox 113+, Safari 16.4+).
   - Export to file: `download.js`'s shared `acquireSaveHandle` called **before** `compress()` to preserve user activation; falls back to anchor download.
   - Import from file: programmatic `<input type="file" accept=".tlstap-markers,.txt">` click (no activation constraint on read).
   - Import replaces all markers (`onImport` prop wired to `setMarkers` in `App.js`).
   - `parseImport(text)`: validates JSON has `markers` array with required typed fields; returns `null` on invalid data.
-- `onImport` prop is threaded: `App.js (setMarkers) → TrafficView (onImportMarkers) → MarkersPanel (onImport)`.
 
 **`api.js`:**
 - `openStidStream()` → `{ fetch(sessionId, streamId, start, n), close() }`: persistent WS to `/stid-stream`.
@@ -492,8 +558,8 @@ instance (canonical `/api/i/tamper/...`), same simplification `tapctl` makes.
     `OPERATIONS['hex-decode']`/`['base64-decode']`; Hexdump goes through `format.js`'s
     `parseHexdump()`.
 
-**Scripted interception (`scriptRuntime.js`, `TamperScriptsPanel.js`, `ScriptEditor.js`) —
-"Scripts" sub-tab:** runs one user script in a Web Worker as a programmatic stand-in for a
+**Scripted interception (`scriptRuntime.js`, `TamperScriptsPanel.js`, `ScriptsCrudPanel.js`,
+`ScriptEditor.js`) — "Scripts" sub-tab:** runs one user script in a Web Worker as a programmatic stand-in for a
 human clicking around `TamperQueueList`/`TamperDetailPanel`. Entirely a frontend feature —
 nothing on the Go side executes a script (see `intercept/tamper/CLAUDE.md`'s "Script
 storage" section). `TamperView` has a second-level tab bar (**Intercept** / **Scripts**);
@@ -513,11 +579,31 @@ This section is implementation notes only:
   `setIntercept`/`listStreams`, all of `fs.*`) post a `call` message to the main thread
   (`createScriptRuntime`'s `handlers`), which performs the real operation and posts back
   a `result` — the Worker has no direct network access from a Blob URL.
-- **`tamper.transform.*`/`tamper.encode.*`/`tamper.decode.*` are the exception**: they run
-  directly inside the Worker (`BOOTSTRAP` dynamically imports `transforms.js`/`format.js`
-  by absolute URL), synchronous once a `ready` flag flips after that import finishes — a
-  script's own hook handlers never observe them as unpopulated; a call made at the
-  script's own top level before that returns a `Promise` instead.
+- **`tamper.transform.*`/`tamper.encode.*`/`tamper.decode.*`/`tamper.number.*` are the
+  exception**: they run directly inside the Worker (`BOOTSTRAP` dynamically imports
+  `transforms.js`/`format.js` by absolute URL), synchronous once a `ready` flag flips
+  after that import finishes — a script's own hook handlers never observe them as
+  unpopulated; a call made at the script's own top level before that returns a `Promise`
+  instead. The op-id-to-JS-name mapping behind `transform.<category>.*` (`camelCaseOpId`,
+  the per-category grouping) and `number.decode<Type>`/`encode<Type>` (`capitalizeTypeId`,
+  driven by `transforms/numbers.js`'s `NUMBER_TYPES`) are shared with `frameRuntime.js`'s
+  equivalent surface via `transformWorkerApi.js`, since both mappings must stay identical
+  between the two — each runtime supplies its own per-entry function body (Promise-wrapped
+  here; see "Framer scripts" below for why `framer.*`'s is plain sync instead).
+  `number.*` is deliberately a separate namespace from `transform.*`: every
+  `transform.<category>.*` op speaks `Uint8Array` in and out (the same convention the
+  Transform panel's step pipeline relies on — `transforms/numbers.js`'s own
+  `decnum-*`/`encnum-*` ops, exposed there as `transform.numeric.*`, decode to/from a
+  *decimal-text* `Uint8Array`, not a number, for exactly that reason), whereas
+  `number.decode<Type>` returns a real number (`bigint` for the 64-bit types, per
+  `DataView`'s own `getBigInt64`/`getBigUint64`) and `number.encode<Type>` takes one —
+  useful for a script parsing a binary length/count field, where `transform.numeric.*`
+  would mean round-tripping through decimal text just to get back to a number. Both share
+  the same pure core (`decodeNumberValue`/`encodeNumberValue`, `transforms/numbers.js`),
+  re-exported through `transforms.js` for the Worker's dynamic import; `numberDecode`/
+  `numberEncode` (the `OPERATIONS['decnum-*'/'encnum-*']` implementations) are thin
+  decimal-text wrappers around those same two functions, so the Transform panel's own
+  behavior is untouched by any of this.
 - **Per-connection event serialization**: all events for one `conn` go through a per-conn
   FIFO queue; different `conn`s run independently. Consecutive still-queued `onReceive`
   entries for the same `(conn, direction)` are coalesced into one dispatch.
@@ -527,19 +613,43 @@ This section is implementation notes only:
 - **Error handling**: a syntax error in the script's own source kills the Worker
   permanently (reported, then `stop()`); an exception thrown inside a handler is caught
   per-event without stopping the Worker. Losing the control connection also stops the script.
-- **`TamperScriptsPanel.js`** is CRUD over the REST script store plus Run/Stop wired to
-  the lifted runtime state.
-- **Log panel** (Download/Clear, or **"Logged to `<filename>`"** in place of Download when
-  `log-file` is configured) — see `doc/interceptor/tamper.md`'s "Logging" section for the
-  persistence/"Skip browser log" behavior.
+- **`ScriptsCrudPanel.js`** is the generic list+editor CRUD chrome (script list with
+  `+ New`, `ScriptEditor.js` instance, Save/Reload/Delete toolbar) extracted out of what
+  used to be `TamperScriptsPanel.js` monolithically — shared with the Analysis tab's
+  framer-script editor (`FramerScriptsPanel.js`, see "Framer scripts" below), and matches
+  what `doc/design/packet-dissector.md`'s "Script storage" section anticipated for a
+  future dissector script store too. Props: `className` (root class — a caller-specific
+  CSS variant, since this component's root sits in different flex contexts per caller;
+  see that file's own CSS comments), `list`/`get`/`put`/`del` (REST CRUD functions,
+  `tamperApi.js`'s and `dbdumpFramerApi.js`'s script functions are byte-for-byte this same
+  shape), `completions` (passed straight through to `ScriptEditor.js`), `refreshSignal`,
+  `listWidthKey` (a `layout.js` key, since each caller needs its own persisted list width),
+  and two optional render-prop extension points: `controls(selectedName, source)` (tamper
+  supplies Run/Stop; framer supplies nothing — CRUD only, see "Framer scripts" below for
+  why) and `rowDecoration(scriptName)` (tamper supplies the ● running-dot; framer supplies
+  nothing).
+- **`TamperScriptsPanel.js`** is now a thin wrapper around `ScriptsCrudPanel.js`: owns
+  `TAMPER_COMPLETION_SHAPE`/`CTX_COMPLETION_SHAPE` (moved here from `ScriptEditor.js`,
+  see below), supplies tamper's REST functions/`controls`/`rowDecoration`, and keeps its
+  own log panel (Download/Clear, or **"Logged to `<filename>`"** in place of Download when
+  `log-file` is configured — see `doc/interceptor/tamper.md`'s "Logging" section for the
+  persistence/"Skip browser log" behavior) as a sibling below `ScriptsCrudPanel.js`, wired
+  to the lifted runtime state exactly as before this extraction.
 - **`ScriptEditor.js`** wraps a CodeMirror 6 `EditorView` (syntax highlighting, bracket
-  matching, folding, `tamper.*`/`ctx.*` autocompletion via `@codemirror/lang-javascript`'s
+  matching, folding, autocompletion via `@codemirror/lang-javascript`'s
   `scopeCompletionSource` — vendored into `codemirror.module.js`, see that file's header —
   run against never-called mirror objects rather than the real API surface). Semi-controlled,
   same contract shape as `HexEditor.js`: `<${ScriptEditor} value onChange loadVersion
-  readOnly? />` — `value` is only pushed back into CodeMirror when the caller bumps
-  `loadVersion`, never inferred from `value` changing on its own. `readOnly` is applied
-  through a `Compartment` rather than a remount.
+  completions readOnly? />` — `value` is only pushed back into CodeMirror when the caller
+  bumps `loadVersion`, never inferred from `value` changing on its own. `readOnly` is
+  applied through a `Compartment` rather than a remount. `completions` (an object passed
+  straight to `scopeCompletionSource`, e.g. `{tamper: TAMPER_COMPLETION_SHAPE, ctx:
+  CTX_COMPLETION_SHAPE}` or `{framer: FRAMER_COMPLETION_SHAPE}`) is baked into the editor
+  once at mount, not reactive to later changes — no caller needs that, since one
+  `ScriptEditor.js` instance is tied to one script *type* for its whole lifetime. The
+  mirror-shape objects themselves now live with their own caller (`TamperScriptsPanel.js`,
+  `FramerScriptsPanel.js`) rather than hardcoded in `ScriptEditor.js` — they're
+  caller-specific config, not editor internals.
 
 **Framer scripts (`dbdumpFramerApi.js`, `frameRuntime.js`, `framerRun.js`,
 `framerPrefs.js`, plus `App.js`'s View-menu entry and `TrafficView.js`'s "Framer"
@@ -572,11 +682,49 @@ rendered, merged/interleaved across both directions.
   script covering both sides of an asymmetric protocol (one script, run once per
   direction) can branch on it. Returns `{frames, state}` (or nothing,
   to mean "no new frames, state unchanged"); each frame is `{offset, length, meta?}`.
-  `state`/`meta` are always plain JSON-serializable JS values from the script's point of
-  view — a script never sees bytes or base64 for either, even though `frame_progress.state`
-  is a BLOB column and `frames.meta` is TEXT (`dbdumpFramerApi.js` encodes/decodes both at
-  the wire boundary: `state` → JSON → UTF-8 bytes → base64 for the BLOB; `meta` → JSON text
-  directly, since the column is already TEXT).
+  `state`/`meta` are plain JS values from the script's point of view, and may freely
+  include a raw `Uint8Array` anywhere in the tree (e.g. a framer's buffered carry bytes
+  between calls) — a script never has to encode/decode bytes itself for either, even
+  though `frame_progress.state` is a BLOB column and `frames.meta` is TEXT
+  (`dbdumpFramerApi.js` encodes/decodes both at the wire boundary: `state` → JSON → UTF-8
+  bytes → base64 for the BLOB; `meta` → JSON text directly, since the column is already
+  TEXT; either JSON pass swaps a nested `Uint8Array` for a tagged base64 wrapper via a
+  replacer/reviver pair — `jsonBytesReplacer`/`jsonBytesReviver`, `dbdumpFramerApi.js` —
+  only at that one actual serialization boundary, not on every call). Prefer keeping
+  buffered bytes as a plain `Uint8Array` across calls rather than encoding it yourself
+  every time: `state` is passed in-memory between consecutive `frame()` calls within one
+  Worker run (and survives the Worker→main-thread `postMessage` hop via structured clone,
+  which also carries `Uint8Array` natively) with no serialization in between — only
+  `appendFrames`'s actual wire write (once per `runFramer` batch, not once per chunk)
+  needs the tagged/base64'd form, and that now happens automatically. Use `.slice()`,
+  not `.subarray()`, when computing what to carry forward — a view would keep the whole
+  (possibly much larger) accumulated buffer alive in memory for as long as the carry is
+  held. Tested directly in `dbdumpFramerApi.test.js`.
+- **A global `framer` object** exposes the same transform framework tamper scripts get,
+  under `framer.transform.<category>.*`/`framer.encode.{hex,base64,hexdump}`/
+  `framer.decode.{hex,base64,hexdump}`/`framer.number.decode<Type>`/`encode<Type>` —
+  mirroring `tamper.*`'s shape (see "Scripted interception" above, including *why*
+  `number.*` is a separate namespace from `transform.*`) minus the `tamper` prefix,
+  sharing its naming via `transformWorkerApi.js`. Unlike `tamper.*`, every `framer.*` call
+  is **plain synchronous, never a Promise**: `runScript` (unlike tamper's live event
+  dispatch) only starts once explicitly told to via the Worker's `'run'` message, so it
+  simply awaits the `transforms.js`/`format.js` module import (plus Whirlpool warmup)
+  finishing *before* ever calling `frame()`, rather than gating each call behind a `ready`
+  flag the way tamper must. A script's own top level, outside `frame()`, has no such
+  guarantee and shouldn't reference `framer.*` there. Both example scripts
+  (`examples/dbdump/framer/*.js`) use `framer.encode.hex` to add a hex preview of the
+  offending header bytes to their "implausible length" error — useful when a framer is
+  misapplied to the wrong protocol (see the "framer never finished" discussion this
+  followed from) — and `framer.number.decodeU32be`/`decodeU16be` to parse their own
+  length-prefix fields as real numbers, in place of a hand-rolled bit-shift.
+- **`framer.log(...args)`** posts `{kind: 'log', args}`; `runFramer`'s optional `onLog`
+  param (called with `args` in call order) surfaces it to `catchUpFramer`, which wraps it
+  as `args => onLog?.(direction, args)` before passing it on — `direction` is
+  `catchUpFramer`'s own fixed direction for that call, not something `runFramer` itself
+  knows. `TrafficView.js` formats args via `format.js`'s `fmtLogArgs` (shared with
+  tamper's identical need, moved out of `TamperView.js`'s previously-local
+  `formatLogArgs`) and lifts each line to `App.js` via `onFramerLog(direction, text,
+  level)` — see "Framing panel" below for where those lines end up.
 - **`frameRuntime.js`** runs the script in a Worker via the same two-Blob-plus-`sourceURL`
   loading technique `scriptRuntime.js` uses (see that file's header comment) — but
   **not** that file's IIFE-wrapping of the script Blob: the framer contract looks
@@ -584,9 +732,8 @@ rendered, merged/interleaved across both directions.
   `tamper.register(...)`), and an IIFE would trap the script's `function frame(...)`
   declaration in its own local scope instead of the global one BOOTSTRAP looks it up
   in — always failing with "framer script must define a top-level function named
-  'frame'" regardless of the script's actual content (a real bug this shipped with
-  briefly; fixed by dropping the wrapper entirely, safe since BOOTSTRAP's own internals
-  are already scoped inside its own separate IIFE).
+  'frame'" regardless of the script's actual content. No wrapper is needed here since
+  BOOTSTRAP's own internals are already scoped inside their own separate IIFE.
 - No RPC bridge: a framer script is a pure function over bytes
   already fetched onto the main thread, so there's no `peek`/`release`/network access from
   inside the Worker at all, unlike tamper's scripted interception. The only messages are a
@@ -602,8 +749,8 @@ rendered, merged/interleaved across both directions.
   409 from `appendFrames`) — in every case the Worker is torn down immediately, not asked
   to wind down gracefully.
 - **`framerRun.js`**'s `catchUpFramer(sessionId, streamId, direction, scriptName,
-  scriptSource)` (plain scalar ids, matching every other `api.js` wrapper — not whole
-  session/stream objects) is the orchestration: fetches `frame-progress` (how far framing has
+  scriptSource, onLog?)` (plain scalar ids, matching every other `api.js` wrapper — not
+  whole session/stream objects) is the orchestration: fetches `frame-progress` (how far framing has
   gotten, plus the framer's own persisted `state`) and `/chunklist`'s length for the target
   direction; if already caught up, resolves immediately having fetched nothing further.
   Otherwise fetches the missing tail via `api.js`'s `fetchDirectionChunks` (unbounded — see
@@ -614,7 +761,9 @@ rendered, merged/interleaved across both directions.
   `scriptSource`, via `sha256Hex` — also exported) is computed once per call, not passed
   in, so every caller derives it identically. Idempotent and safe to call repeatedly —
   `TrafficView.js`'s live-tailing effect (below) calls it again on every central-poll
-  tick while a stream with an active framer is still growing.
+  tick while a stream with an active framer is still growing. `onLog(direction, args)`,
+  if given, is called for every `framer.log(...)` the script makes during this run (see
+  the `framer.log` bullet above).
 - **`framerPrefs.js`**: two `localStorage`-backed preferences, deliberately **not** the
   same in-memory-only mechanism "remember stream position" uses (App.js) — these survive
   a reload. `loadDefaultFramerScript`/`saveDefaultFramerScript` (one global default,
@@ -629,9 +778,15 @@ rendered, merged/interleaved across both directions.
     `framerPrefs.js`). Entering `'framed'` is always an explicit "Run" click (never
     automatic just from picking a script) — **blocking**: the raw view stays up, "Run"
     shows "Framing…" and is disabled, until `catchUpFramer` resolves for both directions
-    (`Promise.all`) or throws. On success the picked script is also persisted as this
-    stream's override; on failure, `frameState` falls back to `'raw'` and the message
-    surfaces via a `.error-msg` banner at the top of `.traffic-body`, above the hex view.
+    (`Promise.all`) or throws. `handleRunFramer` computes `scriptVersion` (`sha256Hex`) and
+    calls `clearStreamFrames` (`dbdumpFramerApi.js`) *before* that `Promise.all` — enforces
+    "at most one framing view per stream" (see `intercept/dbdump/CLAUDE.md`'s
+    `clearStreamFrames`) on every run, not just a script edit/delete; a rerun of the
+    already-active `(script, version)` is a no-op there, so `catchUpFramer` still resumes
+    rather than reprocessing. On success the picked script is also persisted as this
+    stream's override; on failure (including the clear itself), `frameState` falls back to
+    `'raw'` and the message surfaces via a `.error-msg` banner at the top of
+    `.traffic-body`, above the hex view.
   - Once `'framed'`, both directions are shown merged in one scroll (see
     `intercept/dbdump/CLAUDE.md`'s "Cross-direction interleaving" note for the backend
     half); "Show raw chunks" returns to `'raw'` without discarding anything (the
@@ -672,5 +827,51 @@ rendered, merged/interleaved across both directions.
   list backs both the View menu's "Default framer" entry and every `TrafficView`'s own
   per-stream picker), and owns the "Default framer" menu entry itself (a `<select>`
   inside a `.menu-item`, not the usual checkmark-toggle shape every other entry uses).
-  Scripts must be added via `curl`/`tapctl` against dbdump's `/scripts` endpoints — no
-  in-app editor yet (see the root `CLAUDE.md`'s TODO section).
+
+**"Framing" Analysis bottom-panel tab (`FramingPanel.js`, `FramerScriptsPanel.js`,
+`FramerLogPanel.js`):** groups the in-app framer-script editor and a running script's log
+under one tab, **Scripts**/**Log** as sub-tabs — same shape as the Tamper tab's own
+Intercept/Scripts split (`TamperView.js`'s `subTab`). Positioned after Transform in the
+bottom-tab bar (`Goto | Markers | Search | Extract | Transform | Framing`).
+
+- **`FramingPanel.js`** owns just the sub-tab switch (`subTab`: `'scripts'` | `'log'`,
+  local, resets to `'scripts'` on remount — nothing here needs to survive switching away
+  from the Framing tab, unlike tamper's Scripts sub-tab whose running script/log *do*
+  survive switching away, since framer has no persistent "currently running" concept
+  the way tamper does). `frameLog`/`onClearFrameLog` are passed through from `App.js`
+  (see below) since that data needs to survive switching *sub-tabs* here without
+  resetting; `refreshSignal` is `App.js`'s existing header-refresh counter, reused as-is.
+- **`FramerScriptsPanel.js`** is a thin wrapper around `ScriptsCrudPanel.js` (see
+  "Scripted interception" above): dbdump's script REST functions, a new
+  `FRAMER_COMPLETION_SHAPE` (mirrors `TAMPER_COMPLETION_SHAPE`'s `transform`/`number`
+  generation from the same `OPERATIONS_BY_CATEGORY`/`camelCaseOpId`/`NUMBER_TYPES`/
+  `capitalizeTypeId` inputs, plus `encode`/`decode`/`log` — no `fs`, no RPC methods, no
+  `ctx`-equivalent, since a framer script has none of those), no `controls`/
+  `rowDecoration` — CRUD only. Running still happens from `TrafficView.js`'s own
+  meta-bar "Run" button (tied to a specific stream), not from this panel — a second
+  "run" trigger here would need its own stream-picker, duplicating that. Root class
+  `.framer-scripts-view` — `height: 100%` rather than `.tamper-scripts-main`'s `flex: 1`,
+  since it sits inside `.framing-body` (a `flex: 1` region under the sub-tab bar) rather
+  than a flex-column ancestor the way tamper's version does (see `index.html`'s CSS
+  comments on both classes).
+- **`FramerLogPanel.js`**: `<${FramerLogPanel} lines onClear />`, `lines` is
+  `[{direction, text, level}]`. Reuses tamper's log CSS (`.tamper-scripts-log-body`,
+  `.tamper-log-line`/`.tamper-log-${level}`) since the rendering is identical; only the
+  root layout class (`.framer-log-panel`, `height: 100%` for the same reason
+  `.framer-scripts-view` is) is new. Each line is prefixed `[c2s]`/`[s2c]` (or nothing,
+  for a `direction: null` script-level failure) since both directions' `catchUpFramer`
+  calls log concurrently and would otherwise interleave indistinguishably. A Download
+  button (reusing `download.js`'s `downloadBlob`) writes plain text with the direction
+  prefix and an `[ERROR]` marker for error lines, since neither the tag styling nor the
+  bracket-prefix layout survives into a downloaded file.
+- **`App.js`** owns `frameLog` (capped array, `FRAME_LOG_LIMIT = 500`, same cap tamper's
+  `scriptLog` uses) and `handleFramerLog`/`handleFramerLogReset`, wired into
+  `TrafficView.js` as `onFramerLog(direction, text, level)`/`onFramerLogReset()`.
+  `frameLog` is scoped to whichever stream is currently selected: `TrafficView.js`'s own
+  stream-switch reset effect (the one that already resets `frameState`/
+  `frameScriptRunning` — see above) also calls `onFramerLogReset`, since a framer run has
+  no continuity across a stream switch the way tamper's proxy-wide running script does.
+  `handleRunFramer`'s `catch` block calls `onFramerLog(null, e.message, 'error')` in
+  addition to setting `frameError` — the existing banner stays the immediate/prominent
+  signal; the Log tab becomes a persistent trail that includes that same failure, not
+  just successful runs.

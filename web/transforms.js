@@ -11,6 +11,10 @@ import * as mac from './transforms/mac.js'
 // before first use.
 export { warmupWhirlpool } from './transforms/hash.js'
 
+// Re-exported for the framer.number.*/tamper.number.* surface (transformWorkerApi.js) —
+// the pure bytes<->number core, independent of OPERATIONS' decimal-text convention.
+export { decodeNumberValue, encodeNumberValue } from './transforms/numbers.js'
+
 // Grouped for a script-facing API surface (`tamper.transform.<category>.<function>`) —
 // deliberately independent of ALGORITHM_SECTIONS below: the UI's Encode/Decode-style
 // subsections, [TODO] fallback, and alphabetical menu ordering have no bearing on that API,

@@ -2,10 +2,12 @@
 // the persisted frame index a script produces.
 //
 // Wire encoding: state/meta are opaque BLOB/TEXT columns server-side, but every caller
-// here works with plain JSON-serializable JS values for both — this module translates
-// to/from the wire shapes those columns need (state -> JSON -> UTF-8 bytes -> base64,
-// since the column is a BLOB; meta -> JSON text directly, since the column is already
-// TEXT). Callers never see base64 or raw bytes for either field.
+// here works with plain JS values for both, which may freely include raw Uint8Arrays
+// anywhere in the tree — this module translates to/from the wire shapes those columns
+// need (state -> JSON -> UTF-8 bytes -> base64, since the column is a BLOB; meta -> JSON
+// text directly, since the column is already TEXT; a nested Uint8Array in either is
+// tagged/base64'd only at this boundary — see jsonBytesReplacer/Reviver below). Callers
+// never have to encode/decode bytes themselves for either field.
 import { fmtAsBase64, parseBase64 } from './format.js'
 
 const BASE = '/api/i/dbdump'
@@ -72,22 +74,41 @@ function timelineKeyBody(key) {
     return { session: key.session, stream: key.stream, script: key.script, script_version: key.scriptVersion }
 }
 
-function encodeMeta(value) {
-    return value === undefined || value === null ? null : JSON.stringify(value)
+// A script's state/meta may hold a raw Uint8Array anywhere in the tree (e.g. a framer's
+// buffered carry bytes) — JSON has no binary type, so the replacer/reviver pair below
+// swaps one for a tagged base64 wrapper only at this actual serialization boundary,
+// letting script code pass plain Uint8Arrays between calls the rest of the time (no
+// per-call encode/decode of its own). BYTES_TAG is chosen unlikely to collide with a
+// script's own field names; a state/meta value that happens to be shaped exactly like
+// the wrapper would false-positive into bytes on decode — accepted as an edge case.
+const BYTES_TAG = '__bytes_base64__'
+
+function jsonBytesReplacer(_key, value) {
+    return value instanceof Uint8Array ? { [BYTES_TAG]: fmtAsBase64(value) } : value
 }
 
-function decodeMeta(text) {
-    return text == null ? null : JSON.parse(text)
+function jsonBytesReviver(_key, value) {
+    return (value && typeof value === 'object' && typeof value[BYTES_TAG] === 'string') ? parseBase64(value[BYTES_TAG]) : value
 }
 
-function encodeState(value) {
+// Exported for direct round-trip testing (dbdumpFramerApi.test.js) — every other export
+// here needs a real fetch(), these four are the pure part.
+export function encodeMeta(value) {
+    return value === undefined || value === null ? null : JSON.stringify(value, jsonBytesReplacer)
+}
+
+export function decodeMeta(text) {
+    return text == null ? null : JSON.parse(text, jsonBytesReviver)
+}
+
+export function encodeState(value) {
     if (value === undefined || value === null) return null
-    return fmtAsBase64(new TextEncoder().encode(JSON.stringify(value)))
+    return fmtAsBase64(new TextEncoder().encode(JSON.stringify(value, jsonBytesReplacer)))
 }
 
-function decodeState(b64) {
+export function decodeState(b64) {
     if (b64 == null) return null
-    return JSON.parse(new TextDecoder().decode(parseBase64(b64)))
+    return JSON.parse(new TextDecoder().decode(parseBase64(b64)), jsonBytesReviver)
 }
 
 // Returns { processedOffset, state }: how far framing has gotten for key, and the
@@ -143,5 +164,19 @@ export async function appendFrames(key, expectedProcessedOffset, frames, newProc
             new_processed_offset: newProcessedOffset,
             new_state: encodeState(newState),
         }),
+    }))
+}
+
+// Enforces "at most one framing view per stream": deletes every OTHER (script,
+// script_version)'s persisted frame/progress data for key's (session, stream), across
+// both directions — a rerun of the same (script, script_version) already active for
+// this stream is a no-op server-side (its frame_progress survives, so catchUpFramer
+// resumes rather than reprocessing). key is timeline-shaped (no direction), matching how
+// a "view" is scoped to a whole stream, not one direction.
+export async function clearStreamFrames(key) {
+    await checkOk(await fetch(`${BASE}/frames/clear`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(timelineKeyBody(key)),
     }))
 }

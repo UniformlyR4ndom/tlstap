@@ -1,7 +1,7 @@
 import { h } from 'preact'
-import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks'
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'preact/hooks'
 import htm from 'htm'
-import { fmtAsBase64, fmtAsHex, fmtAsAscii, fmtAsHexdump, mergeUint8Arrays, fmtByteSize } from '../format.js'
+import { fmtAsBase64, fmtAsHex, fmtAsAscii, fmtAsHexdump, mergeUint8Arrays, fmtByteSize, fmtByteCount } from '../format.js'
 import { dirClass, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
@@ -10,7 +10,7 @@ export const ROW_HEIGHT    = 22
 const BUFFER               = 8
 const PREFETCH_FRACTION    = 0.1
 
-export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset, onSetMarker, onClearMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onViewportChange, markers }) {
+export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset, onSetMarker, onClearMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onViewportChange, markers, sizeFormat, pinHeader }) {
     const containerRef = useRef(null)
     const [scrollTop, setScrollTop] = useState(0)
     const [height,    setHeight]    = useState(400)
@@ -179,6 +179,43 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
     const markedC2S = markers?.length ? new Set(markers.filter(m => m.direction === DIRNUM_C2S).map(m => m.offset)) : null
     const markedS2C = markers?.length ? new Set(markers.filter(m => m.direction === DIRNUM_S2C).map(m => m.offset)) : null
 
+    // Indices of every 'header' row, kept sorted — recomputed only when `rows` itself
+    // changes (a data load), not on every scroll tick — so the pinned-header lookup below
+    // is a binary search rather than a scan back through however many rows the current
+    // segment has.
+    const headerRowIdxs = useMemo(() => {
+        const idxs = []
+        for (let i = 0; i < rows.length; i++) if (rows[i].type === 'header') idxs.push(i)
+        return idxs
+    }, [rows])
+
+    function lastHeaderIdxAtOrBefore(rowIdx) {
+        let lo = 0, hi = headerRowIdxs.length - 1, found = -1
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1
+            if (headerRowIdxs[mid] <= rowIdx) { found = headerRowIdxs[mid]; lo = mid + 1 }
+            else hi = mid - 1
+        }
+        return found
+    }
+
+    // The header belonging to whatever row currently sits at the very top of the
+    // viewport, only when that header itself has been scrolled above it.
+    const topRowIdx = Math.floor(scrollTop / ROW_HEIGHT)
+    let pinnedHeaderIdx = -1
+    if (pinHeader && rows[topRowIdx] && rows[topRowIdx].type !== 'header') {
+        pinnedHeaderIdx = lastHeaderIdxAtOrBefore(topRowIdx)
+    }
+    const pinnedHeaderRow = pinnedHeaderIdx >= 0 ? rows[pinnedHeaderIdx] : null
+
+    function scrollToRow(rowIdx) {
+        const el = containerRef.current
+        if (!el) return
+        const top = rowIdx * ROW_HEIGHT
+        el.scrollTop = top
+        setScrollTop(top)
+    }
+
     return html`
         <div class="hexdump-wrap">
             <div
@@ -189,10 +226,15 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
                 onMouseMove=${onMouseMove}
                 onContextMenu=${onContextMenu}
             >
+                ${pinnedHeaderRow && html`
+                    <div class="chunk-hdr-pinned-wrap" onContextMenu=${e => e.stopPropagation()}>
+                        <${ChunkHeader} row=${pinnedHeaderRow} sizeFormat=${sizeFormat} pinned onClick=${() => scrollToRow(pinnedHeaderIdx)} />
+                    </div>
+                `}
                 <div style=${{ height: topSpacer + 'px' }} />
                 ${rows.slice(startIdx, endIdx).map((row, i) =>
                     row.type === 'header'
-                        ? html`<${ChunkHeader} key=${startIdx + i} row=${row} />`
+                        ? html`<${ChunkHeader} key=${startIdx + i} row=${row} sizeFormat=${sizeFormat} />`
                         : html`<${HexRow}      key=${startIdx + i} row=${row} globalOffset=${globalOffset} sel=${sel} markedC2S=${markedC2S} markedS2C=${markedS2C} />`
                 )}
                 <div style=${{ height: bottomSpacer + 'px' }} />
@@ -230,7 +272,7 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
     `
 }
 
-function ChunkHeader({ row }) {
+function ChunkHeader({ row, sizeFormat, pinned, onClick }) {
     const dir        = dirClass(row.direction)
     const label      = row.direction === DIRNUM_C2S ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
     const timePart   = `[${row.relTime}]`
@@ -240,9 +282,14 @@ function ChunkHeader({ row }) {
     // is further up, out of the loaded window (front-trimmed while a huge frame was still
     // being scrolled through).
     const continuedPart = row.continued ? '⋯ ' : ''
+    const pinnedPart = pinned ? '▲ ' : ''
+    const sizePart   = sizeFormat === 'count' ? fmtByteCount(row.size) : fmtByteSize(row.size)
+    const title = pinned
+        ? 'Scrolled out of view above — click to jump back to it'
+        : (row.continued ? 'Segment continues from further up — its own header is out of view' : undefined)
     return html`
-        <div class=${'chunk-hdr ' + dir} title=${row.continued ? 'Segment continues from further up — its own header is out of view' : undefined}>
-            ${`${continuedPart}${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${fmtByteSize(row.size)}`}
+        <div class=${'chunk-hdr ' + dir + (pinned ? ' chunk-hdr-pinned' : '')} title=${title} onClick=${onClick}>
+            ${`${continuedPart}${pinnedPart}${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${sizePart}`}
         </div>
     `
 }

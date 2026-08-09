@@ -2,8 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
     initialWindowRange, selectByBudget, computeReachedEnd, wantRangeFor, rangesByDirection,
-    buildFrameWindow, extendRange, mergeExtendedWindow,
+    buildFrameWindow, extendRange, mergeExtendedWindow, excludeAlreadyLoaded,
 } from './frameSegmentsCore.js'
+import { fillToTarget, idsAtStid } from './byteBufferCore.js'
 
 function frame(stid, id, direction, offset, length, time) {
     return { stid, id, direction, offset, length, time, meta: null }
@@ -96,6 +97,19 @@ test('computeReachedEnd: false when selectByBudget left candidates unconsumed, e
     assert.equal(computeReachedEnd(frames, 3, included), false)
 })
 
+test('computeReachedEnd: rawCount defaults to frames.length when omitted', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0)]
+    assert.equal(computeReachedEnd(frames, 1, frames), false) // same as passing rawCount=1 explicitly
+})
+
+test('computeReachedEnd: a full raw page means more may follow, even if filtering an already-loaded tied sibling left frames short of requestN', () => {
+    // frameSegments.js filters out an already-loaded (stid, id) before this is called —
+    // that filtering can shrink frames below requestN even when the server's own page was
+    // full (rawCount === requestN), which must not be misread as "nothing left".
+    const frames = [frame(2, 1, 0, 10, 10, 0)] // one usable frame after filtering
+    assert.equal(computeReachedEnd(frames, 2, frames, 2), false)
+})
+
 // ── wantRangeFor / rangesByDirection ────────────────────────────────────────────────
 
 test('wantRangeFor: a whole (non-truncated) frame wants its full offset/length', () => {
@@ -166,4 +180,100 @@ test('mergeExtendedWindow: backward prepends new bytes before existing, shrinkin
     assert.equal(w.loadedStart, 500)
     assert.equal(w.loadedEnd, 1000)
     assert.deepEqual(Array.from(w.bytes), [5, 6, 7, 8])
+})
+
+// ── excludeAlreadyLoaded ─────────────────────────────────────────────────────────────
+
+test('excludeAlreadyLoaded: drops every listed id at the given stid, keeping everything else', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0), frame(1, 1, 0, 10, 10, 0), frame(3, 0, 1, 0, 10, 0)]
+    const kept = excludeAlreadyLoaded(frames, 1, [0, 1])
+    assert.deepEqual(kept.map(f => `${f.stid}:${f.id}`), ['3:0'])
+})
+
+test('excludeAlreadyLoaded: a single already-consumed id still leaves an unconsumed sibling at the same stid', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0), frame(1, 1, 0, 10, 10, 0)]
+    const kept = excludeAlreadyLoaded(frames, 1, [0])
+    assert.deepEqual(kept.map(f => f.id), [1])
+})
+
+test('excludeAlreadyLoaded: an empty or missing excludeIds is a no-op', () => {
+    const frames = [frame(1, 0, 0, 0, 10, 0)]
+    assert.deepEqual(excludeAlreadyLoaded(frames, 1, []), frames)
+    assert.deepEqual(excludeAlreadyLoaded(frames, 1, undefined), frames)
+})
+
+// ── integration: byteBufferCore's fillToTarget + frame-mode's pure adapter logic ────
+//
+// Reproduces the real bug end to end (2026-08-08): two tied-stid groups, each an
+// oversized frame (needing incremental resumeWindow loading) followed by a small sibling.
+// A fake fillForward wired straight to the real selectByBudget/computeReachedEnd/
+// excludeAlreadyLoaded — the same pieces frameSegments.js's real fillForward calls —
+// proves the combination neither drops nor duplicates a frame across many quanta.
+
+function fakeFrameFillForward(allFrames) {
+    return async (handle, entity, { afterStid, resumeWindow, excludeIds, maxBytes, maxSegments }) => {
+        if (resumeWindow && resumeWindow.loadedEnd < resumeWindow.segment.offset + resumeWindow.segment.length) {
+            const seg = resumeWindow.segment
+            const loadedEnd = Math.min(seg.offset + seg.length, resumeWindow.loadedEnd + maxBytes)
+            return { windows: [{ segment: seg, loadedStart: resumeWindow.loadedStart, loadedEnd, bytes: new Uint8Array(loadedEnd - resumeWindow.loadedStart) }], reachedEnd: false }
+        }
+
+        const requestN = maxSegments + 1
+        const query = resumeWindow ? afterStid : afterStid + 1
+        const rawFrames = allFrames.filter(f => f.stid >= query).slice(0, requestN)
+        const frames = excludeAlreadyLoaded(rawFrames, afterStid, excludeIds)
+
+        const { included, openRange } = selectByBudget(frames, maxSegments, maxBytes, 1)
+        const reachedEnd = computeReachedEnd(frames, requestN, included, rawFrames.length)
+        const windows = included.map(f => {
+            const { wantStart, wantEnd } = wantRangeFor(f, included, openRange)
+            return { segment: f, loadedStart: wantStart, loadedEnd: wantEnd, bytes: new Uint8Array(wantEnd - wantStart) }
+        })
+        return { windows, reachedEnd }
+    }
+}
+
+test('integration: two tied-stid groups (each oversized-then-small) load exactly once each, no duplicates, no drops', async () => {
+    const frame1c = frame(1, 0, 0, 0, 65541)
+    const frame2c = frame(1, 1, 0, 65541, 39)
+    const frame1s = frame(3, 0, 1, 0, 65541)
+    const frame2s = frame(3, 1, 1, 65541, 39)
+    const fill = fakeFrameFillForward([frame1c, frame2c, frame1s, frame2s])
+
+    const windows = []
+    const generationRef = { current: 1 }
+    const result = await fillToTarget(fill, null, {}, windows, 1, -1, null, 1e7, 1e4, generationRef, 1)
+
+    assert.equal(result.reachedEnd, true)
+    assert.deepEqual(
+        windows.map(w => `${w.segment.stid}:${w.segment.id}`),
+        ['1:0', '1:1', '3:0', '3:1'],
+        'every frame appears exactly once, in ascending order',
+    )
+    assert.equal(windows[0].loadedEnd - windows[0].loadedStart, 65541, 'the first oversized frame ended up fully loaded')
+    assert.equal(windows[2].loadedEnd - windows[2].loadedStart, 65541, 'the second oversized frame ended up fully loaded too')
+})
+
+// ── idsAtStid ────────────────────────────────────────────────────────────────────────
+
+test('idsAtStid: forward collects every id tied to the tail, stopping at the first different stid', () => {
+    const windows = [
+        { segment: { stid: 1, id: 0 } },
+        { segment: { stid: 3, id: 0 } },
+        { segment: { stid: 3, id: 1 } },
+    ]
+    assert.deepEqual(idsAtStid(windows, 1, 3), [1, 0])
+})
+
+test('idsAtStid: backward collects every id tied to the head, stopping at the first different stid', () => {
+    const windows = [
+        { segment: { stid: 1, id: 0 } },
+        { segment: { stid: 1, id: 1 } },
+        { segment: { stid: 3, id: 0 } },
+    ]
+    assert.deepEqual(idsAtStid(windows, -1, 1), [0, 1])
+})
+
+test('idsAtStid: an empty windows array yields no ids', () => {
+    assert.deepEqual(idsAtStid([], 1, 5), [])
 })

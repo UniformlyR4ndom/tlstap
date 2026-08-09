@@ -6,6 +6,20 @@ import { mergeUint8Arrays } from './format.js'
 // plain ES module imports). See doc/design/hexview-segment-buffer.md's "Frame-mode
 // adapter" section.
 
+// Drops every frame at exactly `stid` whose id is in excludeIds — used after a metadata
+// fetch made *inclusive* of a boundary stid already partly consumed (see frameSegments.js),
+// to turn the raw result back into "only what's genuinely new". excludeIds must list every
+// id already consumed at that stid, not just the most recent one: a tied group can have
+// more than two members, and each fillForward/fillBackward round resolves only one more —
+// filtering by a single id would let an already-consumed earlier sibling reappear as
+// "new" on the very next round (it doesn't get excluded by the id that round's exclusion
+// happens to carry), producing an infinite reload/duplicate loop instead of converging.
+export function excludeAlreadyLoaded(frames, stid, excludeIds) {
+    if (!excludeIds || excludeIds.length === 0) return frames
+    const ids = new Set(excludeIds)
+    return frames.filter(f => !(f.stid === stid && ids.has(f.id)))
+}
+
 // The sub-range of a too-big-to-load-whole frame f to fetch on its first touch.
 // Forward (dir=1, opened while scrolling *into* it from its start): anchor at f.offset,
 // so later forward extension grows loadedEnd — exactly mergeExtendedWindow's forward
@@ -19,15 +33,22 @@ export function initialWindowRange(dir, f, maxBytes) {
 }
 
 // True only if there is genuinely nothing left to fetch in this direction: the metadata
-// listing itself ran dry (frames.length < requestN) *and* selectByBudget consumed every
-// candidate it returned. The latter half matters because selectByBudget can stop short
-// of the full frames list purely on budget (byte cap, segment cap, or the
+// listing itself ran dry (rawCount < requestN) *and* selectByBudget consumed every
+// candidate it was given (frames — after any already-loaded-tied-sibling filtering the
+// caller applied, see frameSegments.js). The latter half matters because selectByBudget
+// can stop short of the full frames list purely on budget (byte cap, segment cap, or the
 // oversized-single-candidate case) — that leftover metadata still describes real,
 // not-yet-fetched segments, so reporting "reached end" on metadata exhaustion alone would
 // strand them: the caller latches reachedEnd into a ref that permanently gates further
 // fetches in that direction.
-export function computeReachedEnd(frames, requestN, included) {
-    return frames.length < requestN && included.length === frames.length
+//
+// rawCount defaults to frames.length (frames itself is the raw fetch) for a caller with
+// nothing to filter out; frameSegments.js passes its actual raw fetch count explicitly,
+// since filtering out an already-loaded tied sibling can shrink frames below requestN even
+// when the server's own page was full (and so may have more beyond it) — comparing the
+// *filtered* count against requestN there would misreport reachedEnd early.
+export function computeReachedEnd(frames, requestN, included, rawCount = frames.length) {
+    return rawCount < requestN && included.length === frames.length
 }
 
 // Decides which of candidatesNearestFirst (frame metadata, ordered nearest-to-the-

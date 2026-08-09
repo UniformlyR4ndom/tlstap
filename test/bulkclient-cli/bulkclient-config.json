@@ -14,6 +14,6 @@
     "test-large-frame": {
         "connect": "127.0.0.1:8000",
         "comment": "run with -length-prefix against examples/dbdump/framer/length-prefix-framer.js to produce one genuinely large frame, well past the byte-budgeted segment buffer's MAX_BUFFERED_BYTES (see doc/design/hexview-segment-buffer.md)",
-        "msg-sizes": [17, 130, 3000000, 116, 2222222]
+        "msg-sizes": [17, 130, 3000000, 116, 2222222, 22, 3333333, 33, 4444444, 44, 5555555, 55]
     }
 }

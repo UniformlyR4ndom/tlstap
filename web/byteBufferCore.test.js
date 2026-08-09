@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildRows, evict, fillToTarget } from './byteBufferCore.js'
+import { buildRows, evict, fillToTarget, windowIndexAtRow, rowIndexOfWindow } from './byteBufferCore.js'
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────
 
@@ -118,6 +118,59 @@ test('evict: never leaves a zero-byte window behind (drops instead of trimming t
     const { windows: out, removedRows } = evict([w], 1, 0, Infinity)
     assert.equal(out.length, 0)
     assert.equal(removedRows, 2) // 1 header + 1 hex row
+})
+
+// ── windowIndexAtRow / rowIndexOfWindow ─────────────────────────────────────────────
+
+// w0: 1 header + ceil(16/16)=1 hex row = rows [0, 1]
+// w1: 1 header + ceil(32/16)=2 hex rows = rows [2, 3, 4]
+// w2: 1 header + ceil(16/16)=1 hex row  = rows [5, 6]
+function threeWindows() {
+    return [
+        fullWin(seg(1, 0, 0, 0, 16, 0)),
+        fullWin(seg(2, 0, 0, 16, 32, 0)),
+        fullWin(seg(3, 0, 0, 48, 16, 0)),
+    ]
+}
+
+test('windowIndexAtRow: finds the window whose span contains a mid-segment row', () => {
+    const windows = threeWindows()
+    assert.equal(windowIndexAtRow(windows, 3), 1) // a hex row inside w1's span
+})
+
+test('windowIndexAtRow: a row exactly on a header belongs to that window, not the previous one', () => {
+    const windows = threeWindows()
+    assert.equal(windowIndexAtRow(windows, 2), 1) // w1's own header row
+    assert.equal(windowIndexAtRow(windows, 5), 2) // w2's own header row
+})
+
+test('windowIndexAtRow: the very first row belongs to the first window', () => {
+    assert.equal(windowIndexAtRow(threeWindows(), 0), 0)
+})
+
+test('windowIndexAtRow: a row past the last window\'s span is out of range', () => {
+    assert.equal(windowIndexAtRow(threeWindows(), 7), -1)
+})
+
+test('windowIndexAtRow: an empty windows array has no rows at all', () => {
+    assert.equal(windowIndexAtRow([], 0), -1)
+})
+
+test('rowIndexOfWindow: the first window always starts at row 0', () => {
+    assert.equal(rowIndexOfWindow(threeWindows(), 0), 0)
+})
+
+test('rowIndexOfWindow: later windows start after every prior window\'s full row span', () => {
+    const windows = threeWindows()
+    assert.equal(rowIndexOfWindow(windows, 1), 2) // after w0's 2 rows
+    assert.equal(rowIndexOfWindow(windows, 2), 5) // after w0(2) + w1(3)
+})
+
+test('windowIndexAtRow/rowIndexOfWindow round-trip: every window\'s own start row maps back to itself', () => {
+    const windows = threeWindows()
+    for (let i = 0; i < windows.length; i++) {
+        assert.equal(windowIndexAtRow(windows, rowIndexOfWindow(windows, i)), i)
+    }
 })
 
 // ── fillToTarget ─────────────────────────────────────────────────────────────────────
@@ -242,6 +295,34 @@ test('fillToTarget: a no-progress quantum breaks the loop instead of spinning fo
 
     assert.equal(fill.calls.length, 1, 'must give up after the first no-progress quantum, not loop')
     assert.equal(result.addedBytes, 0)
+})
+
+test('fillToTarget: keeps passing the completed edge as resumeWindow, so an adapter can still surface a tied-stid sibling', async () => {
+    // Reproduces the real bug: two frames complete on the same raw chunk (same stid), the
+    // first big enough to need incremental loading. An adapter (frameSegments.js) that
+    // requeries *inclusive* of resumeWindow's stid once it's full — rather than being
+    // handed a nulled-out resumeWindow and an exclusive-of-that-stid boundary — can still
+    // find the second one instead of skipping it forever.
+    const big   = seg(1, 0, 0, 0, 40, 0)
+    const small = seg(1, 1, 0, 40, 8, 0)
+    const fill = fakeFill([
+        { windows: [win(big, 0, 20)], reachedEnd: false }, // partial load of the big frame
+        { windows: [win(big, 0, 40)], reachedEnd: false }, // finishes loading it
+        { windows: [fullWin(small)], reachedEnd: true },   // tied sibling, found via the now-full edge
+    ])
+    const windows = []
+    const genRef = { current: 1 }
+    const result = await fillToTarget(fill, null, {}, windows, 1, -1, null, 1000, 1000, genRef, 1)
+
+    assert.equal(result.reachedEnd, true)
+    assert.deepEqual(windows.map(w => ({ stid: w.segment.stid, id: w.segment.id })), [{ stid: 1, id: 0 }, { stid: 1, id: 1 }])
+    assert.equal(windows[0].loadedEnd, 40, 'the big frame ended up fully loaded')
+    assert.equal(windows[1].loadedStart, 40, 'the sibling was appended, not merged into the big frame')
+
+    // The 3rd call must receive the just-completed big frame as resumeWindow — not null —
+    // so an adapter can recognize "same stid, may have more" instead of a closed chapter.
+    assert.equal(fill.calls[2].resumeWindow.segment.id, 0)
+    assert.equal(fill.calls[2].resumeWindow.loadedEnd, 40)
 })
 
 test('fillToTarget: per-quantum maxBytes/maxSegments are clamped to the remaining target', async () => {

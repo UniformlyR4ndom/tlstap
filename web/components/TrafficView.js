@@ -2,17 +2,14 @@ import { h } from 'preact'
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
 import htm from 'htm'
 import { getChunkStid, getByteStid } from '../api.js'
-import { getFramerScript } from '../dbdumpFramerApi.js'
+import { getFramerScript, clearStreamFrames } from '../dbdumpFramerApi.js'
 import { catchUpFramer, sha256Hex } from '../framerRun.js'
 import { loadStreamFramerScript, saveStreamFramerScript } from '../framerPrefs.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
-import MarkersPanel from './MarkersPanel.js'
-import ResizeHandle from './ResizeHandle.js'
-import { useResizableLayout } from '../useResizableLayout.js'
 import { useByteBuffer, FILL_TARGET_SEGMENTS } from '../useByteBuffer.js'
 import { openConnection as openChunkSegments, fillForward as fillChunkForward, fillBackward as fillChunkBackward } from '../chunkSegments.js'
 import { openConnection as openFrameSegments, fillForward as fillFrameForward, fillBackward as fillFrameBackward } from '../frameSegments.js'
-import { fmtByteSize, fmtDuration } from '../format.js'
+import { fmtByteSize, fmtDuration, fmtLogArgs } from '../format.js'
 import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
 const html = htm.bind(h)
@@ -21,10 +18,8 @@ function isClosed(stream) {
     return !!stream.end
 }
 
-export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onUpdateMarkerLabel, onMarkerJumpRequest, onImportMarkers, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts }) {
+export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeader, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts, onFramerLog, onFramerLogReset }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
-    const [markersPanelCollapsed, setMarkersPanelCollapsed] = useState(false)
-    const [markersWidth, handleMarkersResize] = useResizableLayout('markersWidth', { sign: -1, min: 150, max: 500 })
     const viewHeightRef = useRef(0)
     const scrollTopRef = useRef(0)
 
@@ -38,7 +33,10 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     const [frameScriptRunning, setFrameScriptRunning] = useState(null) // { name, version, content }
     const [frameRefreshKey, setFrameRefreshKey] = useState(0)
 
-    const { display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef, jumpToTop, jumpToBottom } = useByteBuffer({
+    const {
+        display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
+        jumpToTop, jumpToBottom, jumpToNextSegment, jumpToPrevSegment,
+    } = useByteBuffer({
         entity: stream,
         refreshKey,
         openConnection: openChunkSegments,
@@ -48,7 +46,9 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         latestId: latestStid,
     })
 
-    const frameEntity = (frameState === 'framed' && frameScriptRunning && stream) ? {
+    const inFrameView = frameState === 'framed'
+
+    const frameEntity = (inFrameView && frameScriptRunning && stream) ? {
         id: `${stream.id}:${frameScriptRunning.version}`,
         end: stream.end,
         start: stream.start,
@@ -63,6 +63,10 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         loading: frameLoading,
         error: frameFetchError,
         handleScrollEnd: frameHandleScrollEnd,
+        jumpToTop: frameJumpToTop,
+        jumpToBottom: frameJumpToBottom,
+        jumpToNextSegment: frameJumpToNextSegment,
+        jumpToPrevSegment: frameJumpToPrevSegment,
     } = useByteBuffer({
         entity: frameEntity,
         refreshKey: frameRefreshKey,
@@ -70,6 +74,14 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         fillForward: fillFrameForward,
         fillBackward: fillFrameBackward,
         isClosed,
+        // A frame's own stid is always that of the raw chunk containing its last byte, so
+        // the chunk-level latestStid is a valid upper bound for "the end" of the frame
+        // timeline too, even though it's not literally the latest frame's own id — good
+        // enough for jumpToBottom below. This also means this hook's own live-poll top-up
+        // reaction can fire alongside the live-tailing effect further down; harmless (a
+        // redundant top-up when nothing's new is one cheap metadata query), not worth
+        // suppressing separately.
+        latestId: latestStid,
     })
 
     // Resets on every stream (re)selection — frame view is never remembered across a
@@ -80,11 +92,18 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         setFrameError(null)
         setFrameScriptRunning(null)
         setFramerSelected(stream ? (loadStreamFramerScript(stream.session, stream.id) ?? '') : '')
+        onFramerLogReset?.()
     }, [stream?.id])
 
     function handleFramerSelect(name) {
         setFramerSelected(name)
         if (stream) saveStreamFramerScript(stream.session, stream.id, name)
+    }
+
+    // Shared between the initial Run and the live-tailing effect below — both must
+    // format/tag a script's framer.log(...) calls identically.
+    function handleFramerScriptLog(direction, args) {
+        onFramerLog?.(direction, fmtLogArgs(args), 'log')
     }
 
     async function handleRunFramer() {
@@ -93,17 +112,25 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         setFrameError(null)
         try {
             const content = await getFramerScript(framerSelected)
-            await Promise.all([
-                catchUpFramer(stream.session, stream.id, DIRNUM_C2S, framerSelected, content),
-                catchUpFramer(stream.session, stream.id, DIRNUM_S2C, framerSelected, content),
-            ])
             const version = await sha256Hex(content)
+            // Enforces "at most one framing view per stream": purges any other
+            // script/version's frame data for this stream first. A no-op if this exact
+            // (script, version) is already the one active here, so catchUpFramer still
+            // resumes rather than reprocessing.
+            await clearStreamFrames({ session: stream.session, stream: stream.id, script: framerSelected, scriptVersion: version })
+            await Promise.all([
+                catchUpFramer(stream.session, stream.id, DIRNUM_C2S, framerSelected, content, handleFramerScriptLog),
+                catchUpFramer(stream.session, stream.id, DIRNUM_S2C, framerSelected, content, handleFramerScriptLog),
+            ])
             saveStreamFramerScript(stream.session, stream.id, framerSelected)
             setFrameScriptRunning({ name: framerSelected, version, content })
             setFrameState('framed')
         } catch (e) {
             setFrameError(`Framer "${framerSelected}" failed: ${e.message}`)
             setFrameState('raw')
+            // direction: null — a script-level failure (e.g. no top-level frame function)
+            // isn't attributable to one direction specifically.
+            onFramerLog?.(null, e.message, 'error')
         }
     }
 
@@ -117,8 +144,8 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         ;(async () => {
             try {
                 await Promise.all([
-                    catchUpFramer(stream.session, stream.id, DIRNUM_C2S, frameScriptRunning.name, frameScriptRunning.content),
-                    catchUpFramer(stream.session, stream.id, DIRNUM_S2C, frameScriptRunning.name, frameScriptRunning.content),
+                    catchUpFramer(stream.session, stream.id, DIRNUM_C2S, frameScriptRunning.name, frameScriptRunning.content, handleFramerScriptLog),
+                    catchUpFramer(stream.session, stream.id, DIRNUM_S2C, frameScriptRunning.name, frameScriptRunning.content, handleFramerScriptLog),
                 ])
             } catch { /* best-effort; see comment above */ }
             if (!cancelled) setFrameRefreshKey(k => k + 1)
@@ -131,10 +158,30 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
         setTotalBytes(stream ? { up: stream.length0 ?? -1, down: stream.length1 ?? -1 } : { up: -1, down: -1 })
     }, [stream?.id])
 
-    // Exposes the hook's jump functions for the caller's header buttons. No dependency
-    // array — jumpToTop/jumpToBottom aren't stable identities from the hook, so this
+    // Exposes whichever hook's jump functions are actually on screen for the caller's
+    // header buttons — frame view renders frameDisplay (below), not display, so jumping
+    // the raw hook while in frame view would silently move a buffer nobody's looking at.
+    // jumpToNextSegment/jumpToPrevSegment need the viewport's current row, which the hook
+    // doesn't track itself — wrapped here so the caller's buttons keep the same zero-arg
+    // signature as jumpToTop/jumpToBottom, reading scrollTopRef fresh at click time (the
+    // same ref/math the "remember stream position" leave-effect below already uses).
+    // No dependency array — none of these are stable identities from the hook, so this
     // just re-runs every render rather than risk going stale behind a gated dependency array.
-    useEffect(() => { if (jumpRef) jumpRef.current = { jumpToTop, jumpToBottom } })
+    useEffect(() => {
+        if (!jumpRef) return
+        const currentRow = () => Math.floor(scrollTopRef.current / ROW_HEIGHT)
+        jumpRef.current = inFrameView
+            ? {
+                jumpToTop: frameJumpToTop, jumpToBottom: frameJumpToBottom,
+                jumpToNextSegment: () => frameJumpToNextSegment(currentRow()),
+                jumpToPrevSegment: () => frameJumpToPrevSegment(currentRow()),
+            }
+            : {
+                jumpToTop, jumpToBottom,
+                jumpToNextSegment: () => jumpToNextSegment(currentRow()),
+                jumpToPrevSegment: () => jumpToPrevSegment(currentRow()),
+            }
+    })
 
     // Jump effect — resolves jumpTo to a target stid, then calls the hook's reloadFrom.
     // `cancelled` guards against a stale resolution superseding a newer jump.
@@ -232,7 +279,6 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
     if (!stream) return html`<div class="placeholder">Select a stream to view traffic</div>`
 
     const { up, down } = totalBytes
-    const inFrameView = frameState === 'framed'
     return html`
         <div class="traffic-view">
             <div class="stream-meta">
@@ -272,6 +318,8 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                         scrollTo=${frameDisplay.scrollTo}
                         scrollToVersion=${frameDisplay.scrollToVersion}
                         globalOffset=${globalOffset}
+                        sizeFormat=${sizeFormat}
+                        pinHeader=${pinHeader}
                         onViewportChange=${handleViewportChange}
                         markers=${[]}
                     />
@@ -285,6 +333,8 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                         scrollTo=${display.scrollTo}
                         scrollToVersion=${display.scrollToVersion}
                         globalOffset=${globalOffset}
+                        sizeFormat=${sizeFormat}
+                        pinHeader=${pinHeader}
                         onSetMarker=${handleSetMarker}
                         onClearMarker=${handleClearMarker}
                         onSetExtractStart=${onSetExtractStart}
@@ -294,17 +344,6 @@ export default function TrafficView({ stream, globalOffset, jumpTo, refreshKey, 
                         markers=${streamMarkers}
                     />
                 `}
-                ${!markersPanelCollapsed && html`<${ResizeHandle} orientation="v" onResize=${handleMarkersResize} />`}
-                <${MarkersPanel}
-                    markers=${(markers ?? []).filter(m => m.session === stream.session)}
-                    onRemove=${onRemoveMarker}
-                    onUpdateLabel=${onUpdateMarkerLabel}
-                    onJump=${m => onMarkerJumpRequest?.(m)}
-                    onImport=${onImportMarkers}
-                    collapsed=${markersPanelCollapsed}
-                    onToggle=${() => setMarkersPanelCollapsed(v => !v)}
-                    width=${markersWidth}
-                />
             </div>
         </div>
     `

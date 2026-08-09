@@ -6,53 +6,8 @@ import {
     javascript, scopeCompletionSource,
     HighlightStyle, syntaxHighlighting, tags,
 } from '../vendor/codemirror.module.js'
-import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
-import { camelCaseOpId } from '../scriptRuntime.js'
 
 const html = htm.bind(h)
-
-// Reflection-only mirror of the real self.tamper API, for scopeCompletionSource to read
-// property names/types off of — never called. transform's shape is generated from
-// OPERATIONS_BY_CATEGORY/camelCaseOpId, the same inputs the real API uses, so a new
-// transform op appears here without a separate update.
-const TAMPER_COMPLETION_SHAPE = {
-    register: () => {},
-    peek: () => {},
-    release: () => {},
-    dropConnection: () => {},
-    setIntercept: () => {},
-    listStreams: () => {},
-    fs: {
-        listFiles: () => {},
-        readFile: () => {},
-        writeFile: () => {},
-        appendFile: () => {},
-    },
-    transform: Object.fromEntries(Object.entries(OPERATIONS_BY_CATEGORY).map(([category, ops]) =>
-        [category, Object.fromEntries(Object.keys(ops).map(opId => [camelCaseOpId(opId), () => {}]))])),
-    encode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
-    decode: { hex: () => {}, base64: () => {}, hexdump: () => {} },
-    log: () => {},
-}
-
-// Same idea as TAMPER_COMPLETION_SHAPE, mirroring the real ctx object handed to
-// onReceive (minus __flush, internal-only there). scopeCompletionSource matches on
-// identifier text alone, not real lexical scope, so `ctx.` completes anywhere in the
-// document, including outside an onReceive callback — a one-time, deliberate
-// imprecision: harmless since it only ever adds unwanted suggestions, never blocks or
-// slows typing.
-const CTX_COMPLETION_SHAPE = {
-    conn: 0,
-    direction: 'c2s',
-    newLength: 0,
-    get: () => {},
-    set: () => {},
-    append: () => {},
-    release: () => {},
-    drop: () => {},
-    pause: () => {},
-    log: () => {},
-}
 
 // Dark theme + syntax colors matching this app's own CSS variables — kept here rather
 // than in a stylesheet since CodeMirror styles its content via classed spans generated
@@ -83,10 +38,14 @@ const highlightStyle = HighlightStyle.define([
     { tag: tags.punctuation, color: 'var(--text-dim)' },
 ])
 
-// Controlled-ish: <${ScriptEditor} value onChange loadVersion readOnly? />. CodeMirror
-// owns the DOM/cursor/undo-history state internally; this wrapper reports every edit
-// upward via onChange, but only pushes `value` into CodeMirror when `loadVersion`
-// changes — the caller must bump it on every genuinely external reset, and only then.
+// Controlled-ish: <${ScriptEditor} value onChange loadVersion completions readOnly? />.
+// CodeMirror owns the DOM/cursor/undo-history state internally; this wrapper reports
+// every edit upward via onChange, but only pushes `value` into CodeMirror when
+// `loadVersion` changes — the caller must bump it on every genuinely external reset, and
+// only then. `completions` is an object passed straight to CodeMirror's
+// scopeCompletionSource (e.g. `{tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE}`
+// for a tamper script, `{framer: FRAMER_COMPLETION_SHAPE}` for a framer script) — baked
+// into the editor once at mount, not reactive to later changes (no caller needs that).
 //
 // A string-equality check can't substitute for loadVersion: CodeMirror applies
 // keystrokes synchronously, independent of Preact's deferred effect scheduling, so an
@@ -95,7 +54,7 @@ const highlightStyle = HighlightStyle.define([
 // that rolls back real typing — and since that rollback is itself a docChange, it can
 // trigger the same race again. Gating on an explicit loadVersion signal sidesteps this
 // structurally: the sync effect never runs during typing at all.
-export default function ScriptEditor({ value, onChange, loadVersion, readOnly = false }) {
+export default function ScriptEditor({ value, onChange, loadVersion, completions, readOnly = false }) {
     const containerRef = useRef(null)
     const viewRef = useRef(null)
     const readOnlyCompartmentRef = useRef(null)
@@ -114,7 +73,7 @@ export default function ScriptEditor({ value, onChange, loadVersion, readOnly = 
                     basicSetup,
                     keymap.of([indentWithTab]),
                     jsLanguage,
-                    jsLanguage.language.data.of({ autocomplete: scopeCompletionSource({ tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE }) }),
+                    jsLanguage.language.data.of({ autocomplete: scopeCompletionSource(completions) }),
                     syntaxHighlighting(highlightStyle),
                     theme,
                     readOnlyCompartment.of(EditorState.readOnly.of(readOnly)),

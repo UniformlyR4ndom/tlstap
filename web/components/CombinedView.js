@@ -41,7 +41,7 @@ function buildRows(chunks, sessionStart) {
     return rows
 }
 
-export default function CombinedView({ session, globalOffset, refreshKey, latestSgid, jumpRef }) {
+export default function CombinedView({ session, globalOffset, sizeFormat, pinHeader, refreshKey, latestSgid, jumpRef }) {
     const { display, loading, error, handleScrollEnd, jumpToTop, jumpToBottom } = useChunkBuffer({
         entity: session,
         refreshKey,
@@ -73,6 +73,8 @@ export default function CombinedView({ session, globalOffset, refreshKey, latest
                 scrollTo=${display.scrollTo}
                 scrollToVersion=${display.scrollToVersion}
                 globalOffset=${globalOffset}
+                sizeFormat=${sizeFormat}
+                pinHeader=${pinHeader}
             />
         </div>
     `

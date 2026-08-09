@@ -214,6 +214,99 @@ func TestPurgeAllFrameVersions(t *testing.T) {
 	}
 }
 
+func TestClearStreamFrames(t *testing.T) {
+	d := newTestInterceptor(t)
+	keep := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v2"}
+	staleVersion := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+	otherScript := frameKey{Session: 1, Stream: 1, Direction: 1, Script: "bar", ScriptVersion: "v1"}
+	otherStream := frameKey{Session: 1, Stream: 2, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+	otherSession := frameKey{Session: 2, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+
+	for _, k := range []frameKey{keep, staleVersion, otherScript, otherStream, otherSession} {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	keepTimeline := frameTimelineKey{Session: keep.Session, Stream: keep.Stream, Script: keep.Script, ScriptVersion: keep.ScriptVersion}
+	if err := d.clearStreamFrames(keepTimeline); err != nil {
+		t.Fatal(err)
+	}
+
+	if frames, err := d.listFrames(keep, 0, 0); err != nil || len(frames) != 1 {
+		t.Fatalf("expected keep kept, got frames=%+v err=%v", frames, err)
+	}
+	for _, k := range []frameKey{staleVersion, otherScript} {
+		if frames, err := d.listFrames(k, 0, 0); err != nil || len(frames) != 0 {
+			t.Fatalf("expected %+v purged (same stream, different script/version), got frames=%+v err=%v", k, frames, err)
+		}
+		if offset, _, err := d.getFrameProgress(k); err != nil || offset != 0 {
+			t.Fatalf("expected %+v progress purged, got offset=%d err=%v", k, offset, err)
+		}
+	}
+	for _, k := range []frameKey{otherStream, otherSession} {
+		if frames, err := d.listFrames(k, 0, 0); err != nil || len(frames) != 1 {
+			t.Fatalf("expected %+v untouched (different stream/session), got frames=%+v err=%v", k, frames, err)
+		}
+	}
+}
+
+// TestClearStreamFrames_KeepSameVersionIsNoop confirms rerunning the same (script,
+// script_version) already active for a stream leaves its frame_progress intact —
+// TrafficView.js's handleRunFramer relies on this to resume rather than reprocess an
+// unchanged rerun.
+func TestClearStreamFrames_KeepSameVersionIsNoop(t *testing.T) {
+	d := newTestInterceptor(t)
+	key := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	keepTimeline := frameTimelineKey{Session: key.Session, Stream: key.Stream, Script: key.Script, ScriptVersion: key.ScriptVersion}
+	if err := d.clearStreamFrames(keepTimeline); err != nil {
+		t.Fatal(err)
+	}
+
+	if frames, err := d.listFrames(key, 0, 0); err != nil || len(frames) != 1 {
+		t.Fatalf("expected frame data kept, got frames=%+v err=%v", frames, err)
+	}
+	if offset, _, err := d.getFrameProgress(key); err != nil || offset != 10 {
+		t.Fatalf("expected progress kept at 10, got offset=%d err=%v", offset, err)
+	}
+}
+
+// TestFramesClearAPI_HTTP is the HTTP-level counterpart to TestClearStreamFrames,
+// exercising the real POST /frames/clear route.
+func TestFramesClearAPI_HTTP(t *testing.T) {
+	d := newTestInterceptor(t)
+	mux := http.NewServeMux()
+	d.RegisterRoutes(mux, "/api/i/dbdump")
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	keep := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v2"}
+	stale := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+	for _, k := range []frameKey{keep, stale} {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	status := postJSON(t, server.URL+"/api/i/dbdump/frames/clear", map[string]any{
+		"session": keep.Session, "stream": keep.Stream, "script": keep.Script, "script_version": keep.ScriptVersion,
+	}, nil)
+	if status != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", status)
+	}
+
+	if frames, err := d.listFrames(keep, 0, 0); err != nil || len(frames) != 1 {
+		t.Fatalf("expected keep kept, got frames=%+v err=%v", frames, err)
+	}
+	if frames, err := d.listFrames(stale, 0, 0); err != nil || len(frames) != 0 {
+		t.Fatalf("expected stale purged, got frames=%+v err=%v", frames, err)
+	}
+}
+
 // TestFramerScriptsAPI_PutPurgesStaleVersions is an end-to-end test that PUTting a
 // framer script (via the scriptstore-backed REST endpoints RegisterRoutes wires)
 // triggers onFramerScriptPut, purging every other persisted frame-index version for

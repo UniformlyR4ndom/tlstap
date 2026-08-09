@@ -203,6 +203,15 @@ body {
 .chunk-hdr.c2s { color: var(--c2s); background: rgba(121,192,255,0.07); }
 .chunk-hdr.s2c { color: var(--s2c); background: rgba(86,211,100,0.07); }
 
+.chunk-hdr-pinned-wrap { position: sticky; top: 0; height: 0; overflow: visible; z-index: 20; }
+.chunk-hdr.chunk-hdr-pinned {
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 3px 6px -2px rgba(0,0,0,0.5);
+}
+.chunk-hdr.chunk-hdr-pinned.c2s { background: #151d27; }
+.chunk-hdr.chunk-hdr-pinned.s2c { background: #121f1c; }
+
 .hex-row.c2s { color: #c5dffe; }
 .hex-row.s2c { color: #c2f0cd; }
 .hex-off { color: var(--text-dim); }
@@ -864,6 +873,32 @@ body {
     min-height: 0;
     overflow: hidden;
 }
+/* Analysis tab's "Framing" bottom-panel tab (FramingPanel.js): Scripts/Log as sub-tabs,
+   same shape as the Tamper tab's own Intercept/Scripts split — .tamper-subtabs is reused
+   directly (nothing tamper-specific in its styling, just a generic sub-tab row). */
+.framing-panel {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+.framing-body {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+/* FramerScriptsPanel.js: ScriptsCrudPanel.js reused directly for its content
+   (.tamper-scripts-list-panel/.tamper-script-row/etc. all apply unchanged), but its root
+   sits inside .framing-body (flex: 1) rather than the flex-column parent
+   .tamper-scripts-main sits in above — sized via height: 100% (matching
+   .encdec-panel/.search-panel) rather than flex: 1. */
+.framer-scripts-view {
+    height: 100%;
+    display: flex;
+    min-height: 0;
+    overflow: hidden;
+}
 .tamper-scripts-list-panel {
     /* Overrides .panel's `flex: 1` (grow:1, shrink:1, basis:0%) entirely: with a
        0% basis the element ignores `width` and just splits space with its flex
@@ -950,6 +985,17 @@ body {
 }
 .tamper-log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-word; }
 .tamper-log-error { color: #f85149; }
+
+/* Analysis tab's "Log" bottom-panel tab (FramerLogPanel.js) — reuses
+   .tamper-scripts-log-body/.tamper-log-line/.tamper-log-error above for its content;
+   height: 100% for the same reason .framer-scripts-view is, above. */
+.framer-log-panel {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
 
 .tamper-log-bypass-toggle {
     display: flex;
@@ -1063,7 +1109,8 @@ body {
 .tamper-insert-row select { flex: 1; }
 .tamper-insert-popover .error-msg { padding: 0; }
 
-/* ── Traffic body (hex + markers side panel) ── */
+/* ── Traffic body (hex view; markers live in the Analysis bottom panel's Markers tab,
+   not here — see below) ── */
 .traffic-body {
     flex: 1;
     display: flex;
@@ -1072,124 +1119,6 @@ body {
 }
 .traffic-body > .hexdump-wrap { flex: 1; min-width: 0; }
 
-/* ── Markers side panel ── */
-.markers-side {
-    flex-shrink: 0;
-    border-left: 1px solid var(--border);
-    background: var(--surface);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-}
-.markers-side-header {
-    padding: 6px 10px;
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-.markers-collapse-btn {
-    cursor: pointer;
-    font-size: 10px;
-    padding: 2px 4px;
-    border-radius: 3px;
-    color: var(--text-dim);
-}
-.markers-collapse-btn:hover { background: var(--border); color: var(--text); }
-.markers-side-list {
-    flex: 1;
-    overflow-y: auto;
-    min-height: 0;
-}
-.markers-empty {
-    padding: 10px;
-    font-size: 12px;
-    color: var(--text-dim);
-}
-
-/* Collapsed strip */
-.markers-strip {
-    width: 24px;
-    flex-shrink: 0;
-    border-left: 1px solid var(--border);
-    background: var(--surface);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding-top: 8px;
-    gap: 6px;
-    cursor: pointer;
-    user-select: none;
-}
-.markers-strip:hover { background: var(--hover-bg); }
-.markers-strip-triangle {
-    font-size: 8px;
-    color: var(--text-dim);
-}
-.markers-strip-label {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    writing-mode: vertical-rl;
-    text-orientation: mixed;
-}
-
-/* Marker rows in side panel */
-.marker-row {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-}
-.marker-row:hover { background: var(--hover-bg); }
-.marker-row-top {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 3px;
-}
-.marker-loc {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 11px;
-    flex: 1;
-}
-.marker-dir {
-    font-size: 10px;
-    font-weight: 600;
-    padding: 0 4px;
-    border-radius: 3px;
-    background: var(--bg);
-}
-.marker-off {
-    font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 11px;
-    flex: 1;
-}
-.marker-del {
-    font-size: 14px;
-    line-height: 1;
-    color: var(--text-dim);
-    cursor: pointer;
-    padding: 0 2px;
-}
-.marker-del:hover { color: #f85149; }
-.marker-label {
-    font-size: 11px;
-    color: var(--text);
-    word-break: break-word;
-    min-height: 14px;
-}
-.marker-label-empty { color: var(--text-dim); font-style: italic; }
 .markers-io-bar {
     display: flex;
     align-items: center;
@@ -1207,16 +1136,6 @@ body {
 }
 .markers-io-status-ok  { color: var(--accent); }
 .markers-io-status-err { color: #e06c75; }
-.marker-label-input {
-    width: 100%;
-    padding: 2px 4px;
-    background: var(--bg);
-    border: 1px solid var(--accent);
-    color: var(--text);
-    border-radius: 3px;
-    font-size: 11px;
-    outline: none;
-}
 
 /* ── Markers bottom tab ── */
 .markers-tab {
