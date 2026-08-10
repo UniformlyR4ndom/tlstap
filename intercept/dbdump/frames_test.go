@@ -43,7 +43,7 @@ func TestFrameProgress_NotStarted(t *testing.T) {
 	d := newTestInterceptor(t)
 	key := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
 
-	offset, state, err := d.getFrameProgress(key)
+	offset, state, _, err := d.getFrameProgress(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,12 +59,12 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	err := d.appendFrames(key, 0, []frameInput{
 		{Offset: 0, Length: 10, Meta: strPtr("a"), Time: 1000},
 		{Offset: 10, Length: 5, Meta: nil, Time: 1005},
-	}, 15, []byte("state1"))
+	}, 15, []byte("state1"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	offset, state, err := d.getFrameProgress(key)
+	offset, state, _, err := d.getFrameProgress(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,10 +87,10 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	}
 
 	// A second batch continues ids from where the first left off and advances progress.
-	if err := d.appendFrames(key, 15, []frameInput{{Offset: 15, Length: 20}}, 35, []byte("state2")); err != nil {
+	if err := d.appendFrames(key, 15, []frameInput{{Offset: 15, Length: 20}}, 35, []byte("state2"), false); err != nil {
 		t.Fatal(err)
 	}
-	offset, state, err = d.getFrameProgress(key)
+	offset, state, _, err = d.getFrameProgress(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,22 +106,58 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	}
 }
 
+// TestFrameProgress_ClosedFlag confirms the connection-close bit persists independently
+// of processed_offset/state: it starts false, an appendFrames call with closed=true sets
+// it without disturbing the other fields, and a subsequent ordinary (closed=false) call
+// for a *different* key is unaffected.
+func TestFrameProgress_ClosedFlag(t *testing.T) {
+	d := newTestInterceptor(t)
+	key := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
+	other := frameKey{Session: 1, Stream: 1, Direction: 1, Script: "foo", ScriptVersion: "v1"}
+
+	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, []byte("state1"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, closed, err := d.getFrameProgress(key); err != nil || closed {
+		t.Fatalf("expected closed=false before the closing call, got closed=%v err=%v", closed, err)
+	}
+
+	// The dedicated closing call: no new frames, processed_offset unchanged, closed=true.
+	if err := d.appendFrames(key, 10, nil, 10, []byte("state1"), true); err != nil {
+		t.Fatal(err)
+	}
+	offset, state, closed, err := d.getFrameProgress(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closed || offset != 10 || string(state) != "state1" {
+		t.Fatalf("expected (10, %q, true), got (%d, %q, %v)", "state1", offset, state, closed)
+	}
+
+	if err := d.appendFrames(other, 0, []frameInput{{Offset: 0, Length: 5}}, 5, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, closed, err := d.getFrameProgress(other); err != nil || closed {
+		t.Fatalf("expected the other key's closed flag untouched, got closed=%v err=%v", closed, err)
+	}
+}
+
 func TestAppendFrames_ConflictOnStaleOffset(t *testing.T) {
 	d := newTestInterceptor(t)
 	key := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
 
-	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
 	// expectedProcessedOffset still claims 0, but the stored value is now 10.
-	err := d.appendFrames(key, 0, []frameInput{{Offset: 10, Length: 5}}, 15, nil)
+	err := d.appendFrames(key, 0, []frameInput{{Offset: 10, Length: 5}}, 15, nil, false)
 	if err != errFrameProgressConflict {
 		t.Fatalf("expected errFrameProgressConflict, got %v", err)
 	}
 
 	// The rejected call must not have written anything.
-	offset, _, err := d.getFrameProgress(key)
+	offset, _, _, err := d.getFrameProgress(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +181,7 @@ func TestListFrames_Paging(t *testing.T) {
 	for j := range inputs {
 		inputs[j] = frameInput{Offset: int64(j * 10), Length: 10}
 	}
-	if err := d.appendFrames(key, 0, inputs, 50, nil); err != nil {
+	if err := d.appendFrames(key, 0, inputs, 50, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +201,7 @@ func TestPurgeOtherFrameVersions(t *testing.T) {
 	keyOtherScript := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "bar", ScriptVersion: "v1"}
 
 	for _, k := range []frameKey{keyV1, keyV2, keyOtherScript} {
-		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -177,7 +213,7 @@ func TestPurgeOtherFrameVersions(t *testing.T) {
 	if frames, err := d.listFrames(keyV1, 0, 0); err != nil || len(frames) != 0 {
 		t.Fatalf("expected v1 purged, got frames=%+v err=%v", frames, err)
 	}
-	if offset, _, err := d.getFrameProgress(keyV1); err != nil || offset != 0 {
+	if offset, _, _, err := d.getFrameProgress(keyV1); err != nil || offset != 0 {
 		t.Fatalf("expected v1 progress purged, got offset=%d err=%v", offset, err)
 	}
 	if frames, err := d.listFrames(keyV2, 0, 0); err != nil || len(frames) != 1 {
@@ -195,7 +231,7 @@ func TestPurgeAllFrameVersions(t *testing.T) {
 	keyOtherScript := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "bar", ScriptVersion: "v1"}
 
 	for _, k := range []frameKey{keyV1, keyV2, keyOtherScript} {
-		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -223,7 +259,7 @@ func TestClearStreamFrames(t *testing.T) {
 	otherSession := frameKey{Session: 2, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
 
 	for _, k := range []frameKey{keep, staleVersion, otherScript, otherStream, otherSession} {
-		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -240,7 +276,7 @@ func TestClearStreamFrames(t *testing.T) {
 		if frames, err := d.listFrames(k, 0, 0); err != nil || len(frames) != 0 {
 			t.Fatalf("expected %+v purged (same stream, different script/version), got frames=%+v err=%v", k, frames, err)
 		}
-		if offset, _, err := d.getFrameProgress(k); err != nil || offset != 0 {
+		if offset, _, _, err := d.getFrameProgress(k); err != nil || offset != 0 {
 			t.Fatalf("expected %+v progress purged, got offset=%d err=%v", k, offset, err)
 		}
 	}
@@ -258,7 +294,7 @@ func TestClearStreamFrames(t *testing.T) {
 func TestClearStreamFrames_KeepSameVersionIsNoop(t *testing.T) {
 	d := newTestInterceptor(t)
 	key := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
-	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+	if err := d.appendFrames(key, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,7 +306,7 @@ func TestClearStreamFrames_KeepSameVersionIsNoop(t *testing.T) {
 	if frames, err := d.listFrames(key, 0, 0); err != nil || len(frames) != 1 {
 		t.Fatalf("expected frame data kept, got frames=%+v err=%v", frames, err)
 	}
-	if offset, _, err := d.getFrameProgress(key); err != nil || offset != 10 {
+	if offset, _, _, err := d.getFrameProgress(key); err != nil || offset != 10 {
 		t.Fatalf("expected progress kept at 10, got offset=%d err=%v", offset, err)
 	}
 }
@@ -287,7 +323,7 @@ func TestFramesClearAPI_HTTP(t *testing.T) {
 	keep := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v2"}
 	stale := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "foo", ScriptVersion: "v1"}
 	for _, k := range []frameKey{keep, stale} {
-		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil); err != nil {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 10}}, 10, nil, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -326,7 +362,7 @@ func TestFramerScriptsAPI_PutPurgesStaleVersions(t *testing.T) {
 	otherKey := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "other", ScriptVersion: "stale"}
 
 	for _, k := range []frameKey{staleKey, freshKey, otherKey} {
-		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil); err != nil {
+		if err := d.appendFrames(k, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -378,10 +414,10 @@ func TestFramerScriptsAPI_DeletePurgesAllVersions(t *testing.T) {
 
 	keyV1 := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "myframer", ScriptVersion: "v1"}
 	keyV2 := frameKey{Session: 1, Stream: 1, Direction: 0, Script: "myframer", ScriptVersion: "v2"}
-	if err := d.appendFrames(keyV1, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil); err != nil {
+	if err := d.appendFrames(keyV1, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.appendFrames(keyV2, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil); err != nil {
+	if err := d.appendFrames(keyV2, 0, []frameInput{{Offset: 0, Length: 1}}, 1, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -421,13 +457,43 @@ func TestHandleFrameProgress_NotStarted(t *testing.T) {
 	var resp struct {
 		ProcessedOffset int64  `json:"processed_offset"`
 		State           []byte `json:"state"`
+		Closed          bool   `json:"closed"`
 	}
 	req := map[string]any{"session": 1, "stream": 1, "direction": 0, "script": "foo", "script_version": "v1"}
 	if status := postJSON(t, base+"/frame-progress", req, &resp); status != http.StatusOK {
 		t.Fatalf("expected 200, got %d", status)
 	}
-	if resp.ProcessedOffset != 0 || resp.State != nil {
-		t.Fatalf("expected (0, nil), got (%d, %v)", resp.ProcessedOffset, resp.State)
+	if resp.ProcessedOffset != 0 || resp.State != nil || resp.Closed {
+		t.Fatalf("expected (0, nil, false), got (%d, %v, %v)", resp.ProcessedOffset, resp.State, resp.Closed)
+	}
+}
+
+// TestHandleFramesAppend_Closed is the HTTP-level counterpart to
+// TestFrameProgress_ClosedFlag: POSTing /frames/append with "closed": true is reflected
+// back by /frame-progress.
+func TestHandleFramesAppend_Closed(t *testing.T) {
+	base := newTestFramesServer(t)
+	key := map[string]any{"session": 1, "stream": 1, "direction": 0, "script": "foo", "script_version": "v1"}
+
+	closeReq := map[string]any{
+		"session": 1, "stream": 1, "direction": 0, "script": "foo", "script_version": "v1",
+		"expected_processed_offset": 0,
+		"new_frames":                []map[string]any{},
+		"new_processed_offset":      0,
+		"closed":                    true,
+	}
+	if status := postJSON(t, base+"/frames/append", closeReq, nil); status != http.StatusNoContent {
+		t.Fatalf("append: expected 204, got %d", status)
+	}
+
+	var resp struct {
+		Closed bool `json:"closed"`
+	}
+	if status := postJSON(t, base+"/frame-progress", key, &resp); status != http.StatusOK {
+		t.Fatalf("frame-progress: expected 200, got %d", status)
+	}
+	if !resp.Closed {
+		t.Fatalf("expected closed=true, got %v", resp.Closed)
 	}
 }
 
@@ -534,7 +600,7 @@ func TestListFramesTimeline_OrderingAndTieBreak(t *testing.T) {
 		{Offset: 10, Length: 5, Stid: 12},
 		{Offset: 15, Length: 5, Stid: 12},
 		{Offset: 20, Length: 5, Stid: 15},
-	}, 25, nil); err != nil {
+	}, 25, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	// Direction 1: ids 0..1, interleaved with direction 0's stids but never tied with
@@ -542,7 +608,7 @@ func TestListFramesTimeline_OrderingAndTieBreak(t *testing.T) {
 	if err := d.appendFrames(keyS2C, 0, []frameInput{
 		{Offset: 0, Length: 8, Stid: 11},
 		{Offset: 8, Length: 8, Stid: 13},
-	}, 16, nil); err != nil {
+	}, 16, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -614,13 +680,13 @@ func TestListFramesTimelineBackward_OrderingAndTieBreak(t *testing.T) {
 		{Offset: 10, Length: 5, Stid: 12},
 		{Offset: 15, Length: 5, Stid: 12},
 		{Offset: 20, Length: 5, Stid: 15},
-	}, 25, nil); err != nil {
+	}, 25, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.appendFrames(keyS2C, 0, []frameInput{
 		{Offset: 0, Length: 8, Stid: 11},
 		{Offset: 8, Length: 8, Stid: 13},
-	}, 16, nil); err != nil {
+	}, 16, nil, false); err != nil {
 		t.Fatal(err)
 	}
 

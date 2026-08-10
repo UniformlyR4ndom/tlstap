@@ -100,6 +100,9 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   frameRuntime.js   ← Worker bootstrap that runs a framer script's frame() function over pre-fetched chunks (no RPC bridge, unlike scriptRuntime.js — see web/CLAUDE.md)
   framerRun.js      ← catchUpFramer(): orchestrates fetching un-framed chunks, running frameRuntime.js, and persisting each batch via dbdumpFramerApi.js
   framerPrefs.js    ← localStorage: global default framer script + per-stream override (see "Framer scripts" in web/CLAUDE.md)
+  dissectRuntime.js ← Worker bootstrap that runs a dissector script's dissect() function once over one frame's bytes (no RPC bridge, no batch/ack cycle, unlike frameRuntime.js — see "Dissector scripts" in web/CLAUDE.md)
+  dbdumpDissectApi.js ← REST wrappers for /api/i/dbdump/dissect/* script CRUD (same shape as dbdumpFramerApi.js's script functions, separate namespace)
+  dissectPrefs.js   ← localStorage: global default dissector script + per-stream override (see "Dissector scripts" in web/CLAUDE.md)
   format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
   direction.js      ← direction constants/helpers (DIRNUM_C2S/DIRNUM_S2C, DIR_C2S/DIR_S2C, dirClass, dirLabel)
   download.js       ← file-save helpers (downloadBlob anchor-click fallback; acquireSaveHandle/writeToFileHandle for the File System Access API)
@@ -134,8 +137,10 @@ web/                ← embedded web frontend (Preact + htm, no build step)
 logging/            ← thin slog wrapper
 assert/             ← assert.Assertf — panics with message; used for "this is a bug" invariants
 examples/           ← standalone binaries showing how to write custom interceptors, plus
-                      framer/tamper script examples (e.g. dbdump/framer/tls-framer.js — a
-                      TLS record-layer framer; see "Framer scripts" below)
+                      framer/tamper/dissector script examples (e.g. dbdump/framer/tls-framer.js
+                      — a TLS record-layer framer; dbdump/dissect/tls-dissector.js — its
+                      dissector counterpart, breaking one TLS record into its fixed
+                      header fields; see "Framer scripts"/"Dissector scripts" below)
 test/               ← echo server/client helpers, CLI wrappers for manual testing, and tapctl/
                       (one-shot test client for the tamper/dbdump WebSocket + REST APIs)
 ```
@@ -278,7 +283,7 @@ Three strategies (configured on the server side):
 | `match-replace` | `MatchReplaceInterceptor` | `replacements`: ordered list of `{regex: replacement}` maps |
 | `bridge` | `BridgeInterceptor` | `connect` (endpoint); streams data to a TCP server using a custom binary framing protocol |
 | `droptls` | `DropTlsInterceptor` | none; aborts on `ConnectionUpgraded` to attempt TLS downgrade |
-| `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool), `scripts-dir` (string, optional — storage for user-authored framer scripts; see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section); logs all traffic to SQLite; exposes REST API |
+| `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool), `scripts-dir` (string, optional — storage for user-authored framer scripts; see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section), `dissect-scripts-dir` (string, optional — separate storage for user-authored dissector scripts, own namespace from `scripts-dir`; see `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section); logs all traffic to SQLite; exposes REST API |
 | `tamper` | `TamperInterceptor` | `hold-timeout-ms` (int, `<=0` = infinite), `hold-until-connected` (bool), `scripts-dir` (string, optional), `fs-root` (string, optional — grants scripts scoped read/write/list access to this host directory via REST; see `intercept/tamper/CLAUDE.md`'s "Filesystem access" section), `log-file` (string, optional — persists a running script's `tamper.log`/`ctx.log` output server-side, always appended to; see `intercept/tamper/CLAUDE.md`'s "Script storage" section and `web/CLAUDE.md`'s "Scripted interception" section); lets a connected control client actively pause, inspect, edit, drop, or forward live chunks, or just live-watch them; exposes a WebSocket API |
 
 ## REST API
@@ -366,6 +371,36 @@ when working in that directory.
 
 Known gaps and deferred work, collected here so they aren't rediscovered from scratch.
 
+- **HTTP/1 and HTTP/2 example framer/dissector pairs — deferred, not started; both
+  prerequisites below are now done.** `examples/dbdump/framer/`/`examples/dbdump/dissect/`
+  cover TLS records and a couple of generic length-prefixed shapes, but nothing for HTTP
+  itself, despite it being the most common protocol this tool would be pointed at.
+  Originally scoped as two independent pairs, on the assumption that a framer script
+  couldn't see ALPN to auto-pick between them — that assumption no longer holds now that
+  `chunk.tls?.alpn` is available (see the "Route TLS info" item below), so it's worth
+  reconsidering a single ALPN-branching HTTP framer instead of two, when this is actually
+  picked up (not decided yet — flagging so it isn't missed). HTTP/1 in particular needs
+  body-length handling per RFC 9112 §6.3 (`Content-Length` vs `Transfer-Encoding: chunked`
+  vs the no-body cases vs the connection-close-delimited case, now handled via the
+  close-signal item below).
+- **Signal connection close to framer scripts — done.** A framer script's final
+  `frame(state, chunk)` call for a direction may now carry `chunk.closed = true` (empty
+  `data`) once that direction's connection has closed, letting a script flush a body
+  whose length is implicit in connection close (RFC 9112 §6.3 case 7 — the HTTP/1 framer
+  above needs this). See `intercept/dbdump/CLAUDE.md`'s "Connection-close signal" note
+  (schema/persistence) and `web/CLAUDE.md`'s "Framer scripts" section (`catchUpFramer`'s
+  orchestration) for the full mechanism. Not yet verified in an actual browser — only
+  Go-side unit tests (`frames_test.go`) and the `web/` test suite have run against it.
+- **Route TLS info (SNI, ALPN, TLS version, cipher suite ID) to framer scripts —
+  done.** A framer script's `chunk.tls` is now `null` for a plain-mode proxy or a
+  not-yet-upgraded `detecttls` connection, else `{sni, alpn, version, cipherSuite}` from
+  the stream's *downstream* (client-facing) TLS handshake specifically — the proxy's
+  separate upstream handshake isn't exposed, since it can legitimately negotiate
+  differently without ALPN/SNI passthrough. See `proxy/interceptor.go`'s `ConnInfo.TLS`/
+  `TLSInfo`, `intercept/dbdump/CLAUDE.md`'s "TLS info capture" note (schema/persistence),
+  and `web/CLAUDE.md`'s "Framer scripts" section (`catchUpFramer`'s `tlsInfo` param) for
+  the full mechanism. Not yet verified against a real TLS proxy run in a browser — only
+  `proxy`/`intercept/dbdump` Go unit tests and the `web/` test suite have run against it.
 - **`doc/openapi.yaml`'s `{path}` parameters don't survive standard OpenAPI tooling.**
   `/api/i/tamper/fs/list/{path}` and `/fs/file/{path}` document `path` as a single
   `in: path` string, but the real route is a `{path...}` wildcard that can embed
@@ -373,9 +408,14 @@ Known gaps and deferred work, collected here so they aren't rediscovered from sc
   `/` in a path parameter, so it can't actually drive a nested path through these
   operations as written. Needs a parameter-modeling redesign (e.g. prose-only
   documentation for the parameter, or a vendor extension), not a safe drive-by edit.
-- **Packet dissector stage — not started.** `doc/design/packet-dissector.md` covers two
-  stages: framer (done — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section)
-  and dissector (deferred, no work begun).
+- **Packet dissector stage — done, both stages of the "Packet Dissector" feature now
+  feature-complete for v1.** `doc/design/packet-dissector.md` covers both: framer (done
+  2026-08-05 — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section) and dissector
+  (done 2026-08-09 — script store, Worker execution, REST wrappers, and the
+  `TrafficView.js` side panel with click-to-select-frame/click-to-highlight-node — see
+  `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section and `web/CLAUDE.md`'s section
+  of the same name). Not verified in an actual browser yet — same standing note the
+  framer stage's own memory carries; no automated UI testing exists in this repo.
 - **Byte-budgeted segment buffer — `TrafficView.js` fully migrated, `CombinedView.js`
   still pending (deliberately deferred).** `doc/design/hexview-segment-buffer.md` has the
   full migration plan; all of `TrafficView.js` (raw and frame mode) now runs on

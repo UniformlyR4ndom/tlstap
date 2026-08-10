@@ -140,7 +140,7 @@ func (h *ConnHandler) forwardDetectTls(conn net.Conn) error {
 
 func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) error {
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(connDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
+	connInfo := NewConnInfo(connDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
 	for {
 		peeked, err := connDown.Peek(buf)
 		if err != nil {
@@ -195,7 +195,7 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 		<-h.upgradeAckChan
 
 		// drain upstream connection in case there is outstanding data sent from the sever to the client
-		info := NewConnInfo(h.ConnUp.RemoteAddr(), connDown.RemoteAddr(), h.ConnId)
+		info := NewConnInfo(h.ConnUp.RemoteAddr(), connDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
 		if err = h.drainConn(buf, h.ConnUp, h.ConnDown, h.InterceptorsDown, &info, drainTimeoutMs); err != nil {
 			h.logger.Error("Error while draining upstream connection: %v", err)
 			h.upgradeChan <- false
@@ -222,6 +222,12 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 			return err
 		}
 
+		// Assigned before notifyConnUpgraded (not after, as previously): its own
+		// NewConnInfo calls read h.ConnDown/h.ConnUp, and need to see the upgraded
+		// connections to report TLS info on the ConnectionUpgraded call itself.
+		h.ConnDown = tlsConnDown
+		h.ConnUp = tlsConnUp
+
 		if err = h.notifyConnUpgraded(); err != nil {
 			h.terminate()
 			return err
@@ -235,8 +241,10 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 		rUp := tlsConnUp.RemoteAddr().String()
 		h.logger.Info("Upgraded upstream connection (%d): %s <-> %s (%s)", h.ConnId, lUp, rUp, SummarizeTlsConn(tlsConnUp))
 
-		h.ConnDown = tlsConnDown
-		h.ConnUp = tlsConnUp
+		// connInfo was built before the upgrade (TLS: nil baked in) and is reused for the
+		// rest of this direction's lifetime below — refresh it now that h.ConnDown
+		// reflects the upgraded connection.
+		connInfo.TLS = tlsInfoFromConn(h.ConnDown)
 
 		// signal completion of TLS upgrade
 		h.upgradeChan <- true
@@ -246,7 +254,7 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 
 func (h *ConnHandler) forwardDetectTlsDown() error {
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	connInfo := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
 
 	for {
 		read, err := h.ConnUp.Read(buf)
@@ -267,6 +275,13 @@ func (h *ConnHandler) forwardDetectTlsDown() error {
 
 			// wait for completion of the TLS upgrade
 			<-h.upgradeChan
+
+			// connInfo was built before the upgrade (TLS: nil baked in) and is reused for
+			// the rest of this direction's lifetime — refresh it now that h.ConnDown
+			// reflects the upgraded connection (forwardDetectTlsUp performs the actual
+			// handshake and reassigns h.ConnDown/h.ConnUp; this goroutine only pauses
+			// through it via the upgradeChan/upgradeAckChan handshake above).
+			connInfo.TLS = tlsInfoFromConn(h.ConnDown)
 		default:
 			h.logger.Error("Failed to read from upstream connection: %v", err)
 			h.terminate()
@@ -303,8 +318,8 @@ func (h *ConnHandler) drainConn(b []byte, connIn, connOut net.Conn, interceptors
 func (h *ConnHandler) forwardGeneric() error {
 	bufDown := make([]byte, bufSize)
 	bufUp := make([]byte, bufSize)
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
 
 	h.logger.Info("Forwarding %s <-> %s", h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String())
 	if err := h.notifyConnEstablished(); err != nil {
@@ -326,8 +341,8 @@ func (h *ConnHandler) forwardGeneric() error {
 
 // TODO: what to do on errors in ConnectionEstablished for any interceptor?
 func (h *ConnHandler) notifyConnEstablished() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
 	if err := h.notifyEstablished(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}
@@ -340,8 +355,8 @@ func (h *ConnHandler) notifyConnEstablished() error {
 }
 
 func (h *ConnHandler) notifyConnUpgraded() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
 	if err := h.notifyUpgraded(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}
@@ -354,8 +369,8 @@ func (h *ConnHandler) notifyConnUpgraded() error {
 }
 
 func (h *ConnHandler) notifyConnTerminated() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId)
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId)
+	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
 	if err := h.notifyTerminated(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}

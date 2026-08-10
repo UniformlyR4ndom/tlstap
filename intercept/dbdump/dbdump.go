@@ -49,6 +49,11 @@ type DbDumpConfig struct {
 	// disables the feature entirely — the REST endpoints still exist but reject every
 	// request with 501, rather than silently defaulting to an implicit directory.
 	ScriptsDir string `json:"scripts-dir"`
+
+	// Directory dissector scripts (doc/design/packet-dissector.md) are stored in and
+	// served from — a separate scriptstore.Store/directory from ScriptsDir above, not a
+	// shared namespace with framer scripts. Same empty-disables-with-501 convention.
+	DissectScriptsDir string `json:"dissect-scripts-dir"`
 }
 
 // sessionConfig is the JSON snapshot written to sessions.config on first traffic.
@@ -87,6 +92,14 @@ type pendingStream struct {
 	src string
 	dst string
 	at  int64
+
+	// sni/alpn/tlsVersion/cipherSuite are filled in by ConnectionUpgraded if it fires
+	// before the session is created — nil/unset (and so NULL once flushed) for a
+	// connection that either isn't TLS or hasn't upgraded yet.
+	sni         *string
+	alpn        *string
+	tlsVersion  *int64
+	cipherSuite *int64
 }
 
 // DbDumpInterceptor logs all traffic into an SQLite database.
@@ -112,12 +125,13 @@ type pendingStream struct {
 // client-side, so a content change is simply a different (and initially absent) key
 // rather than something that needs explicit staleness detection.
 type DbDumpInterceptor struct {
-	filePath    string
-	truncate    bool
-	proxyConfig proxy.ResolvedProxyConfig
-	db          *sql.DB
-	scripts     *scriptstore.Store // nil if ScriptsDir wasn't configured
-	sessionID   int64              // valid only after ensureSession succeeds
+	filePath       string
+	truncate       bool
+	proxyConfig    proxy.ResolvedProxyConfig
+	db             *sql.DB
+	scripts        *scriptstore.Store // nil if ScriptsDir wasn't configured
+	dissectScripts *scriptstore.Store // nil if DissectScriptsDir wasn't configured
+	sessionID      int64              // valid only after ensureSession succeeds
 
 	// Lazy session creation: the session row (and buffered stream rows) are only
 	// written to the DB on the first Intercept call, so idle runs leave no trace.
@@ -158,10 +172,10 @@ type DbDumpInterceptor struct {
 // API handlers, wired up synchronously right after this returns, never see a nil
 // or partially-schema'd i.db — Init itself runs later, asynchronously, from the
 // proxy's own start goroutine. No session/stream/chunk row is written here; that
-// stays deferred to the first Intercept call (see ensureSession). If scriptsDir is
-// set, the scripts directory (including any missing parents) is also created here,
-// for the same "must be usable the moment RegisterRoutes runs" reason.
-func NewDbDumpInterceptor(path string, truncate bool, scriptsDir string, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) (*DbDumpInterceptor, error) {
+// stays deferred to the first Intercept call (see ensureSession). If scriptsDir/
+// dissectScriptsDir is set, that scripts directory (including any missing parents) is
+// also created here, for the same "must be usable the moment RegisterRoutes runs" reason.
+func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScriptsDir string, proxyConfig proxy.ResolvedProxyConfig, logger *logging.Logger) (*DbDumpInterceptor, error) {
 	if truncate {
 		_ = os.Remove(path)
 	}
@@ -200,6 +214,23 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir string, proxyCo
 		)
 	`); err != nil {
 		return nil, err
+	}
+
+	// sni/alpn/tls_version/cipher_suite added after stream first shipped, via
+	// ensureColumn like frame_progress.closed above — all nullable, since a plain
+	// connection (or a detecttls one that never upgrades) has none of them. Captured
+	// once per connection from the downstream (client-facing) TLS handshake — see
+	// ConnectionUpgraded — never the proxy's separate upstream one, which can legitimately
+	// negotiate differently without ALPN/SNI passthrough.
+	for _, col := range []string{"sni", "alpn"} {
+		if err = ensureColumn(db, "stream", col, "TEXT"); err != nil {
+			return nil, err
+		}
+	}
+	for _, col := range []string{"tls_version", "cipher_suite"} {
+		if err = ensureColumn(db, "stream", col, "INTEGER"); err != nil {
+			return nil, err
+		}
 	}
 
 	if _, err = db.Exec(`
@@ -293,9 +324,28 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir string, proxyCo
 		return nil, err
 	}
 
+	// closed added after frame_progress first shipped, via ensureColumn like stid/time
+	// above — NOT NULL DEFAULT 0 (unlike those) since "not yet closed" is an unambiguous
+	// default for every row, old or new. Set once a framer script has been given its
+	// direction's final synthetic frame(state, {closed: true, ...}) call (see
+	// catchUpFramer in web/framerRun.js) — lets that caller's "already caught up" fast
+	// path recognize a direction that finished closing, instead of redelivering the
+	// close signal forever on every live-tail poll.
+	if err = ensureColumn(db, "frame_progress", "closed", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return nil, err
+	}
+
 	var scripts *scriptstore.Store
 	if scriptsDir != "" {
 		scripts, err = scriptstore.New(scriptsDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var dissectScripts *scriptstore.Store
+	if dissectScriptsDir != "" {
+		dissectScripts, err = scriptstore.New(dissectScriptsDir)
 		if err != nil {
 			return nil, err
 		}
@@ -307,6 +357,7 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir string, proxyCo
 		proxyConfig:     proxyConfig,
 		db:              db,
 		scripts:         scripts,
+		dissectScripts:  dissectScripts,
 		clientEndpoints: make(map[uint32]string),
 		chunkStates:     make(map[chunkKey]chunkState),
 		streamNextSTID:  make(map[uint32]int64),
@@ -415,8 +466,9 @@ func (i *DbDumpInterceptor) ensureSession() error {
 		defer i.mu.Unlock()
 		for _, ps := range i.pendingStreams {
 			result, err := i.db.Exec(
-				`INSERT OR IGNORE INTO stream (id, session, src, dst, start) VALUES (?, ?, ?, ?, ?)`,
-				ps.id, id, ps.src, ps.dst, ps.at,
+				`INSERT OR IGNORE INTO stream (id, session, src, dst, start, sni, alpn, tls_version, cipher_suite)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				ps.id, id, ps.src, ps.dst, ps.at, ps.sni, ps.alpn, ps.tlsVersion, ps.cipherSuite,
 			)
 			if err != nil {
 				i.logger.Error("dbdump: flush pending stream %d: %v", ps.id, err)
@@ -483,7 +535,65 @@ func (i *DbDumpInterceptor) ConnectionEstablished(info *proxy.ConnInfo) error {
 	return nil
 }
 
+// ConnectionUpgraded captures the downstream TLS handshake's SNI/ALPN/version/cipher
+// suite into stream once (info.TLS is nil for a plain connection). Called once per
+// direction with identical info.TLS; the second call is a harmless no-op — the
+// pendingStreams path (below) always ends up with the same values from either call, and
+// the direct-UPDATE path's own WHERE guard makes its second call's write affect 0 rows.
 func (i *DbDumpInterceptor) ConnectionUpgraded(info *proxy.ConnInfo) error {
+	if info.TLS == nil {
+		return nil
+	}
+
+	sni, alpn := info.TLS.SNI, info.TLS.ALPN
+	var sniPtr, alpnPtr *string
+	if sni != "" {
+		sniPtr = &sni
+	}
+	if alpn != "" {
+		alpnPtr = &alpn
+	}
+	version, cipherSuite := int64(info.TLS.Version), int64(info.TLS.CipherSuite)
+
+	i.mu.Lock()
+	if !i.sessionCreated {
+		// ConnectionEstablished (both directions) always completes before
+		// ConnectionUpgraded (either direction) begins, in every proxy mode — so both of
+		// this ConnID's pendingStreams entries (one per direction — see
+		// ConnectionEstablished's own doc comment on why there can be two) already exist
+		// here. Set on both: ensureSession's flush INSERT OR IGNORE only keeps whichever
+		// is enumerated first, so leaving the other's TLS fields unset would risk losing
+		// them if that happened to be the "wrong" one.
+		for j := range i.pendingStreams {
+			if i.pendingStreams[j].id == info.ConnID {
+				i.pendingStreams[j].sni, i.pendingStreams[j].alpn = sniPtr, alpnPtr
+				i.pendingStreams[j].tlsVersion, i.pendingStreams[j].cipherSuite = &version, &cipherSuite
+			}
+		}
+		i.mu.Unlock()
+		return nil
+	}
+	i.mu.Unlock()
+
+	// tls_version IS NULL guards against this connection's second ConnectionUpgraded
+	// call (same info.TLS) re-triggering the streamsVersion bump below.
+	result, err := i.db.Exec(
+		`UPDATE stream SET sni = ?, alpn = ?, tls_version = ?, cipher_suite = ?
+		 WHERE session = ? AND id = ? AND tls_version IS NULL`,
+		sniPtr, alpnPtr, version, cipherSuite, i.sessionID, info.ConnID,
+	)
+	if err != nil {
+		return err
+	}
+	// Matters most for detecttls, where this fires well after ConnectionEstablished
+	// (mid-connection, once the Client Hello is seen) — without the bump, a frontend
+	// already polling wouldn't know to refetch /streams until some other event (e.g. the
+	// stream closing) happened to bump it anyway.
+	if n, _ := result.RowsAffected(); n > 0 {
+		i.mu.Lock()
+		i.streamsVersion++
+		i.mu.Unlock()
+	}
 	return nil
 }
 

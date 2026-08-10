@@ -447,7 +447,7 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 			return nil, err
 		}
 
-		i, err := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, dbDumpConf.ScriptsDir, *pConfig, logger)
+		i, err := dbdump.NewDbDumpInterceptor(dbDumpConf.FilePath, dbDumpConf.Truncate, dbDumpConf.ScriptsDir, dbDumpConf.DissectScriptsDir, *pConfig, logger)
 		if err != nil {
 			return nil, err
 		}

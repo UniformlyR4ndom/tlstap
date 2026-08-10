@@ -111,12 +111,14 @@ export function decodeState(b64) {
     return JSON.parse(new TextDecoder().decode(parseBase64(b64)), jsonBytesReviver)
 }
 
-// Returns { processedOffset, state }: how far framing has gotten for key, and the
-// framer's own persisted state for resuming. A key with no rows yet is not an error —
-// { processedOffset: 0, state: null } just means framing hasn't started for it.
+// Returns { processedOffset, state, closed }: how far framing has gotten for key, the
+// framer's own persisted state for resuming, and whether the direction's
+// connection-close signal (see catchUpFramer in framerRun.js) has already been
+// delivered. A key with no rows yet is not an error — { processedOffset: 0, state: null,
+// closed: false } just means framing hasn't started for it.
 export async function getFrameProgress(key) {
     const res = await post('/frame-progress', keyBody(key))
-    return { processedOffset: res.processed_offset, state: decodeState(res.state) }
+    return { processedOffset: res.processed_offset, state: decodeState(res.state), closed: res.closed }
 }
 
 function decodeFrame(f) {
@@ -149,11 +151,15 @@ export async function listFramesTimelineBackward(key, beforeStid, n) {
 
 // Extends key's persisted frame index by one computed batch: expectedProcessedOffset
 // must match what's currently stored (0 if framing hasn't started yet) or the call
-// throws — the caller is expected to be the only writer for key.
+// throws — the caller is expected to be the only writer for key. closed (default false)
+// marks the direction's connection-close signal as delivered — see catchUpFramer in
+// framerRun.js, the only caller that ever passes true, and always as its own dedicated
+// trailing call (empty frames, processedOffset unchanged) rather than mixed into an
+// ordinary batch.
 //
 // Doesn't use the shared post() helper: a successful append is 204 No Content, and
 // post() always calls r.json(), which throws on an empty body.
-export async function appendFrames(key, expectedProcessedOffset, frames, newProcessedOffset, newState) {
+export async function appendFrames(key, expectedProcessedOffset, frames, newProcessedOffset, newState, closed = false) {
     await checkOk(await fetch(`${BASE}/frames/append`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -163,6 +169,7 @@ export async function appendFrames(key, expectedProcessedOffset, frames, newProc
             new_frames: frames.map(f => ({ offset: f.offset, length: f.length, meta: encodeMeta(f.meta), stid: f.stid, time: f.time })),
             new_processed_offset: newProcessedOffset,
             new_state: encodeState(newState),
+            closed,
         }),
     }))
 }

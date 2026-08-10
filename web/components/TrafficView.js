@@ -5,7 +5,11 @@ import { getChunkStid, getByteStid } from '../api.js'
 import { getFramerScript, clearStreamFrames } from '../dbdumpFramerApi.js'
 import { catchUpFramer, sha256Hex } from '../framerRun.js'
 import { loadStreamFramerScript, saveStreamFramerScript } from '../framerPrefs.js'
+import { loadStreamDissectScript, saveStreamDissectScript } from '../dissectPrefs.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
+import DissectPanel from './DissectPanel.js'
+import ResizeHandle from './ResizeHandle.js'
+import { useResizableLayout } from '../useResizableLayout.js'
 import { useByteBuffer, FILL_TARGET_SEGMENTS } from '../useByteBuffer.js'
 import { openConnection as openChunkSegments, fillForward as fillChunkForward, fillBackward as fillChunkBackward } from '../chunkSegments.js'
 import { openConnection as openFrameSegments, fillForward as fillFrameForward, fillBackward as fillFrameBackward } from '../frameSegments.js'
@@ -18,7 +22,17 @@ function isClosed(stream) {
     return !!stream.end
 }
 
-export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeader, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts, onFramerLog, onFramerLogReset }) {
+// The downstream (client-facing) TLS session's negotiated parameters, or null for a
+// plain-mode proxy or a detecttls connection that hasn't upgraded (yet) — mirrors
+// proxy.ConnInfo.TLS's own nil convention. tls_version is the presence check (matches
+// the backend's own NULL-guard column — see dbdump's ConnectionUpgraded).
+function streamTlsInfo(stream) {
+    return stream.tls_version != null
+        ? { sni: stream.sni, alpn: stream.alpn, version: stream.tls_version, cipherSuite: stream.cipher_suite }
+        : null
+}
+
+export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeader, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts, onFramerLog, onFramerLogReset, dissectScripts }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
     const viewHeightRef = useRef(0)
     const scrollTopRef = useRef(0)
@@ -32,6 +46,19 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     const [frameError, setFrameError] = useState(null)
     const [frameScriptRunning, setFrameScriptRunning] = useState(null) // { name, version, content }
     const [frameRefreshKey, setFrameRefreshKey] = useState(0)
+
+    // Dissector state (frame view only). selectedFrame: null | { key, frame: {offset,
+    // length, direction, kind, meta}, bytes } — set by clicking a frame's header row
+    // (HexDump's onHeaderClick), built entirely from what's already loaded (see
+    // handleFrameHeaderClick below), no fetch of its own. dissectHighlight: null |
+    // {direction, start, end}, absolute stream offsets, set by clicking a field node.
+    // Both are invalidated (not just left stale) wherever the frame timeline itself is —
+    // a stream switch, leaving frame view, or a fresh Run, all of which can make the
+    // previously-selected frame's key meaningless.
+    const [dissectorSelected, setDissectorSelected] = useState('')
+    const [selectedFrame, setSelectedFrame] = useState(null)
+    const [dissectHighlight, setDissectHighlight] = useState(null)
+    const [dissectPanelWidth, handleDissectPanelResize] = useResizableLayout('dissectPanelWidth', { sign: -1, min: 200, max: 500 })
 
     const {
         display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
@@ -92,12 +119,46 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         setFrameError(null)
         setFrameScriptRunning(null)
         setFramerSelected(stream ? (loadStreamFramerScript(stream.session, stream.id) ?? '') : '')
+        setDissectorSelected(stream ? (loadStreamDissectScript(stream.session, stream.id) ?? '') : '')
+        setSelectedFrame(null)
+        setDissectHighlight(null)
         onFramerLogReset?.()
     }, [stream?.id])
 
     function handleFramerSelect(name) {
         setFramerSelected(name)
         if (stream) saveStreamFramerScript(stream.session, stream.id, name)
+    }
+
+    function handleDissectorSelect(name) {
+        setDissectorSelected(name)
+        if (stream) saveStreamDissectScript(stream.session, stream.id, name)
+    }
+
+    function handleShowRawChunks() {
+        setFrameState('raw')
+        setSelectedFrame(null)
+        setDissectHighlight(null)
+    }
+
+    // A frame's own header row, from HexDump's onHeaderClick — bytesInfo is exactly what
+    // collectChunkBytes(headerIdx) already computes for the context menu (bytes currently
+    // loaded starting at baseOffset), reused as-is rather than a second fetch: no
+    // guarantee the whole frame is loaded for a still-partially-loaded huge one, so
+    // dissection simply runs on whatever's available (see DissectPanel.js's own note).
+    // kind is hoisted out of the framer's own free-form meta by convention (no dedicated
+    // backend field for it) — see doc/design/packet-dissector.md.
+    function handleFrameHeaderClick(row, bytesInfo) {
+        setSelectedFrame({
+            key: `${row.direction}:${row.chunkId}`,
+            frame: { offset: bytesInfo.baseOffset, length: bytesInfo.bytes.length, direction: row.direction, kind: row.meta?.kind, meta: row.meta },
+            bytes: bytesInfo.bytes,
+        })
+        setDissectHighlight(null)
+    }
+
+    function handleDissectNodeClick(direction, start, end) {
+        setDissectHighlight({ direction, start, end })
     }
 
     // Shared between the initial Run and the live-tailing effect below — both must
@@ -110,6 +171,10 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         if (!stream || !framerSelected) return
         setFrameState('framing')
         setFrameError(null)
+        // clearStreamFrames below wipes any other (script, version)'s frame data for this
+        // stream — a frame previously selected for dissection may no longer exist.
+        setSelectedFrame(null)
+        setDissectHighlight(null)
         try {
             const content = await getFramerScript(framerSelected)
             const version = await sha256Hex(content)
@@ -119,8 +184,8 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
             // resumes rather than reprocessing.
             await clearStreamFrames({ session: stream.session, stream: stream.id, script: framerSelected, scriptVersion: version })
             await Promise.all([
-                catchUpFramer(stream.session, stream.id, DIRNUM_C2S, framerSelected, content, handleFramerScriptLog),
-                catchUpFramer(stream.session, stream.id, DIRNUM_S2C, framerSelected, content, handleFramerScriptLog),
+                catchUpFramer(stream.session, stream.id, DIRNUM_C2S, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
+                catchUpFramer(stream.session, stream.id, DIRNUM_S2C, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
             ])
             saveStreamFramerScript(stream.session, stream.id, framerSelected)
             setFrameScriptRunning({ name: framerSelected, version, content })
@@ -144,8 +209,8 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         ;(async () => {
             try {
                 await Promise.all([
-                    catchUpFramer(stream.session, stream.id, DIRNUM_C2S, frameScriptRunning.name, frameScriptRunning.content, handleFramerScriptLog),
-                    catchUpFramer(stream.session, stream.id, DIRNUM_S2C, frameScriptRunning.name, frameScriptRunning.content, handleFramerScriptLog),
+                    catchUpFramer(stream.session, stream.id, DIRNUM_C2S, frameScriptRunning.name, frameScriptRunning.content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
+                    catchUpFramer(stream.session, stream.id, DIRNUM_S2C, frameScriptRunning.name, frameScriptRunning.content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
                 ])
             } catch { /* best-effort; see comment above */ }
             if (!cancelled) setFrameRefreshKey(k => k + 1)
@@ -300,7 +365,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                         </button>
                     ` : html`
                         <span>${frameScriptRunning.name}</span>
-                        <button class="btn" onclick=${() => setFrameState('raw')}>Show raw chunks</button>
+                        <button class="btn" onclick=${handleShowRawChunks}>Show raw chunks</button>
                     `}
                 </span>
             </div>
@@ -322,6 +387,18 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                         pinHeader=${pinHeader}
                         onViewportChange=${handleViewportChange}
                         markers=${[]}
+                        onHeaderClick=${handleFrameHeaderClick}
+                        selectedHeaderKey=${selectedFrame?.key}
+                        highlightRange=${dissectHighlight}
+                    />
+                    <${ResizeHandle} orientation="v" onResize=${handleDissectPanelResize} />
+                    <${DissectPanel}
+                        selectedFrame=${selectedFrame}
+                        dissectScripts=${dissectScripts}
+                        dissectorSelected=${dissectorSelected}
+                        onDissectorSelect=${handleDissectorSelect}
+                        onNodeClick=${handleDissectNodeClick}
+                        style=${`width: ${dissectPanelWidth}px`}
                     />
                 ` : html`
                     <${HexDump}

@@ -64,6 +64,14 @@ tags:
       Worker) — these endpoints are the REST CRUD backing script storage plus
       reading/extending the computed result. See CLAUDE.md's "Framer scripts"
       section and doc/design/packet-dissector.md for the wider design.
+  - name: dissector
+    description: >-
+      Storage for dissector scripts (produce a labeled field-tree breakdown of one
+      frame's bytes, à la Wireshark's packet-details pane), in a namespace separate
+      from framer scripts. Execution is client-side only, not yet implemented —
+      these endpoints are so far just the REST CRUD backing script storage. See
+      CLAUDE.md's "Dissector scripts" section and doc/design/packet-dissector.md
+      for the wider design.
   - name: fs
     description: >-
       Scoped read/write/list access to one host directory (`fs-root`), for a
@@ -782,6 +790,95 @@ paths:
         '501':
           $ref: '#/components/responses/NotImplemented'
 
+  /api/i/dbdump/dissect/scripts:
+    get:
+      tags: [dissector]
+      summary: List stored dissector scripts
+      description: |
+        Metadata only, no script bodies, so listing stays cheap. Returns `501`
+        if the `dbdump` interceptor wasn't configured with
+        `dissect-scripts-dir`. A separate store/namespace from the framer
+        scripts above — same name in both is not a collision.
+      operationId: listDissectScripts
+      responses:
+        '200':
+          description: All stored scripts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScriptInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/dbdump/dissect/scripts/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_-][A-Za-z0-9_. -]*[A-Za-z0-9_-]$|^[A-Za-z0-9_-]$'
+        description: |
+          Script name, without the `.js` extension. Letters, digits, `_`, `-`,
+          `.`, and spaces only; must not start/end with `.` or a space, and
+          must not be exactly `.` or `..`.
+    get:
+      tags: [dissector]
+      summary: Fetch a dissector script's content
+      operationId: getDissectScript
+      responses:
+        '200':
+          description: Raw script source
+          content:
+            application/javascript:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      tags: [dissector]
+      summary: Create or overwrite a dissector script
+      description: |
+        Writes the request body verbatim as `<name>.js` (atomically — never
+        observable as a partial write). Unlike the framer's equivalent
+        endpoint, this has no side effect on any other stored data — dissector
+        output is never persisted.
+      operationId: putDissectScript
+      requestBody:
+        required: true
+        content:
+          application/javascript:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Script written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [dissector]
+      summary: Delete a dissector script
+      operationId: deleteDissectScript
+      responses:
+        '204':
+          description: Script deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
   /api/i/dbdump/frame-progress:
     post:
       tags: [framer]
@@ -790,8 +887,12 @@ paths:
         Reports the persisted progress for one (session, stream, direction,
         script, script_version) key, so a browser-run framer knows whether it
         needs to compute anything beyond what's already stored. A key with no
-        rows yet is not an error — `processed_offset: 0` and `state: null`
-        just mean framing hasn't started for it.
+        rows yet is not an error — `processed_offset: 0`, `state: null`, and
+        `closed: false` just mean framing hasn't started for it. `closed`
+        reports whether the direction's connection-close signal (a synthetic
+        final `frame(state, chunk)` call with `chunk.closed = true`) has
+        already been delivered to and persisted by the script — once true, it
+        never reverts, since a closed direction's byte length is final.
       operationId: getFrameProgress
       requestBody:
         required: true
@@ -927,10 +1028,15 @@ paths:
         stored (0 if framing hasn't started for this key yet), assigns
         `new_frames` sequential ids continuing from whatever's already
         stored, and advances progress to
-        `new_processed_offset`/`new_state`. There is deliberately no
+        `new_processed_offset`/`new_state`/`closed`. There is deliberately no
         retry/CAS-defense beyond that one offset check — the browser UI
         enforces a single writer per key, so a `409` here always means a
-        client bug, not a real race to resolve gracefully.
+        client bug, not a real race to resolve gracefully. `closed` (default
+        false) marks the direction's connection-close signal as delivered;
+        the only caller that ever sets it true is a dedicated trailing call
+        (empty `new_frames`, `new_processed_offset` unchanged) issued once
+        every batch of the run that carried the synthetic close chunk has
+        already been persisted by an ordinary (closed=false) call.
       operationId: appendFrames
       requestBody:
         required: true
@@ -957,6 +1063,9 @@ paths:
                       type: string
                       contentEncoding: base64
                       description: Opaque framer state to persist alongside the new progress; omit/null for no state
+                    closed:
+                      type: boolean
+                      description: Marks the direction's connection-close signal as delivered; defaults to false
       responses:
         '204':
           description: Frames appended and progress advanced
@@ -1557,6 +1666,30 @@ components:
           type: integer
           format: int64
           description: Total captured bytes in the server→client direction; -1 if no data captured
+        sni:
+          type: string
+          nullable: true
+          description: >-
+            Server Name Indication sent in the downstream (client-facing) TLS handshake;
+            null if not TLS, not yet upgraded, or no SNI was sent
+        alpn:
+          type: string
+          nullable: true
+          description: >-
+            ALPN protocol negotiated in the downstream TLS handshake (e.g. `h2`,
+            `http/1.1`); null if not TLS, not yet upgraded, or ALPN wasn't negotiated
+        tls_version:
+          type: integer
+          nullable: true
+          description: >-
+            Negotiated TLS version from the downstream handshake, as the raw
+            `tls.VersionTLS13`-style numeric ID; null if not TLS or not yet upgraded
+        cipher_suite:
+          type: integer
+          nullable: true
+          description: >-
+            Negotiated cipher suite from the downstream handshake, as the raw numeric ID;
+            null if not TLS or not yet upgraded
 
     ChunkList:
       type: object
@@ -1743,6 +1876,12 @@ components:
           description: >-
             The framer script's own opaque persisted state, for resuming;
             null if none
+        closed:
+          type: boolean
+          description: >-
+            Whether the direction's connection-close signal has already been
+            delivered to the script; false if framing hasn't started or the
+            direction hasn't closed yet
 
     Frame:
       type: object

@@ -58,7 +58,7 @@ view's own `jumpRef.current` object simply lacks the key rather than providing a
 
 **Resizable panels (`ResizeHandle.js`, `layout.js`, `useResizableLayout.js`):**
 - `ResizeHandle.js` is a generic draggable divider: `<${ResizeHandle} orientation="v"|"h" onResize=${deltaPx => ...} />`. On `mousedown` it attaches document-level `mousemove`/`mouseup` listeners for the drag; each `mousemove` calls `onResize(ev.movementX)` (`v`) or `onResize(ev.movementY)` (`h`). The caller owns the resulting size state, clamping, and sign convention (a handle placed *after* the sized element treats a positive delta as "grow"; placed *before*, negative is "grow"). `onResize` is read fresh from props at `mousedown` time, never memoized.
-- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` read/write one `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight, scriptsListWidth, scriptsLogHeight, framerScriptsListWidth }`, merged with defaults on load. Also exports `clamp(v, lo, hi)`, used by the hook below and standalone by `TransformPanel.js`.
+- `layout.js`: `loadLayout()` / `saveLayoutValue(key, value)` read/write one `localStorage` key (`tlstap-layout`) holding `{ sidebarWidth, bottomHeight, encdecOptionsWidth, encdecInputHeight, tamperDetailHeight, scriptsListWidth, scriptsLogHeight, framerScriptsListWidth, dissectPanelWidth, dissectScriptsListWidth }`, merged with defaults on load. Also exports `clamp(v, lo, hi)`, used by the hook below and standalone by `TransformPanel.js`.
 - `useResizableLayout(key, { sign = 1, min, max })` is what every panel below calls: reads `loadLayout()[key]` for the initial value, applies `clamp(v + sign * delta, min, max)` on each `onResize(delta)`, calls `saveLayoutValue(key, next)`, and returns `[value, onResize]`. `max` may be a plain number or a thunk (`() => number`) — the three window-relative panels pass `() => Math.floor(window.innerHeight * 0.7)` so the bound is re-read at drag time rather than baked in at render time.
 - **Sidebar** (`App.js`): `useResizableLayout('sidebarWidth', { min: 180, max: 600 })` (default 280), handle between `.sidebar` and `.main`.
 - **Bottom panel** (`App.js`): `useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160), handle at the top of `.bottom-panel` (only rendered while a tab is open). The Markers/Framing bottom tabs (below) have no resizable dimension of their own — they're sized entirely by this one, like every other bottom tab.
@@ -66,6 +66,8 @@ view's own `jumpRef.current` object simply lacks the key rather than providing a
 - **Tamper detail panel** (`TamperView.js`): `useResizableLayout('tamperDetailHeight', { sign: -1, min: 120, max: () => Math.floor(window.innerHeight * 0.7) })` (default 300), handle above `.tamper-detail-wrap`, same sign convention as the bottom panel's handle (also placed before the sized element).
 - **Tamper scripts sub-tab** (`TamperScriptsPanel.js`): `useResizableLayout('scriptsListWidth', { min: 150, max: 500 })` (default 220, handle between the script list and editor) and `useResizableLayout('scriptsLogHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })` (default 160, handle above the log panel).
 - **Framer Scripts sub-tab** (`FramerScriptsPanel.js`, via `ScriptsCrudPanel.js`): `useResizableLayout('framerScriptsListWidth', { min: 150, max: 500 })` (default 220) — same key shape as tamper's `scriptsListWidth` but its own persisted value, since the two script lists are independent. No log-height key here — `FramerLogPanel.js` is a separate bottom tab (Framing's own "Log" sub-tab), not a panel nested inside the Scripts sub-tab the way tamper's is.
+- **Dissect Scripts tab** (`DissectScriptsPanel.js`, via `ScriptsCrudPanel.js`): `useResizableLayout('dissectScriptsListWidth', { min: 150, max: 500 })` (default 220) — same pattern as the framer's own, independent persisted value.
+- **Dissect panel** (`TrafficView.js`): `useResizableLayout('dissectPanelWidth', { sign: -1, min: 200, max: 500 })` (default 300), handle between `.hexdump-wrap` and `.dissect-panel` — placed *before* the sized element (the panel sits on the right), same sign convention as the bottom panel's and tamper detail panel's own handles above.
 - All of the above apply their size via inline `style` (not fixed CSS) so the persisted value always wins.
 
 **Outside-click/Escape dismissal (`useDismissOnOutsideClick.js`):**
@@ -76,7 +78,7 @@ view's own `jumpRef.current` object simply lacks the key rather than providing a
 
 **Virtual scroll (`HexDump.js`):**
 - Exports `ROW_HEIGHT = 22`. Constants: `BUFFER = 8` (overdraw rows), `PREFETCH_FRACTION = 0.1`.
-- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`, `onSetMarker`, `onClearMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onViewportChange`, `markers`, `sizeFormat`, `pinHeader`.
+- Props: `rows`, `onScrollEnd`, `scrollAdjust`, `adjustVersion`, `scrollTo`, `scrollToVersion`, `globalOffset`, `onSetMarker`, `onClearMarker`, `onSetExtractStart`, `onSetExtractEnd`, `onSetExtractRange`, `onViewportChange`, `markers`, `sizeFormat`, `pinHeader`, `onHeaderClick`, `selectedHeaderKey`, `highlightRange` (the last three back the dissector panel — see "Dissector scripts" below).
 - Encoding helpers imported from `../format.js` (not defined locally).
 - Flattens all loaded chunks into a flat `rows[]` array: one `{type:'header'}` row + N `{type:'hex'}` rows per chunk.
 - A `ResizeObserver` tracks container height; `onScroll` tracks `scrollTop`. Visible window is `[startIdx, endIdx)`. Inner div height = `rows.length * ROW_HEIGHT`; top/bottom spacer divs fill the rest.
@@ -85,9 +87,11 @@ view's own `jumpRef.current` object simply lacks the key rather than providing a
 - **Absolute scroll** (`useLayoutEffect([scrollToVersion])`): clamps `scrollTo` to `[0, el.scrollHeight - el.clientHeight]` and sets both `scrollTop` and internal `scrollTop` state to that clamped value, synchronously before paint; `scrollToVersion` must change to trigger even if `scrollTo` is unchanged. Used by jump-to — the clamp is what lets `jumpToBottom()` pass a deliberately-oversized `scrollTo` and land exactly at the end without knowing the viewport height.
 - **Global/local offset**: `HexRow` displays `row.offset` (stream-global byte offset) when `globalOffset` is true, or `row.localOffset` (offset within the chunk, resets to 0 at each chunk start) when false.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
+- **Dissector highlight** (`highlightRange` prop, `null | {direction, start, end}`, inclusive like `sel`): externally driven — set by clicking a field node in `DissectPanel.js`, not by any mouse interaction inside `HexDump.js` itself — and rendered via its own `.dissect-hl` class alongside (not replacing) `.sel-hl`/marker classes, so a byte under more than one at once shows all of them. See "Dissector scripts" below.
 - **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
 - **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView), where the size field is `fmtByteSize`'s or `fmtByteCount`'s output depending on the `sizeFormat` prop (`'size'`/`'count'`, App.js's View-menu toggle — see "Menu bar" above). A `⋯ ` prefix (plus a `title` tooltip) marks a `row.continued` header — the byte-budgeted segment buffer's loaded window doesn't start at the segment's own offset, so the real header is further up, out of the loaded range (only possible in `TrafficView.js`'s frame mode today, for a still-growing huge frame).
 - **Pinned header** (`pinHeader` prop, App.js's View-menu toggle, default on): when the chunk header for whatever row sits at the very top of the viewport has itself been scrolled above it, a second copy is rendered pinned to the top via `position: sticky` inside a zero-height wrapper (`.chunk-hdr-pinned-wrap` — contributes no height to the flow, so it doesn't perturb `topSpacer`/`scrollHeight` math elsewhere) — `.chunk-hdr-pinned`'s own class adds an opaque background/shadow/border so it reads as floating above the rows scrolling underneath, plus a `▲ ` prefix and a distinct tooltip. `headerRowIdxs` (`useMemo`, keyed on `rows`) + a binary search (`lastHeaderIdxAtOrBefore`) finds it in O(log n) rather than scanning back through however many rows the current segment has. Clicking it calls `scrollToRow` to jump back to the real header; its own `onContextMenu` stops propagation so a right-click there doesn't get misattributed to whatever row is underneath at that screen position (the container's context-menu handler maps click position to a row via `scrollTop`, which doesn't account for the pinned banner's fixed on-screen position).
+- **Frame selection for dissection** (`onHeaderClick`/`selectedHeaderKey` props, frame mode only — `TrafficView.js` is the only caller that passes them): a plain (non-pinned) header row's `onClick` calls `onHeaderClick(row, collectChunkBytes(idx))` — reuses the same `collectChunkBytes` the right-click "copy as hex" menu already computes, so no second byte-collection implementation exists. `headerKey(row)` (`` `${row.direction}:${row.chunkId}` ``, unique within one direction/frame-mode entity) compared against `selectedHeaderKey` adds `.chunk-hdr-selected`; `onClick` being set at all adds `.chunk-hdr-clickable` (cursor). The pinned header keeps its own separate `onClick` (`scrollToRow`) unconditionally — the two behaviors don't share one element. See "Dissector scripts" below.
 - **Context menu** (right-click on a hex row or chunk header):
   - Copy as hex / ASCII / hexdump / base64 — copies chunk bytes (header click) or selection/chunk bytes (row click).
   - Separator, then (when right-clicking a hex byte and extract props present):
@@ -680,7 +684,16 @@ rendered, merged/interleaved across both directions.
   `direction.js`'s `dirToStr` — same convention `scriptRuntime.js` uses for its own
   script-facing API) is fixed for the whole run but carried on every chunk anyway, so a
   script covering both sides of an asymmetric protocol (one script, run once per
-  direction) can branch on it. Returns `{frames, state}` (or nothing,
+  direction) can branch on it. The *last* call of a run may instead carry
+  `chunk.closed = true` with empty `data` — a synthetic signal that the direction's
+  connection has closed, for a script that needs to flush anything whose length is
+  implicit in connection close (e.g. an HTTP/1 response with neither `Content-Length` nor
+  chunked `Transfer-Encoding`); see `catchUpFramer` below for exactly when this fires.
+  `chunk.tls` is `null` for a plain-mode proxy or a not-yet-upgraded `detecttls`
+  connection, else `{sni, alpn, version, cipherSuite}` from the downstream TLS
+  handshake — constant for the whole run like `direction`, carried per-chunk the same
+  way, e.g. to let one script pick HTTP/1.1 vs h2 framing off `chunk.tls?.alpn`. Returns
+  `{frames, state}` (or nothing,
   to mean "no new frames, state unchanged"); each frame is `{offset, length, meta?}`.
   `state`/`meta` are plain JS values from the script's point of view, and may freely
   include a raw `Uint8Array` anywhere in the tree (e.g. a framer's buffered carry bytes
@@ -749,10 +762,17 @@ rendered, merged/interleaved across both directions.
   409 from `appendFrames`) — in every case the Worker is torn down immediately, not asked
   to wind down gracefully.
 - **`framerRun.js`**'s `catchUpFramer(sessionId, streamId, direction, scriptName,
-  scriptSource, onLog?)` (plain scalar ids, matching every other `api.js` wrapper — not
-  whole session/stream objects) is the orchestration: fetches `frame-progress` (how far framing has
-  gotten, plus the framer's own persisted `state`) and `/chunklist`'s length for the target
-  direction; if already caught up, resolves immediately having fetched nothing further.
+  scriptSource, streamEnd, tlsInfo, onLog?)` (plain scalar ids, matching every other
+  `api.js` wrapper — not whole session/stream objects; `streamEnd` is the stream's own
+  `end` field, `0` while ongoing — same convention `TrafficView.js`'s `isClosed(stream)`
+  and `chunkSegments.js`'s own `end` prop already use; `tlsInfo` is
+  `TrafficView.js`'s `streamTlsInfo(stream)` — `null`, or `{sni, alpn, version,
+  cipherSuite}` from the stream's downstream TLS handshake, attached as `chunk.tls` on
+  every chunk built below, constant for the run like `direction`) is the orchestration: fetches
+  `frame-progress` (how far framing has gotten, the framer's own persisted `state`, and
+  whether the close signal below was already delivered) and `/chunklist`'s length for the
+  target direction; if the close signal was already delivered, or (nothing new *and* the
+  direction hasn't closed), resolves immediately having fetched nothing further.
   Otherwise fetches the missing tail via `api.js`'s `fetchDirectionChunks` (unbounded — see
   its own entry above) and runs it through `runFramer`, tagging each returned frame with
   the `stid` *and* `time` of whichever raw chunk contains its last byte (a frame has no
@@ -764,6 +784,29 @@ rendered, merged/interleaved across both directions.
   tick while a stream with an active framer is still growing. `onLog(direction, args)`,
   if given, is called for every `framer.log(...)` the script makes during this run (see
   the `framer.log` bullet above).
+  - **Connection-close signal**: once `streamEnd` is nonzero and every real chunk for the
+    direction has been (or, this call, is about to be) processed, `runFramer`'s `chunks`
+    array gets one extra synthetic entry appended —
+    `{offset: totalLength, length: 0, direction, data: new Uint8Array(0), closed: true}`
+    — so it's always the *last* chunk `frame()` sees for the run. If there's no new real
+    backlog to process (already caught up from an earlier run, direction just closed),
+    `rawChunks` still gets populated — via a targeted `fetchDirectionChunks(...,
+    totalLength)`, relying on `/byte-stid`'s floor lookup (`offset <= N`) resolving to the
+    stream's *last* real chunk even though `totalLength` itself lands one past its end —
+    purely so a frame the script emits on the synthetic call can still resolve a real
+    `stid`/`time` via the existing `chunkAtOffset` lookup; that fetched chunk is filtered
+    back out of what's actually fed to `frame()`, since it was already processed in an
+    earlier run. Once `runFramer` resolves — meaning every batch, including whichever one
+    carried the synthetic chunk, already persisted via an ordinary `appendFrames(...,
+    closed: false)` call — one dedicated trailing `appendFrames(key, expectedOffset, [],
+    expectedOffset, finalState, closed: true)` call marks `frame_progress.closed`, so a
+    later call short-circuits instead of ever redelivering the signal (needed because
+    `TrafficView.js`'s live-tailing effect keeps re-polling on every central-poll tick
+    regardless of whether the stream has closed). A frame emitted from the synthetic call
+    when the direction closed having captured **zero bytes ever** has no real chunk for
+    `chunkAtOffset` to resolve against and throws — an accepted edge case (surfaces as an
+    ordinary framer-run error), not worth guarding since it only arises from a script
+    emitting a frame that references no real data.
 - **`framerPrefs.js`**: two `localStorage`-backed preferences, deliberately **not** the
   same in-memory-only mechanism "remember stream position" uses (App.js) — these survive
   a reload. `loadDefaultFramerScript`/`saveDefaultFramerScript` (one global default,
@@ -875,3 +918,105 @@ bottom-tab bar (`Goto | Markers | Search | Extract | Transform | Framing`).
   addition to setting `frameError` — the existing banner stays the immediate/prominent
   signal; the Log tab becomes a persistent trail that includes that same failure, not
   just successful runs.
+
+**Dissector scripts (`dissectRuntime.js`, `dbdumpDissectApi.js`, `dissectPrefs.js`,
+`DissectPanel.js`, `DissectScriptsPanel.js`) — done, feature-complete for v1:** produces a
+labeled field-tree breakdown of one frame's bytes, à la Wireshark's packet-details pane.
+Full design (field node schema, `dissect(bytes, frame)` contract) in
+[`doc/design/packet-dissector.md`](../doc/design/packet-dissector.md); backend script
+storage in `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section.
+
+- **Script contract**: a plain top-level `function dissect(bytes, frame)`, looked up by
+  name — same convention as the framer's `frame(state, chunk)`, and for the same reason
+  (`dissectRuntime.js`'s `buildScriptSource` isn't IIFE-wrapped, same as
+  `frameRuntime.js`'s). Returns `FieldNode[]` — top-level siblings, not one wrapping root.
+  Unlike a framer script, there's no `state` threaded across calls (dissection has no
+  cross-frame memory) and no batch/ack cycle (one call, one result) — `dissectRuntime.js`
+  spins up a fresh Worker per call rather than reusing one across frames, since dissection
+  is on-demand per selected frame, not a running process; revisit only if per-click
+  Worker-startup cost turns out to matter in practice.
+- **A global `dissector` object** exposes the same transform framework framer/tamper
+  scripts get, under `dissector.transform.<category>.*`/`dissector.encode.{hex,base64,
+  hexdump}`/`dissector.decode.{hex,base64,hexdump}`/`dissector.number.decode<Type>`/
+  `encode<Type>` — mirroring `framer.*`'s shape (see "Framer scripts" above) and its
+  always-synchronous convention, via the same shared `transformWorkerApi.js`. Named
+  `dissector`, not `dissect`, specifically so it can't collide with the script's own
+  top-level `function dissect(...)` declaration. Lets a script report a node's `content`
+  for something that isn't a direct frame slice (e.g. a decompressed sub-payload via
+  `dissector.transform.compression.zlibDecompress(bytes)`, base64-encoded for `content`
+  via `dissector.encode.base64(...)`) without a second formatting implementation.
+- **No RPC bridge, no network access from inside the Worker at all** — a dissector script
+  is a pure function over bytes the main thread already has (the design doc's "Execution
+  model" section is explicit that only the two-Blob-plus-`sourceURL` loading trick is
+  worth carrying over from `scriptRuntime.js`/`frameRuntime.js`; not worth factoring into
+  shared code across three call sites, per this repo's duplication policy — same
+  conclusion each of the three independently reaches for that trick).
+- **`runDissector(scriptName, scriptSource, bytes, frame)`** posts one `{kind: 'run',
+  bytes, frame}` message; the Worker calls `dissect(bytes, frame)` after `modulesReady`
+  resolves and posts back `{kind: 'result', nodes}` or `{kind: 'error', message}`. Rejects
+  if the script throws, never defines `dissect`, or `dissect` doesn't return an array —
+  the last case is checked explicitly (`Array.isArray`) rather than silently coerced to
+  `[]`, matching this codebase's fail-loud convention for a contract violation.
+- **`dbdumpDissectApi.js`** — `listDissectScripts`/`getDissectScript`/
+  `putDissectScript`/`deleteDissectScript`, byte-for-byte the same shape as
+  `dbdumpFramerApi.js`'s own script functions, pointed at `/api/i/dbdump/dissect/scripts`
+  instead of `/api/i/dbdump/scripts` — the exact shape `ScriptsCrudPanel.js` expects
+  (`list`/`get`/`put`/`del` props), so a future `DissectScriptsPanel.js` can wrap it the
+  same way `FramerScriptsPanel.js` wraps the framer's own functions (see "Scripted
+  interception" above). No frame-index-style read/extend functions here — dissection
+  output is never persisted, so there's nothing beyond script CRUD to wrap.
+- **`dissectPrefs.js`** — `localStorage`-backed script-selection persistence, a straight
+  mirror of `framerPrefs.js` (global default + per-stream override, own storage key
+  `tlstap-dissect-prefs`): `loadDefaultDissectScript`/`saveDefaultDissectScript` (driven
+  by the View menu's "Default dissector" entry, next to "Default framer") and
+  `loadStreamDissectScript`/`saveStreamDissectScript` (per-`session:streamId`, falling
+  back to the default until a stream has its own override).
+- **`DissectPanel.js`** — the field-tree side panel, `TrafficView.js`'s right edge, frame
+  view only (see "Frame selection for dissection" under "Virtual scroll" above for how a
+  frame becomes `selectedFrame`). Runs `dissect()` in an effect keyed on
+  `[selectedFrame?.key, dissectorSelected]` — re-fetches the script's current content via
+  `getDissectScript` on every run rather than caching it, so an edit made in the "Dissect"
+  bottom tab (below) takes effect on the very next frame click with no separate reload
+  step, unlike the framer's cached `frameScriptRunning`. Placeholders for "no frame
+  selected yet" / "no script chosen"; a thrown/malformed result surfaces as an
+  `.error-msg` banner, not a crash.
+  - **`resolveValue(node, frameBytes)`** turns a node's `content` or `offset`/`length`
+    (mutually exclusive, per the schema) into `{text, bytes}`: an `offset`/`length` node
+    slices `frameBytes` directly; a `content` string is treated as base64 *only* when
+    `display-hint` is present (undecorated string content renders as-is — a script's own
+    already-formatted label); a `content` number/bool renders via `String(...)`,
+    `display-hint` ignored. `display-hint` is one of `format.js`'s own formatter names
+    (`ascii`/`hex`/`hexdump`/`base64`/`raw`), defaulting to `hex` when byte-shaped but
+    unhinted. **Wrapped in try/catch** — a bad base64 `content` (or any other malformed
+    node) renders as an inline `(invalid: ...)` value instead of throwing mid-render, since
+    this codebase has no error boundary to catch it. A non-object array entry gets the
+    same treatment one level up, in `FieldNode` itself.
+  - **`FieldNode`** (recursive): local `expanded` state per instance (default expanded,
+    resets on remount — no persistence, matching `HexEditor.js`'s cursor not persisting
+    across remounts). Only a node with both `offset` and `length` is clickable
+    (`.dissect-node-clickable`) — clicking translates its frame-relative range to an
+    absolute one (`frameOffset + node.offset`, inclusive end) and calls `onNodeClick`,
+    forwarded unchanged through every recursion level from the top-level list's own
+    closure (which is where `selectedFrame.frame.direction` actually gets attached — a
+    node itself carries no direction, since it's implicit in whichever frame is selected).
+  - Props: `selectedFrame` (`TrafficView.js`'s `{key, frame, bytes}` or `null`),
+    `dissectScripts`, `dissectorSelected`, `onDissectorSelect`, `onNodeClick(direction,
+    start, end)`.
+- **`DissectScriptsPanel.js`** — thin `ScriptsCrudPanel.js` wrapper, byte-for-byte the
+  same shape as `FramerScriptsPanel.js` (own `DISSECTOR_COMPLETION_SHAPE`, generated the
+  same way from `OPERATIONS_BY_CATEGORY`/`NUMBER_TYPES`, minus `log` — a dissector script
+  has no equivalent). CRUD only, no `controls`/`rowDecoration` — a dissector script runs
+  on-demand per selected frame from `DissectPanel.js`, not from here.
+- **"Dissect" Analysis bottom-panel tab** (`App.js`): positioned after "Framing"
+  (`Goto | Markers | Search | Extract | Transform | Framing | Dissect`). Unlike
+  `FramingPanel.js`, no Scripts/Log sub-tab split — `DissectScriptsPanel.js` is the
+  entire tab content directly, since there's no running-script log to show alongside the
+  editor (errors surface inline in `DissectPanel.js` itself, per-frame).
+- **`TrafficView.js`'s own state**: `selectedFrame`/`dissectHighlight`/
+  `dissectorSelected` (see the doc comment directly above `handleFrameHeaderClick` in
+  that file) are all reset together on a stream switch, on `handleShowRawChunks` (leaving
+  frame view), and at the start of `handleRunFramer` (a fresh run's `clearStreamFrames`
+  can invalidate a previously-selected frame's key) — `dissectorSelected` alone survives
+  a stream switch, reloaded from `dissectPrefs.js` like `framerSelected` is from
+  `framerPrefs.js`. `dissectPanelWidth` (`layout.js`) is not stream-scoped, same as every
+  other resizable-panel width in this codebase.

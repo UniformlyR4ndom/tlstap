@@ -1,17 +1,17 @@
-# Packet Dissector — design notes (dissector stage, deferred)
+# Packet Dissector — design notes
 
-**Status: not implemented, not scheduled.** This document captures the design arrived
-at for the dissector half of the "Packet Dissector" feature, split out so the
-[framer stage](#relationship-to-the-framer-stage) can be built and shipped first. Treat
-everything here as a starting point for whoever picks this up later, not a committed
-design — revisit it against whatever the framer stage actually looks like once built.
+**Status: implemented, v1 complete (2026-08-09).** The framer stage
+([below](#relationship-to-the-framer-stage)) shipped first, as planned; the dissector
+stage documented here — schema, script store, Worker execution, and the
+`TrafficView.js` panel (click a frame, click a field, see it highlighted) — is now built
+end-to-end. See `intercept/dbdump/CLAUDE.md`'s and `web/CLAUDE.md`'s own "Dissector
+scripts" sections for what actually shipped, not just what was planned.
 
 ## What problem this solves
 
 Turn a byte range (a frame, in framer-stage terms — see below) into a labeled,
 human-readable breakdown of its fields, à la Wireshark's packet-details pane: a
-collapsible tree of `{label, value, byte range}` nodes, clicking a node highlights its
-bytes in the hex view.
+collapsible tree of field nodes, clicking a node highlights its bytes in the hex view.
 
 ## Relationship to the framer stage
 
@@ -26,18 +26,39 @@ own — see below.
 
 ```js
 {
-  label: "Content Type",
-  value: "Handshake (22)",   // human-readable, formatted by the dissector script
-  start: 0,                   // byte offset relative to the frame's own bytes
-  length: 1,
-  children: [ /* nested FieldNode[], for TLV / sub-structures */ ]
+  label: "Content Type",       // required
+  content: "FhYD",             // OR offset+length below — mutually exclusive, never both
+  "display-hint": "hex",       // optional; only meaningful when the value is bytes
+  sub: [ /* nested FieldNode[], for TLV / sub-structures — optional */ ]
 }
 ```
 
-`start`/`length` are relative to the frame, not the stream — the panel adds the frame's
-own base stream-offset to translate a node into an absolute byte range for highlighting
-in `HexDump`/`HexEditor`, the same translation the framer stage already needs for its own
-frame-boundary → absolute-offset mapping.
+A node carries **at most one** of:
+- `content` — a literal value the script computes directly: base64-encoded bytes, a
+  number, or a bool. Used for anything that isn't a direct slice of the frame's own bytes
+  (a decompressed/decrypted sub-payload, a checksum computed over other fields, a decoded
+  enum label, ...). A `content`-only node has no byte range, so it **cannot** be
+  highlighted in the hex view — that's an accepted, deliberate limitation: it's not
+  possible in general (the decompressed example above has no single contiguous range in
+  the frame to point back to).
+- `offset`/`length` — plain integers, relative to the frame's own bytes (not the stream).
+  Means "this field's value *is* the frame's own bytes at `[offset, offset+length)`" —
+  the panel adds the frame's own base stream-offset to translate this into an absolute
+  byte range for highlighting in `HexDump`/`HexEditor`, the same translation the framer
+  stage already needs for its own frame-boundary → absolute-offset mapping. `display-hint`
+  says how to render those raw bytes; there is no numeric-decoding hint (e.g. "treat these
+  2 bytes as a big-endian uint16") — a script that wants a *decoded* number displayed
+  computes it itself and reports it via `content` instead, accepting the tradeoff above.
+
+Neither is required — a node with just `label` and `sub` is a pure grouping row (e.g.
+"Extensions") with no value of its own.
+
+`display-hint` is one of `format.js`'s existing formatter names — `ascii`, `hex`,
+`hexdump`, `base64`, `raw` — reused as-is rather than inventing a second formatting
+vocabulary; the UI decodes (`content`'s base64, or the frame slice at `offset`/`length`)
+then calls the same `fmtAsAscii`/`fmtAsHexdump`/etc. `HexDump.js`/`ExtractPanel.js`/
+`TransformPanel.js` already use. Irrelevant/omitted for a `content` that's already a
+number or bool — rendered as-is.
 
 ## Dissector contract
 
@@ -48,7 +69,7 @@ function dissect(bytes, frame) {
   // frame: { offset, length, direction, kind, ... } — kind/metadata as tagged by the
   // framer that produced this frame (e.g. "http-response" vs "websocket-frame" for a
   // stream that upgraded partway through)
-  return FieldNode // the tree's root
+  return FieldNode[] // top-level siblings, not a single wrapping root
 }
 ```
 
@@ -79,30 +100,38 @@ fast enough not to need caching at all.
 
 ## UI
 
-- A collapsible field-tree panel — side or bottom, panel placement kept easy to change
-  (matches how every other resizable panel in this codebase already reads its size from
-  `layout.js`/`useResizableLayout`, not hardcoded).
+- A collapsible field-tree panel in `TrafficView.js`'s right side — the space
+  `MarkersPanel.js` was deliberately moved out of the traffic view for (see
+  `web/CLAUDE.md`'s "Markers panel" section). Sized via `layout.js`/`useResizableLayout`,
+  same as every other resizable panel here, not hardcoded.
+- **Frame view only** — dissection needs `frame.kind`, which only exists once a framer
+  script has tagged frames; there is no dissection entry point in raw-chunk view.
+- **Frame selection is click-driven, not auto-follow-scroll**: clicking a frame's row/
+  header while in frame view selects it as "current"; the panel recomputes automatically
+  (no separate "Dissect" button) for whichever frame is currently selected. Unambiguous
+  even when several frames are visible in the viewport at once.
 - Clicking a node highlights its translated absolute byte range in the hex view (reuses
   `HexDump.js`'s existing per-byte `data-off`/`data-dir` selection machinery — see
-  `web/CLAUDE.md`'s "Byte selection" note).
+  `web/CLAUDE.md`'s "Byte selection" note) — only possible for a node with `offset`/
+  `length`, per the field node schema above.
 - Nested/variable-length fields (TLV, length-prefixed sub-structures) are in scope from
-  the start via `FieldNode.children` — not deferred to a later cut.
+  the start via `FieldNode.sub` — not deferred to a later cut.
 
 ## Script storage
 
-Reuses the same extraction planned for the framer stage:
+Reuses the extraction the framer stage already did:
 - Backend: the shared `scriptstore` package (name-validated flat store, atomic writes),
-  the same one tamper's own scripts and the framer's scripts use.
-- Frontend: `ScriptEditor.js` generalized to take its autocompletion source as a prop
-  (dissector scripts get no tamper-specific `tamper.*`/`ctx.*` completions); the generic
-  CRUD list+editor chrome extracted from `TamperScriptsPanel.js`, parametrized by REST
-  functions and an extension-point slot for controls (dissector panel likely needs none —
-  no Run/Stop, since execution is on-demand per viewed frame, not a running process).
-
-**Open question, not resolved:** whether dissector scripts share the same `scripts-dir`/
-namespace as framer scripts (distinguished by some "kind" metadata) or get an entirely
-separate directory/config field. Revisit once the framer stage's actual `scripts-dir`
-wiring exists to model this against.
+  the same one tamper's own scripts and the framer's scripts use — a second, independent
+  `*scriptstore.Store` for dissector scripts, its own `dissect-scripts-dir` config field,
+  registered under its own REST namespace (`.../dissect/scripts`, nested under `dbdump`'s
+  basePath, so it can reuse `scriptstore.RegisterRoutes` unmodified rather than colliding
+  with the framer's own `.../scripts`). **Settled 2026-08-09**: a fully separate
+  directory/namespace, not shared with framer scripts — simpler than adding a "kind"
+  concept to the shared `scriptstore` package for a cosmetic benefit.
+- Frontend: `ScriptEditor.js`/`ScriptsCrudPanel.js` (already generalized during the
+  framer stage — see `web/CLAUDE.md`'s "Scripted interception" section) reused directly,
+  the same way `FramerScriptsPanel.js` wraps `ScriptsCrudPanel.js` today. No Run/Stop
+  controls needed — execution is on-demand per selected frame, not a running process.
 
 ## Dropped for now: manual framing anchors
 

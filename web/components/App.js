@@ -12,13 +12,16 @@ import ExtractPanel from './ExtractPanel.js'
 import TransformPanel from './TransformPanel.js'
 import TamperView from './TamperView.js'
 import FramingPanel from './FramingPanel.js'
+import DissectScriptsPanel from './DissectScriptsPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { loadMarkers, saveMarkers, makeMarkerId } from '../markers.js'
 import { useResizableLayout } from '../useResizableLayout.js'
 import { usePoll } from '../usePoll.js'
 import { getLatest } from '../api.js'
 import { listFramerScripts } from '../dbdumpFramerApi.js'
+import { listDissectScripts } from '../dbdumpDissectApi.js'
 import { loadDefaultFramerScript, saveDefaultFramerScript } from '../framerPrefs.js'
+import { loadDefaultDissectScript, saveDefaultDissectScript } from '../dissectPrefs.js'
 import { DIRNUM_C2S } from '../direction.js'
 
 const html = htm.bind(h)
@@ -41,7 +44,7 @@ export default function App() {
     const [pinHeader,    setPinHeader]    = useState(true)    // pin a scrolled-past chunk header to the top
     const [rememberPosition, setRememberPosition] = useState(false)
     const [viewMode,     setViewMode]     = useState('single')
-    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'markers' | 'search' | 'extract' | 'transform' | 'framing'
+    const [bottomTab,    setBottomTab]    = useState(null)  // null = collapsed, 'goto' | 'markers' | 'search' | 'extract' | 'transform' | 'framing' | 'dissect'
     const [frameLog,     setFrameLog]     = useState([])  // [{direction, text, level}], scoped to the current stream — see handleFramerLogReset
     const [jumpTo,       setJumpTo]       = useState(null)
     const [markers,      setMarkers]      = useState(() => loadMarkers())
@@ -51,6 +54,8 @@ export default function App() {
     const [latest,       setLatest]       = useState({ latest_session_id: -1, latest_sgid: -1, streams_version: -1, latest_stid: -1 })
     const [framerScripts, setFramerScripts] = useState([])
     const [defaultFramerScript, setDefaultFramerScriptState] = useState(() => loadDefaultFramerScript())
+    const [dissectScripts, setDissectScripts] = useState([])
+    const [defaultDissectScript, setDefaultDissectScriptState] = useState(() => loadDefaultDissectScript())
     const [sidebarWidth, handleSidebarResize] = useResizableLayout('sidebarWidth', { min: 180, max: 600 })
     const [bottomHeight, handleBottomResize]  = useResizableLayout('bottomHeight', { sign: -1, min: 80, max: () => Math.floor(window.innerHeight * 0.7) })
     const menubarRef     = useRef(null)
@@ -71,9 +76,21 @@ export default function App() {
         listFramerScripts().then(setFramerScripts).catch(() => setFramerScripts([]))
     }, [refreshKey])
 
+    // Same reasoning/convention as the framer scripts fetch above, for dbdump's separate
+    // dissector script store.
+    useEffect(() => {
+        listDissectScripts().then(setDissectScripts).catch(() => setDissectScripts([]))
+    }, [refreshKey])
+
     function handleSetDefaultFramer(name) {
         setDefaultFramerScriptState(name || null)
         saveDefaultFramerScript(name || null)
+        setOpenMenu(null)
+    }
+
+    function handleSetDefaultDissect(name) {
+        setDefaultDissectScriptState(name || null)
+        saveDefaultDissectScript(name || null)
         setOpenMenu(null)
     }
 
@@ -296,6 +313,18 @@ export default function App() {
                                     ${framerScripts.map(s => html`<option value=${s.name}>${s.name}</option>`)}
                                 </select>
                             </div>
+                            <div class="menu-item">
+                                <span>Default dissector</span>
+                                <select
+                                    class="goto-select"
+                                    style="margin-left:auto"
+                                    value=${defaultDissectScript ?? ''}
+                                    onchange=${e => handleSetDefaultDissect(e.target.value)}
+                                >
+                                    <option value="">(none)</option>
+                                    ${dissectScripts.map(s => html`<option value=${s.name}>${s.name}</option>`)}
+                                </select>
+                            </div>
                         </div>
                     `}
                 </div>
@@ -341,6 +370,7 @@ export default function App() {
                             framerScripts=${framerScripts}
                             onFramerLog=${handleFramerLog}
                             onFramerLogReset=${handleFramerLogReset}
+                            dissectScripts=${dissectScripts}
                           />`
                     }
                 </main>
@@ -354,6 +384,7 @@ export default function App() {
                     <div class=${'bottom-tab' + (bottomTab === 'extract'   ? ' active' : '')} onclick=${() => selectBottomTab('extract')}>Extract</div>
                     <div class=${'bottom-tab' + (bottomTab === 'transform' ? ' active' : '')} onclick=${() => selectBottomTab('transform')}>Transform</div>
                     <div class=${'bottom-tab' + (bottomTab === 'framing'  ? ' active' : '')} onclick=${() => selectBottomTab('framing')}>Framing</div>
+                    <div class=${'bottom-tab' + (bottomTab === 'dissect'  ? ' active' : '')} onclick=${() => selectBottomTab('dissect')}>Dissect</div>
                     ${bottomTab && html`<div class="bottom-collapse" onclick=${() => setBottomTab(null)} title="Collapse">▼</div>`}
                 </div>
                 ${bottomTab && html`
@@ -380,6 +411,7 @@ export default function App() {
                         />`}
                         ${bottomTab === 'transform' && html`<${TransformPanel} />`}
                         ${bottomTab === 'framing' && html`<${FramingPanel} refreshSignal=${refreshKey} frameLog=${frameLog} onClearFrameLog=${handleFramerLogReset} />`}
+                        ${bottomTab === 'dissect' && html`<${DissectScriptsPanel} refreshSignal=${refreshKey} />`}
                     </div>`}
             </div>
             `}

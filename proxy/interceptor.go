@@ -44,9 +44,27 @@ type ConnInfo struct {
 	SrcEndpoint string
 	DstEndpoint string
 	ConnID      uint32
+
+	// TLS is the downstream (client-facing) connection's negotiated TLS state — nil for
+	// a plain connection, or a TLS one that hasn't (yet, or ever) completed its
+	// downstream handshake at the point this ConnInfo was built. Always the downstream
+	// side specifically, for both directions' ConnInfo alike, even though the proxy also
+	// holds a second, independent TLS session upstream (which can legitimately differ,
+	// e.g. without ALPN/SNI passthrough) — see tlsInfoFromConn (tls.go).
+	TLS *TLSInfo
 }
 
-func NewConnInfo(lAddr, rAddr net.Addr, id uint32) ConnInfo {
+// TLSInfo is the subset of tls.ConnectionState an interceptor might find useful —
+// e.g. distinguishing HTTP/1.1 from h2 via ALPN. CipherSuite is the raw ID; a script
+// wanting the name looks it up itself.
+type TLSInfo struct {
+	SNI         string
+	ALPN        string
+	Version     uint16
+	CipherSuite uint16
+}
+
+func NewConnInfo(lAddr, rAddr net.Addr, id uint32, tlsInfo *TLSInfo) ConnInfo {
 	lTcpAddr, ok := lAddr.(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected type: %T. This is a bug.", lAddr)
 
@@ -61,5 +79,6 @@ func NewConnInfo(lAddr, rAddr net.Addr, id uint32) ConnInfo {
 		DstPort:     uint16(rTcpAddr.Port),
 		DstEndpoint: rTcpAddr.String(),
 		ConnID:      id,
+		TLS:         tlsInfo,
 	}
 }

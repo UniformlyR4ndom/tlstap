@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -223,6 +224,24 @@ func SummarizeTlsConn(tlsConn *tls.Conn) string {
 	}
 
 	return sb.String()
+}
+
+// tlsInfoFromConn extracts a TLSInfo from conn's negotiated TLS state, or nil if conn
+// isn't (yet) a *tls.Conn — a plain net.Conn (ModePlain, or a not-yet-upgraded
+// detecttls connection) has no TLS state to report.
+func tlsInfoFromConn(conn net.Conn) *TLSInfo {
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+
+	state := tlsConn.ConnectionState()
+	return &TLSInfo{
+		SNI:         state.ServerName,
+		ALPN:        state.NegotiatedProtocol,
+		Version:     state.Version,
+		CipherSuite: state.CipherSuite,
+	}
 }
 
 func TLSVersionToString(version uint16) string {

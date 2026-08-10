@@ -40,6 +40,7 @@ test('buildRows: a fully-loaded window produces one header + hex rows with local
     assert.equal(rows.length, 3) // 1 header + ceil(20/16)=2 hex rows
     assert.deepEqual(rows[0], {
         type: 'header', direction: 0, stid: 1, chunkId: 0, relTime: '+1.000s', size: 20, continued: false,
+        offset: 0, meta: undefined,
     })
     assert.equal(rows[1].type, 'hex')
     assert.equal(rows[1].offset, 0)

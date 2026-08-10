@@ -212,11 +212,19 @@ body {
 .chunk-hdr.chunk-hdr-pinned.c2s { background: #151d27; }
 .chunk-hdr.chunk-hdr-pinned.s2c { background: #121f1c; }
 
+/* Frame mode's dissector selection — a plain header click (not the pinned/jump-back one
+   above), see HexDump.js's onHeaderClick. */
+.chunk-hdr.chunk-hdr-clickable { cursor: pointer; }
+.chunk-hdr.chunk-hdr-selected { outline: 1px solid var(--text-dim); outline-offset: -1px; }
+
 .hex-row.c2s { color: #c5dffe; }
 .hex-row.s2c { color: #c2f0cd; }
 .hex-off { color: var(--text-dim); }
 .hex-asc { color: var(--text-dim); }
 .sel-hl  { background: rgba(88,166,255,0.28); border-radius: 1px; }
+/* Dissector field-node highlight (DissectPanel.js) — distinct color from .sel-hl (mouse
+   drag) and the marker triangles below, since a byte can be under more than one at once. */
+.dissect-hl { background: rgba(255,170,60,0.35); border-radius: 1px; }
 
 .hex-byte-marked, .asc-byte-marked { position: relative; }
 .hex-byte-marked::after, .asc-byte-marked::after {
@@ -899,6 +907,16 @@ body {
     min-height: 0;
     overflow: hidden;
 }
+/* DissectScriptsPanel.js: same ScriptsCrudPanel.js reuse and root shape as
+   .framer-scripts-view above — its own "Dissect" bottom tab sits in the same kind of
+   flex: 1 region .framing-body is, just without a Scripts/Log sub-tab split around it
+   (no Log tab for dissector scripts — see DissectScriptsPanel.js's own comment). */
+.dissect-scripts-view {
+    height: 100%;
+    display: flex;
+    min-height: 0;
+    overflow: hidden;
+}
 .tamper-scripts-list-panel {
     /* Overrides .panel's `flex: 1` (grow:1, shrink:1, basis:0%) entirely: with a
        0% basis the element ignores `width` and just splits space with its flex
@@ -1118,6 +1136,51 @@ body {
     overflow: hidden;
 }
 .traffic-body > .hexdump-wrap { flex: 1; min-width: 0; }
+
+/* Frame view's dissector side panel (DissectPanel.js) — the space MarkersPanel.js was
+   moved out of TrafficView.js to free (see this file's header comment above); a fixed
+   width (inline style, TrafficView.js's own dissectPanelWidth) flex sibling of
+   .hexdump-wrap, same shape .sidebar is to .main in App.js's own layout. */
+.dissect-panel {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-left: 1px solid var(--border);
+    background: var(--surface);
+}
+.dissect-panel .goto-select { margin-left: auto; max-width: 55%; }
+.dissect-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+.dissect-node-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+}
+.dissect-node-row.dissect-node-clickable { cursor: pointer; }
+.dissect-node-row.dissect-node-clickable:hover { background: rgba(255,255,255,0.05); }
+.dissect-node-toggle {
+    width: 12px;
+    flex-shrink: 0;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+}
+.dissect-node-toggle-spacer { width: 12px; flex-shrink: 0; }
+.dissect-node-label { color: var(--text-dim); flex-shrink: 0; }
+.dissect-node-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 
 .markers-io-bar {
     display: flex;

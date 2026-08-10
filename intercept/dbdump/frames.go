@@ -56,19 +56,21 @@ type frameInput struct {
 var errFrameProgressConflict = errors.New("frame progress has advanced past the expected offset")
 
 // getFrameProgress reports how far framing has progressed for key: the processed
-// offset (0 if framing hasn't started for key yet) and the framer's own opaque
-// persisted state (nil if none). "Not started" is a normal, common state, not an error.
-func (i *DbDumpInterceptor) getFrameProgress(key frameKey) (processedOffset int64, state []byte, err error) {
+// offset (0 if framing hasn't started for key yet), the framer's own opaque persisted
+// state (nil if none), and whether the direction's connection-close signal has already
+// been delivered to (and persisted by) the script — see catchUpFramer in
+// web/framerRun.js. "Not started" is a normal, common state, not an error.
+func (i *DbDumpInterceptor) getFrameProgress(key frameKey) (processedOffset int64, state []byte, closed bool, err error) {
 	row := i.db.QueryRow(
-		`SELECT processed_offset, state FROM frame_progress
+		`SELECT processed_offset, state, closed FROM frame_progress
 		 WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ?`,
 		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion,
 	)
-	err = row.Scan(&processedOffset, &state)
+	err = row.Scan(&processedOffset, &state, &closed)
 	if err == sql.ErrNoRows {
-		return 0, nil, nil
+		return 0, nil, false, nil
 	}
-	return processedOffset, state, err
+	return processedOffset, state, closed, err
 }
 
 // scanFrameRows reads every row of rows into a frameRecord slice, closing rows itself.
@@ -257,14 +259,19 @@ func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, bef
 
 // appendFrames extends key's persisted frame index by one batch, computed by a
 // browser-run framer script: newFrames are inserted with sequential ids continuing from
-// whatever's already stored, and processed_offset/state are advanced to
-// newProcessedOffset/newState — all in one transaction. expectedProcessedOffset must
-// match the currently-stored processed_offset (0 if framing hasn't started for key yet);
-// a mismatch returns errFrameProgressConflict without writing anything. There is
+// whatever's already stored, and processed_offset/state/closed are advanced to
+// newProcessedOffset/newState/closed — all in one transaction. expectedProcessedOffset
+// must match the currently-stored processed_offset (0 if framing hasn't started for key
+// yet); a mismatch returns errFrameProgressConflict without writing anything. There is
 // deliberately no retry/CAS-defense beyond that single check: the UI enforces one writer
 // per key, so a mismatch here always indicates a client bug, not a real race to resolve
 // gracefully.
-func (i *DbDumpInterceptor) appendFrames(key frameKey, expectedProcessedOffset int64, newFrames []frameInput, newProcessedOffset int64, newState []byte) error {
+//
+// closed is normally false — ordinary batches processing real backlog never set it.
+// catchUpFramer (web/framerRun.js) passes true in exactly one dedicated call per
+// direction, once its synthetic connection-close chunk has itself already been
+// persisted via a prior (closed=false) call to this same function.
+func (i *DbDumpInterceptor) appendFrames(key frameKey, expectedProcessedOffset int64, newFrames []frameInput, newProcessedOffset int64, newState []byte, closed bool) error {
 	tx, err := i.db.Begin()
 	if err != nil {
 		return err
@@ -309,11 +316,11 @@ func (i *DbDumpInterceptor) appendFrames(key frameKey, expectedProcessedOffset i
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO frame_progress (session, stream, direction, script, script_version, processed_offset, state)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO frame_progress (session, stream, direction, script, script_version, processed_offset, state, closed)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (session, stream, direction, script, script_version)
-		 DO UPDATE SET processed_offset = excluded.processed_offset, state = excluded.state`,
-		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, newProcessedOffset, newState,
+		 DO UPDATE SET processed_offset = excluded.processed_offset, state = excluded.state, closed = excluded.closed`,
+		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, newProcessedOffset, newState, closed,
 	); err != nil {
 		return err
 	}
@@ -453,7 +460,7 @@ func (i *DbDumpInterceptor) handleFrameProgress(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	offset, state, err := i.getFrameProgress(req.key())
+	offset, state, closed, err := i.getFrameProgress(req.key())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -462,7 +469,8 @@ func (i *DbDumpInterceptor) handleFrameProgress(w http.ResponseWriter, r *http.R
 	writeJSON(w, struct {
 		ProcessedOffset int64  `json:"processed_offset"`
 		State           []byte `json:"state"`
-	}{ProcessedOffset: offset, State: state})
+		Closed          bool   `json:"closed"`
+	}{ProcessedOffset: offset, State: state, Closed: closed})
 }
 
 func (i *DbDumpInterceptor) handleFramesList(w http.ResponseWriter, r *http.Request) {
@@ -532,6 +540,7 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 		} `json:"new_frames"`
 		NewProcessedOffset int64  `json:"new_processed_offset"`
 		NewState           []byte `json:"new_state"`
+		Closed             bool   `json:"closed"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -542,7 +551,7 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 		inputs[j] = frameInput{Offset: f.Offset, Length: f.Length, Meta: f.Meta, Stid: f.Stid, Time: f.Time}
 	}
 
-	err := i.appendFrames(req.key(), req.ExpectedProcessedOffset, inputs, req.NewProcessedOffset, req.NewState)
+	err := i.appendFrames(req.key(), req.ExpectedProcessedOffset, inputs, req.NewProcessedOffset, req.NewState, req.Closed)
 	if err == errFrameProgressConflict {
 		writeError(w, http.StatusConflict, err.Error())
 		return

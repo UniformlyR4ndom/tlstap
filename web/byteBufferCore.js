@@ -42,6 +42,9 @@ export function isWindowFull(w)  { return w.loadedEnd >= w.segment.offset + w.se
 // once this is wired in. `continued: true` marks a header whose window no longer starts
 // at the segment's own offset (front-trimmed while still partially resident) — exact
 // visual treatment is a HexDump.js concern for the migration step, not decided here.
+// `offset`/`meta` are the segment's own (not the loaded window's) — for a `continued`
+// header these are still the frame's true start/metadata even though the loaded bytes
+// begin later; see doc/design/packet-dissector.md for what a frame's own `meta` carries.
 export function buildRows(windows, streamStart) {
     const rows = []
     for (const w of windows) {
@@ -54,6 +57,8 @@ export function buildRows(windows, streamStart) {
             relTime:   fmtRelTime(segment.time, streamStart),
             size:      segment.length,
             continued: loadedStart > segment.offset,
+            offset:    segment.offset,
+            meta:      segment.meta,
         })
         const localBase = loadedStart - segment.offset
         for (let off = 0; off < bytes.length; off += 16) {

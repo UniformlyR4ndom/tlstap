@@ -44,6 +44,14 @@ func (i *DbDumpInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	mux.HandleFunc("POST "+basePath+"/frames/clear", i.handleFramesClear)
 
 	scriptstore.RegisterRoutes(mux, basePath, i.scripts, i.onFramerScriptPut, i.onFramerScriptDelete)
+
+	// Nested under its own "/dissect" segment so this second Store's routes don't collide
+	// with the framer's own basePath+"/scripts" above — RegisterRoutes always registers at
+	// <basePath>/scripts, so a distinct basePath is what keeps the two independent. No
+	// onPut/onDelete: dissection output is never persisted (see
+	// doc/design/packet-dissector.md's "Laziness" section), so there's nothing to purge on
+	// a script write/delete the way onFramerScriptPut/onFramerScriptDelete purge frame data.
+	scriptstore.RegisterRoutes(mux, basePath+"/dissect", i.dissectScripts, nil, nil)
 }
 
 // onFramerScriptPut purges any other persisted frame-index version for name, keeping
@@ -120,7 +128,8 @@ func (i *DbDumpInterceptor) handleStreams(w http.ResponseWriter, r *http.Request
 	rows, err := i.db.Query(
 		`SELECT s.id, s.session, s.src, s.dst, s.start, COALESCE(s.end, 0),
 		        COALESCE(MAX(CASE WHEN c.direction = 0 THEN c.offset + length(c.data) END), -1),
-		        COALESCE(MAX(CASE WHEN c.direction = 1 THEN c.offset + length(c.data) END), -1)
+		        COALESCE(MAX(CASE WHEN c.direction = 1 THEN c.offset + length(c.data) END), -1),
+		        s.sni, s.alpn, s.tls_version, s.cipher_suite
 		 FROM stream s LEFT JOIN chunks c ON c.stream = s.id AND c.session = s.session
 		 WHERE s.session = ? GROUP BY s.id ORDER BY s.id`,
 		req.SessionID,
@@ -132,20 +141,25 @@ func (i *DbDumpInterceptor) handleStreams(w http.ResponseWriter, r *http.Request
 	defer rows.Close()
 
 	type streamResponse struct {
-		ID      int64  `json:"id"`
-		Session int64  `json:"session"`
-		Src     string `json:"src"`
-		Dst     string `json:"dst"`
-		Start   int64  `json:"start"`
-		End     int64  `json:"end"`
-		Length0 int64  `json:"length0"`
-		Length1 int64  `json:"length1"`
+		ID          int64   `json:"id"`
+		Session     int64   `json:"session"`
+		Src         string  `json:"src"`
+		Dst         string  `json:"dst"`
+		Start       int64   `json:"start"`
+		End         int64   `json:"end"`
+		Length0     int64   `json:"length0"`
+		Length1     int64   `json:"length1"`
+		SNI         *string `json:"sni"`
+		ALPN        *string `json:"alpn"`
+		TLSVersion  *int64  `json:"tls_version"`
+		CipherSuite *int64  `json:"cipher_suite"`
 	}
 
 	streams := []streamResponse{}
 	for rows.Next() {
 		var s streamResponse
-		if err := rows.Scan(&s.ID, &s.Session, &s.Src, &s.Dst, &s.Start, &s.End, &s.Length0, &s.Length1); err != nil {
+		if err := rows.Scan(&s.ID, &s.Session, &s.Src, &s.Dst, &s.Start, &s.End, &s.Length0, &s.Length1,
+			&s.SNI, &s.ALPN, &s.TLSVersion, &s.CipherSuite); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

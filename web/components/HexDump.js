@@ -10,7 +10,7 @@ export const ROW_HEIGHT    = 22
 const BUFFER               = 8
 const PREFETCH_FRACTION    = 0.1
 
-export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset, onSetMarker, onClearMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onViewportChange, markers, sizeFormat, pinHeader }) {
+export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion, scrollTo, scrollToVersion, globalOffset, onSetMarker, onClearMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onViewportChange, markers, sizeFormat, pinHeader, onHeaderClick, selectedHeaderKey, highlightRange }) {
     const containerRef = useRef(null)
     const [scrollTop, setScrollTop] = useState(0)
     const [height,    setHeight]    = useState(400)
@@ -137,6 +137,13 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
         setMenu({ x: e.clientX, y: e.clientY, byteInfo, ...result })
     }
 
+    // Identifies a header row for onHeaderClick/selectedHeaderKey purposes — chunkId
+    // alone isn't unique in frame mode (each direction has its own id sequence), and stid
+    // isn't needed on top of it since chunkId is already unique within one direction.
+    function headerKey(row) {
+        return `${row.direction}:${row.chunkId}`
+    }
+
     function collectChunkBytes(headerIdx) {
         const parts = []
         let baseOffset = null
@@ -234,8 +241,12 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
                 <div style=${{ height: topSpacer + 'px' }} />
                 ${rows.slice(startIdx, endIdx).map((row, i) =>
                     row.type === 'header'
-                        ? html`<${ChunkHeader} key=${startIdx + i} row=${row} sizeFormat=${sizeFormat} />`
-                        : html`<${HexRow}      key=${startIdx + i} row=${row} globalOffset=${globalOffset} sel=${sel} markedC2S=${markedC2S} markedS2C=${markedS2C} />`
+                        ? html`<${ChunkHeader}
+                            key=${startIdx + i} row=${row} sizeFormat=${sizeFormat}
+                            selected=${onHeaderClick && selectedHeaderKey === headerKey(row)}
+                            onClick=${onHeaderClick ? () => onHeaderClick(row, collectChunkBytes(startIdx + i)) : undefined}
+                          />`
+                        : html`<${HexRow}      key=${startIdx + i} row=${row} globalOffset=${globalOffset} sel=${sel} highlightRange=${highlightRange} markedC2S=${markedC2S} markedS2C=${markedS2C} />`
                 )}
                 <div style=${{ height: bottomSpacer + 'px' }} />
             </div>
@@ -272,7 +283,7 @@ export default function HexDump({ rows, onScrollEnd, scrollAdjust, adjustVersion
     `
 }
 
-function ChunkHeader({ row, sizeFormat, pinned, onClick }) {
+function ChunkHeader({ row, sizeFormat, pinned, selected, onClick }) {
     const dir        = dirClass(row.direction)
     const label      = row.direction === DIRNUM_C2S ? 'CLIENT → SERVER' : 'SERVER → CLIENT'
     const timePart   = `[${row.relTime}]`
@@ -287,18 +298,26 @@ function ChunkHeader({ row, sizeFormat, pinned, onClick }) {
     const title = pinned
         ? 'Scrolled out of view above — click to jump back to it'
         : (row.continued ? 'Segment continues from further up — its own header is out of view' : undefined)
+    const cls = 'chunk-hdr ' + dir + (pinned ? ' chunk-hdr-pinned' : '') + (selected ? ' chunk-hdr-selected' : '') + (onClick ? ' chunk-hdr-clickable' : '')
     return html`
-        <div class=${'chunk-hdr ' + dir + (pinned ? ' chunk-hdr-pinned' : '')} title=${title} onClick=${onClick}>
+        <div class=${cls} title=${title} onClick=${onClick}>
             ${`${continuedPart}${pinnedPart}${timePart}${stidPart} ${label}${streamPart}  #${row.chunkId}  ${sizePart}`}
         </div>
     `
 }
 
-function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
+function HexRow({ row, globalOffset, sel, highlightRange, markedC2S, markedS2C }) {
     const { bytes, offset, localOffset, direction } = row
     const dir      = dirClass(direction)
     const offStr   = (globalOffset ? offset : localOffset).toString(16).padStart(8, '0')
     const markedSet = direction === DIRNUM_C2S ? markedC2S : markedS2C
+
+    // dissectHl: externally-driven (dissector node click), independent of sel (mouse-drag
+    // selection) — a different CSS class so the two read as visually distinct even if
+    // both happen to cover the same byte.
+    function isDissectHl(byteOff) {
+        return !!highlightRange && highlightRange.direction === direction && byteOff >= highlightRange.start && byteOff <= highlightRange.end
+    }
 
     // Build hex section: '  ' leader + per-byte spans with spaces + padding + '  ' trailer.
     // Between group 1 (bytes 0-7) and group 2 (bytes 8-15) there is an extra space.
@@ -309,7 +328,7 @@ function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
         const byteOff = offset + i
         const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
         const marked  = markedSet?.has(byteOff)
-        const cls     = [hl ? 'sel-hl' : null, marked ? 'hex-byte-marked' : null].filter(Boolean).join(' ') || undefined
+        const cls     = [hl ? 'sel-hl' : null, isDissectHl(byteOff) ? 'dissect-hl' : null, marked ? 'hex-byte-marked' : null].filter(Boolean).join(' ') || undefined
         hexContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${bytes[i].toString(16).padStart(2, '0')}</span>`)
     }
     // Pad to 48 chars so short rows align with full rows.
@@ -323,7 +342,7 @@ function HexRow({ row, globalOffset, sel, markedC2S, markedS2C }) {
         const byteOff = offset + i
         const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
         const marked  = markedSet?.has(byteOff)
-        const cls     = [hl ? 'sel-hl' : null, marked ? 'asc-byte-marked' : null].filter(Boolean).join(' ') || undefined
+        const cls     = [hl ? 'sel-hl' : null, isDissectHl(byteOff) ? 'dissect-hl' : null, marked ? 'asc-byte-marked' : null].filter(Boolean).join(' ') || undefined
         const ch = bytes[i] >= 0x20 && bytes[i] < 0x7f ? String.fromCharCode(bytes[i]) : '.'
         asciiContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${ch}</span>`)
     }

@@ -16,8 +16,8 @@
     "dbdump-test": {
       "mode": "plain",
       "listen": "127.0.0.1:8000",
-      "x-connect": "212.102.35.236:443",
-      "connect": "127.0.0.1:8100",
+      "connect": "212.102.35.236:443",
+      "x-connect": "127.0.0.1:8100",
       "interceptors": [
         "dbdump"
       ]
@@ -200,7 +200,8 @@
       "args": {
         "file": "dump.sqlite",
         "truncate": false,
-	"scripts-dir": "examples/dbdump/framer"
+	"scripts-dir": "examples/dbdump/framer",
+	"dissect-scripts-dir": "examples/dbdump/dissect"
       }
     },
     "tamper": {
