@@ -9,10 +9,15 @@ const HEADER_LEN = 4
 const MAX_MESSAGE_LENGTH = 256 * 1024 * 1024 // sanity cap against a misaligned stream
 
 function frame(state, chunk) {
-    // `state.carry` holds whatever tail bytes didn't yet form a complete message last
+    // Combined mode runs one script instance across both directions (see
+    // doc/design/framer-cross-direction-correlation.md), so state carries two
+    // independent sub-states — state.c2s/state.s2c — one per direction; only the
+    // current call's own chunk.direction sub-state is ever read or written.
+    const sub = (state && state[chunk.direction]) || {}
+    // sub.carry holds whatever tail bytes didn't yet form a complete message last
     // time (undefined on the very first call for this direction) — a plain Uint8Array;
     // dbdumpFramerApi.js base64-encodes it only when state actually crosses the wire.
-    const carry = state && state.carry ? state.carry : new Uint8Array(0)
+    const carry = sub.carry || new Uint8Array(0)
 
     const buf = new Uint8Array(carry.length + chunk.data.length)
     buf.set(carry, 0)
@@ -46,6 +51,6 @@ function frame(state, chunk) {
         frames,
         // .slice(), not .subarray(): a view would keep the whole (possibly much larger)
         // accumulated buf alive in memory for as long as this carry is held.
-        state: { carry: buf.slice(pos) },
+        state: { ...state, [chunk.direction]: { carry: buf.slice(pos) } },
     }
 }

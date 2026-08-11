@@ -882,24 +882,32 @@ paths:
   /api/i/dbdump/frame-progress:
     post:
       tags: [framer]
-      summary: How far a framer script has processed one stream direction
+      summary: How far a combined-mode framer script has processed a stream
       description: |
-        Reports the persisted progress for one (session, stream, direction,
-        script, script_version) key, so a browser-run framer knows whether it
-        needs to compute anything beyond what's already stored. A key with no
-        rows yet is not an error — `processed_offset: 0`, `state: null`, and
-        `closed: false` just mean framing hasn't started for it. `closed`
-        reports whether the direction's connection-close signal (a synthetic
-        final `frame(state, chunk)` call with `chunk.closed = true`) has
-        already been delivered to and persisted by the script — once true, it
-        never reverts, since a closed direction's byte length is final.
+        Reports the persisted progress for one (session, stream, script,
+        script_version) key — spanning *both* directions at once (combined
+        mode: one script instance, one shared state, run over both
+        directions' chunks merged into one chronological sequence — see
+        doc/design/framer-cross-direction-correlation.md), unlike `/frames`
+        below, which is still scoped to one direction. So a browser-run
+        framer knows whether it needs to compute anything beyond what's
+        already stored. A key with no rows yet is not an error —
+        `processed_offset_c2s`/`processed_offset_s2c: 0`, `state: null`, and
+        `closed_c2s`/`closed_s2c: false` just mean framing hasn't started for
+        it. Each `closed_*` flag reports whether that direction's
+        connection-close signal (a synthetic final `frame(state, chunk)` call
+        with `chunk.closed = true`) has already been delivered to and
+        persisted by the script — once true, it never reverts, since a closed
+        direction's byte length is final. In practice both flip to true
+        together, in the same call, since the two directions share one TCP
+        connection and thus one close event.
       operationId: getFrameProgress
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/FrameKey'
+              $ref: '#/components/schemas/FrameTimelineKey'
       responses:
         '200':
           description: Current progress for the given key
@@ -1019,24 +1027,94 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/i/dbdump/frames/by-seq:
+    post:
+      tags: [framer]
+      summary: List persisted frames for a stream across *both* directions, in emission order
+      description: |
+        `/frames/timeline`'s sibling, ordered by `seq` instead of `stid`.
+        `seq` is a single counter per (session, stream, script,
+        script_version), assigned server-side in `/frames/append` in
+        `new_frames`' own array order — i.e. the order a combined-mode
+        script actually returned each frame in, spanning both directions.
+        This can genuinely differ from `stid` order (which always reflects
+        true wire-arrival time): a script may hold a fully-parsed frame in
+        its own persisted `state` and return it later, once e.g. a
+        correlated frame from the other direction is also ready to emit
+        (see doc/design/framer-cross-direction-correlation.md) — that
+        frame's `stid` still reflects when its bytes actually arrived, but
+        its `seq` reflects when the script chose to reveal it.
+
+        Unlike `stid`, `seq` is unique per key by construction (a bare
+        counter, never shared across two frames), so there's no tied-group
+        pagination concern here — a plain page boundary is always safe.
+
+        **Exactly one of `start` (forward, inclusive) or `beforeSeq`
+        (backward, exclusive) must be given**, same convention as
+        `/frames/timeline`'s `start`/`beforeStid`. A request with both or
+        neither is rejected with `400`.
+      operationId: listFramesBySeq
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/FrameTimelineKey'
+                - type: object
+                  required: [n]
+                  properties:
+                    start:
+                      type: integer
+                      format: int64
+                      description: First seq to return (inclusive) — forward scan
+                    beforeSeq:
+                      type: integer
+                      format: int64
+                      description: Scan backward for frames with seq strictly less than this value
+                    n:
+                      type: integer
+                      description: Maximum number of frames to return; 0 or negative means unlimited
+      responses:
+        '200':
+          description: Frames with seq >= start (forward) or seq < beforeSeq (backward), always ordered ascending by seq
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Frame'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/i/dbdump/frames/append:
     post:
       tags: [framer]
       summary: Extend a framer script's persisted frame index by one computed batch
       description: |
-        Atomically: asserts `expected_processed_offset` still matches what's
-        stored (0 if framing hasn't started for this key yet), assigns
-        `new_frames` sequential ids continuing from whatever's already
-        stored, and advances progress to
-        `new_processed_offset`/`new_state`/`closed`. There is deliberately no
-        retry/CAS-defense beyond that one offset check — the browser UI
-        enforces a single writer per key, so a `409` here always means a
-        client bug, not a real race to resolve gracefully. `closed` (default
-        false) marks the direction's connection-close signal as delivered;
-        the only caller that ever sets it true is a dedicated trailing call
-        (empty `new_frames`, `new_processed_offset` unchanged) issued once
-        every batch of the run that carried the synthetic close chunk has
-        already been persisted by an ordinary (closed=false) call.
+        Atomically: asserts `expected_processed_offset_c2s`/`_s2c` still
+        match what's stored (both 0 if framing hasn't started for this key
+        yet), assigns `new_frames` sequential ids continuing from whatever's
+        already stored — independently per direction (each entry carries its
+        own `direction`, since one combined-mode batch can mix frames from
+        either direction) — and a sequential `seq` continuing from whatever's
+        already stored for this key, shared across both directions, assigned
+        in `new_frames`' own array order (see `/frames/by-seq`), then
+        advances progress to
+        `new_processed_offset_c2s`/`_s2c`/`new_state`/`closed_c2s`/`closed_s2c`.
+        There is deliberately no retry/CAS-defense beyond the two offset
+        checks — the browser UI enforces a single writer per key, so a `409`
+        here always means a client bug, not a real race to resolve
+        gracefully. `closed_c2s`/`closed_s2c` (default false) mark each
+        direction's connection-close signal as delivered; the only caller
+        that ever sets either true is a dedicated trailing call (empty
+        `new_frames`, offsets unchanged) issued once every batch of the run
+        that carried a synthetic close chunk has already been persisted by
+        an ordinary (closed_c2s/closed_s2c both false) call — in practice
+        both are set together, since the two directions share one TCP
+        connection and thus one close event.
       operationId: appendFrames
       requestBody:
         required: true
@@ -1044,28 +1122,38 @@ paths:
           application/json:
             schema:
               allOf:
-                - $ref: '#/components/schemas/FrameKey'
+                - $ref: '#/components/schemas/FrameTimelineKey'
                 - type: object
-                  required: [expected_processed_offset, new_frames, new_processed_offset]
+                  required: [new_frames]
                   properties:
-                    expected_processed_offset:
+                    expected_processed_offset_c2s:
                       type: integer
                       format: int64
-                      description: Must match the currently-stored processed_offset, or the request is rejected
+                      description: Must match the currently-stored processed_offset_c2s, or the request is rejected
+                    expected_processed_offset_s2c:
+                      type: integer
+                      format: int64
+                      description: Must match the currently-stored processed_offset_s2c, or the request is rejected
                     new_frames:
                       type: array
                       items:
                         $ref: '#/components/schemas/FrameInput'
-                    new_processed_offset:
+                    new_processed_offset_c2s:
+                      type: integer
+                      format: int64
+                    new_processed_offset_s2c:
                       type: integer
                       format: int64
                     new_state:
                       type: string
                       contentEncoding: base64
                       description: Opaque framer state to persist alongside the new progress; omit/null for no state
-                    closed:
+                    closed_c2s:
                       type: boolean
-                      description: Marks the direction's connection-close signal as delivered; defaults to false
+                      description: Marks c2s's connection-close signal as delivered; defaults to false
+                    closed_s2c:
+                      type: boolean
+                      description: Marks s2c's connection-close signal as delivered; defaults to false
       responses:
         '204':
           description: Frames appended and progress advanced
@@ -1862,30 +1950,45 @@ components:
 
     FrameProgress:
       type: object
-      required: [processed_offset]
+      required: [processed_offset_c2s, processed_offset_s2c]
       properties:
-        processed_offset:
+        processed_offset_c2s:
           type: integer
           format: int64
           description: >-
-            How many bytes of the direction stream have been framed so far;
-            0 if framing hasn't started yet for this key
+            How many bytes of the c2s stream have been framed so far; 0 if
+            framing hasn't started yet for this key
+        processed_offset_s2c:
+          type: integer
+          format: int64
+          description: >-
+            How many bytes of the s2c stream have been framed so far; 0 if
+            framing hasn't started yet for this key
         state:
           type: string
           contentEncoding: base64
           description: >-
-            The framer script's own opaque persisted state, for resuming;
+            The framer script's own opaque persisted state, shared by both
+            directions (combined mode: one script instance runs both
+            directions' chunks merged into one chronological sequence — see
+            doc/design/framer-cross-direction-correlation.md), for resuming;
             null if none
-        closed:
+        closed_c2s:
           type: boolean
           description: >-
-            Whether the direction's connection-close signal has already been
-            delivered to the script; false if framing hasn't started or the
-            direction hasn't closed yet
+            Whether c2s's connection-close signal has already been delivered
+            to the script; false if framing hasn't started or c2s hasn't
+            closed yet
+        closed_s2c:
+          type: boolean
+          description: >-
+            Whether s2c's connection-close signal has already been delivered
+            to the script; false if framing hasn't started or s2c hasn't
+            closed yet
 
     Frame:
       type: object
-      required: [id, offset, length, direction, stid, time]
+      required: [id, offset, length, direction, stid, time, seq]
       properties:
         id:
           type: integer
@@ -1909,17 +2012,17 @@ components:
           description: >-
             Redundant with the request's own key for `/frames` (which is
             already scoped to one direction); the field that actually matters
-            for `/frames/timeline`, whose key spans both
+            for `/frames/timeline`/`/frames/by-seq`, whose keys span both
         stid:
           type: integer
           format: int64
           description: >-
             Inherited from whichever raw chunk this frame completes on — the
-            cross-direction ordering key `/frames/timeline` sorts by. Ties
-            (multiple frames completing on the same chunk) are routine, not
-            an edge case, and are always within one direction (two different
-            chunks, from either direction, never share a `stid`) — broken by
-            `id`
+            cross-direction, true-wire-order ordering key `/frames/timeline`
+            sorts by. Ties (multiple frames completing on the same chunk) are
+            routine, not an edge case, and are always within one direction
+            (two different chunks, from either direction, never share a
+            `stid`) — broken by `id`
         time:
           type: integer
           format: int64
@@ -1927,11 +2030,27 @@ components:
             Capture timestamp (milliseconds since Unix epoch) of whichever raw
             chunk this frame completes on — frames have no timestamp of their
             own, since they're computed, not captured
+        seq:
+          type: integer
+          format: int64
+          description: >-
+            The server-assigned emission-order ordering key `/frames/by-seq`
+            sorts by — see that endpoint's own description for how it's
+            assigned and how it can differ from `stid` order. Unique per
+            (session, stream, script, script_version), across both
+            directions.
 
     FrameInput:
       type: object
       required: [offset, length, stid, time]
       properties:
+        direction:
+          $ref: '#/components/schemas/Direction'
+          description: >-
+            Which direction this frame belongs to — one combined-mode
+            `/frames/append` batch can mix frames from either direction, so
+            each entry carries its own rather than inheriting one from the
+            request's key (`FrameTimelineKey` has no `direction` to inherit)
         offset:
           type: integer
           format: int64

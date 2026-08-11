@@ -23,15 +23,29 @@ chunks(id INTEGER, stream INTEGER, session INTEGER → sessions.id, direction IN
   -- INDEX: idx_chunks_stid ON (session, stream, stid)
 frames(session INTEGER → sessions.id, stream INTEGER, direction INTEGER, script TEXT,
        script_version TEXT, id INTEGER, offset INTEGER, length INTEGER, meta TEXT,
-       stid INTEGER, time INTEGER)
+       stid INTEGER, time INTEGER, seq INTEGER)
   -- PK: (session, stream, direction, script, script_version, id)
   -- INDEX: idx_frames_stid ON (session, stream, script, script_version, stid, id)
-frame_progress(session INTEGER → sessions.id, stream INTEGER, direction INTEGER,
-       script TEXT, script_version TEXT, processed_offset INTEGER, state BLOB,
-       closed INTEGER NOT NULL DEFAULT 0)
-  -- PK: (session, stream, direction, script, script_version)
+  -- INDEX: idx_frames_seq ON (session, stream, script, script_version, seq)
+frame_progress(session INTEGER → sessions.id, stream INTEGER, script TEXT,
+       script_version TEXT, processed_offset_c2s INTEGER, processed_offset_s2c INTEGER,
+       state BLOB, closed_c2s INTEGER NOT NULL DEFAULT 0, closed_s2c INTEGER NOT NULL DEFAULT 0)
+  -- PK: (session, stream, script, script_version)
 ```
 
+- **`frame_progress`'s reshape (combined mode)**: unlike every other schema addition here
+  (all additive, via `ensureColumn`'s idempotent `ALTER TABLE ADD COLUMN`), moving
+  `frame_progress` off its old per-`direction` PK required an actual shape change
+  `ensureColumn` can't express. `dbdump.go`'s `NewDbDumpInterceptor` detects the old shape
+  (presence of a `direction` column on `frame_progress`, via the same `columnExists`
+  helper `ensureColumn` is now built on) and `DROP TABLE`s both `frames` and
+  `frame_progress` together before their `CREATE TABLE IF NOT EXISTS`/`ensureColumn`
+  calls run — frame data is a purgeable/regenerable cache (the same reasoning
+  `clearStreamFrames` below already relies on), and leaving stale pre-reshape `frames`
+  rows in place while `frame_progress` reset to `processed_offset 0` would desync the two
+  (duplicate frames on the next run) and leave `frames.seq` (introduced in the same
+  reshape) unpopulated for them. A no-op for a fresh database or one already on the new
+  shape.
 - `sessions.config` — JSON snapshot of the full proxy config (proxy + TLS server/client + interceptors).
 - `stream.id` — the proxy's `ConnID` (sequential per proxy run, restarts at 0 each run). Not globally unique; the PK is `(session, id)`.
 - `stream.sni`/`alpn`/`tls_version`/`cipher_suite` — added after `stream` first shipped, via `ensureColumn`, all nullable: NULL for a plain connection or a `detecttls` one that hasn't upgraded yet. Captured once per connection, from the *downstream* (client-facing) TLS handshake specifically — the proxy's separate upstream handshake can legitimately negotiate differently without ALPN/SNI passthrough, and isn't exposed here. `tls_version`/`cipher_suite` are the raw numeric IDs (`tls.VersionTLS13`-style / `tls.CipherSuiteName`-lookupable), not decoded names — a consumer that wants a name looks it up itself. See `ConnectionUpgraded` below.
@@ -54,18 +68,41 @@ frame_progress(session INTEGER → sessions.id, stream INTEGER, direction INTEGE
   `MAX(id)+1`, never client-supplied).
 - `frames.meta` — free-form JSON text a framer script attaches per frame; opaque to the
   Go side (stored/returned as-is, never interpreted), nullable.
-- `frame_progress.processed_offset`/`state` — how far framing has gotten and the
-  framer's own opaque persisted state (also free-form, from the framer script's
-  perspective) for resuming; both `0`/`NULL` before framing has started for a key, which
-  is a normal state, not an error condition.
-- `frame_progress.closed` — added after `frame_progress` first shipped, via
-  `ensureColumn`, but `NOT NULL DEFAULT 0` (unlike `frames.stid`/`frames.time` below,
-  which are nullable) since "not yet closed" is an unambiguous default for every row, old
-  or new. Whether the direction's connection-close signal has already been delivered to
-  (and persisted by) the script — see "Framer scripts"' "Connection-close signal" note
-  below. Never reverts to `false` once set: a closed direction's byte length is final, so
-  `catchUpFramer` (`web/framerRun.js`) never calls `appendFrames` again for a key once
-  this is `true`.
+- `frames.seq` — added alongside combined mode's `frame_progress` reshape below, via
+  `ensureColumn`. A single counter per `(session, stream, script, script_version)` —
+  deliberately **not** scoped by `direction` the way `id` is — assigned server-side in
+  `appendFrames`, continuing from `MAX(seq)+1`, in `newFrames`' own array order: exactly
+  the order a combined-mode script actually returned each frame in, spanning both
+  directions. This can genuinely differ from `stid` order: a script may hold a
+  fully-parsed frame in its own `state` and return it later, once e.g. a correlated frame
+  from the other direction is also ready (see `doc/design/framer-cross-direction-
+  correlation.md`) — that frame's `stid` still reflects true wire-arrival order, but its
+  `seq` reflects the order the script chose to reveal it. Unique per key by construction
+  (a bare counter, never shared across two frames), so unlike `stid` no tie-break/
+  group-boundary pagination logic is needed for it — see `listFramesBySeq` below. Not yet
+  surfaced in any UI.
+- `frame_progress.processed_offset_c2s`/`processed_offset_s2c`/`state` — how far a
+  combined-mode framer run has gotten, per direction, and the framer's own opaque
+  persisted state (free-form, from the framer script's perspective, shared by both
+  directions) for resuming; all zero/`NULL` before framing has started for a key, which
+  is a normal state, not an error condition. One row per `(session, stream, script,
+  script_version)` — no `direction` column, unlike `frames` — since a combined-mode
+  script run (see "Framer scripts" below) tracks both directions' progress/state at once
+  in a single instance; splitting that back into two rows would just recreate the
+  pre-combined-mode staleness problem the design doc's "Rejected alternative" section
+  describes.
+- `frame_progress.closed_c2s`/`closed_s2c` — added after `frame_progress` first shipped
+  (alongside the rest of this reshape), via `ensureColumn`, but `NOT NULL DEFAULT 0`
+  (unlike `frames.stid`/`frames.time` below, which are nullable) since "not yet closed" is
+  an unambiguous default for every row, old or new. Whether each direction's
+  connection-close signal has already been delivered to (and persisted by) the script —
+  see "Framer scripts"' "Connection-close signal" note below. Neither ever reverts to
+  `false` once set: a closed direction's byte length is final. In practice both flip
+  together in one `appendFrames` call — the whole stream closes at once (one `ConnID`,
+  one `ConnectionTerminated`) — but they're independent columns because `frame_progress`
+  itself no longer has a per-direction row to hang a single flag off of. Once both are
+  `true`, `catchUpFramer` (`web/framerRun.js`) never calls `appendFrames` again for that
+  key.
 - `frames.stid` — added after `frames` first shipped, via `ensureColumn`'s idempotent
   `ALTER TABLE` rather than the `CREATE TABLE IF NOT EXISTS` above (a no-op on an
   already-existing table — see `ensureColumn`'s own doc comment in `dbdump.go`).
@@ -107,35 +144,39 @@ tab's hex view can offer a framed partitioning alongside the raw-chunk one at ne
 repeat cost once cached — implemented and confirmed working end-to-end (including
 cross-direction interleaving) as of 2026-08-05. Full design/rationale lives in
 [`doc/design/packet-dissector.md`](../../doc/design/packet-dissector.md) — the framer
-half described there is done; the dissector half is a separate stage, its schema/contract
-settled and script-storage backend built (see "Dissector scripts" below), Worker
-execution and UI not yet started (see the root `CLAUDE.md`'s TODO section). This section
-covers the storage layer and REST surface; the browser-side Worker execution and UI are
-documented in
-`web/CLAUDE.md`'s "Framer scripts" section.
+half described there is done, and so is the separate dissector half (see "Dissector
+scripts" below), also confirmed working end-to-end (2026-08-10). This section covers the
+storage layer and REST surface; the browser-side Worker execution and UI are documented
+in `web/CLAUDE.md`'s "Framer scripts" section.
 
 - `ScriptsDir` (`scripts-dir` config field): directory framer scripts are stored in,
   passed to `scriptstore.New` — same shared package `tamper`'s control scripts use (see
   `intercept/scriptstore/CLAUDE.md`). Empty disables the feature entirely, same
   501-when-unconfigured convention as everywhere else this pattern appears.
-- `frameKey` (`frames.go`) bundles the five columns every per-direction `frames`/
-  `frame_progress` query filters on: `Session, Stream, Direction, Script, ScriptVersion`.
-  `frameTimelineKey` is the same minus `Direction` — `listFramesTimeline`'s key, since a
-  merged cross-direction listing has no single direction to key on.
-- `getFrameProgress(key)` — `(0, nil, false, nil)` for a key with no rows yet (a normal,
-  common state, not an error); otherwise the stored `processed_offset`/`state`/`closed`.
-- `listFrames(key, start, n)` — frames with `id >= start`, ordered by `id`; `n <= 0`
-  means unlimited. No extra index needed beyond `frames`' own PK: its btree is already
-  ordered `(session, stream, direction, script, script_version, id)`, exactly the
-  access pattern this (and `appendFrames`) needs. Shares `frameRecord`/`scanFrameRows`
-  with `listFramesTimeline` below — both SELECT the same seven columns, so one scan
-  implementation serves both, even though `direction` is technically redundant with
-  `listFrames`' own request key.
-- `listFramesTimeline(key, start, n)` — the cross-direction counterpart: frames from
-  *both* directions, ordered by `(stid, id)`, `stid >= start`. See the "Cross-direction
-  interleaving" note below for the full correctness argument (tie-breaking by `id`, and
-  why pagination must never split a tied-`stid` group across a page — the reason this
-  isn't just `ORDER BY stid LIMIT n`).
+- `frameKey` (`frames.go`) bundles the five columns `listFrames`' per-direction `frames`
+  query filters on: `Session, Stream, Direction, Script, ScriptVersion`. `frameTimelineKey`
+  is the same minus `Direction` — every other key in this file (`frame_progress`'s own
+  key, `listFramesTimeline`/`listFramesBySeq`) uses this shape instead, since a
+  combined-mode run has no single direction to key `frame_progress` on, and a merged
+  cross-direction frame listing has none either.
+- `getFrameProgress(key frameTimelineKey)` — a zero-value `frameProgress` (both offsets
+  0, `state` nil, both closed flags false) for a key with no rows yet (a normal, common
+  state, not an error); otherwise the stored row. `frameProgress` bundles
+  `ProcessedOffsetC2S`/`ProcessedOffsetS2C`/`State`/`ClosedC2S`/`ClosedS2C` — used both as
+  this function's return value and, in `appendFrames` below, as both the CAS check's
+  expected value (`State` ignored there) and the new value to write.
+- `listFrames(key frameKey, start, n)` — frames with `id >= start`, ordered by `id`;
+  `n <= 0` means unlimited. No extra index needed beyond `frames`' own PK: its btree is
+  already ordered `(session, stream, direction, script, script_version, id)`, exactly the
+  access pattern this needs. Shares `frameRecord`/`scanFrameRows` with
+  `listFramesTimeline`/`listFramesBySeq` below — all three SELECT the same eight columns,
+  so one scan implementation serves all of them, even though `direction` is technically
+  redundant with `listFrames`' own request key.
+- `listFramesTimeline(key frameTimelineKey, start, n)` — the cross-direction counterpart:
+  frames from *both* directions, ordered by `(stid, id)`, `stid >= start`. See the
+  "Cross-direction interleaving" note below for the full correctness argument
+  (tie-breaking by `id`, and why pagination must never split a tied-`stid` group across a
+  page — the reason this isn't just `ORDER BY stid LIMIT n`).
 - `listFramesTimelineBackward(key, beforeStid, n)` — the backward counterpart, added
   alongside `/segments`' own `beforeStid` support for the same reason (a client-side
   "guess how far back" approximation isn't reliable once pagination is byte-budgeted, not
@@ -145,17 +186,28 @@ documented in
   group-boundary-safety guarantee for the reverse direction, and always returns ascending
   `(stid, id)` order like the forward version — a caller never special-cases which
   direction produced a page.
-- `appendFrames(key, expectedProcessedOffset, newFrames, newProcessedOffset, newState,
-  closed)` — one transaction: asserts `expectedProcessedOffset` still matches what's
-  stored (`0` if framing hasn't started for `key`), assigns `newFrames` sequential ids
-  continuing from `MAX(id)+1` (each carrying its own client-computed `stid`/`time`), then
-  upserts `frame_progress` to `newProcessedOffset`/`newState`/`closed`. A mismatch
-  returns `errFrameProgressConflict` without writing anything — this is deliberately not
-  a defended-against race: the browser UI enforces one writer per key, so a mismatch here
-  always means a client bug, not real concurrent use to reconcile. No separate
-  index/counter tracks "next id" — it's derived via `MAX(id)+1` inside the same
-  transaction, cheap given the PK's own ordering. `closed` is `false` for every ordinary
-  batch; see "Connection-close signal" below for the one caller that passes `true`.
+- `listFramesBySeq(key, start, n)` / `listFramesBySeqBackward(key, beforeSeq, n)` —
+  `listFramesTimeline`/`listFramesTimelineBackward`'s `seq`-ordered siblings (see
+  `frames.seq` above for what emission order means and why it can differ from `stid`
+  order). Since `seq` is unique per key by construction, these are simpler than their
+  `stid` counterparts: a plain `LIMIT` is always a safe page boundary, no `n+1`-lookahead
+  group-boundary logic needed. Not yet surfaced in any UI.
+- `appendFrames(key frameTimelineKey, expected frameProgress, newFrames []frameInput,
+  newProgress frameProgress)` — one transaction: asserts `expected`'s
+  `ProcessedOffsetC2S`/`S2C` still match what's stored (`0`/`0` if framing hasn't started
+  for `key`), assigns `newFrames` sequential ids — continuing from `MAX(id)+1`,
+  independently *per direction* (`frameInput.Direction`, since one combined-mode batch
+  can mix frames from either direction; computed lazily, the first time each direction
+  actually appears in `newFrames`) — and a sequential `seq` continuing from
+  `MAX(seq)+1`, shared across both directions, assigned in `newFrames`' own array order
+  (see `frames.seq` above), then upserts `frame_progress` to `newProgress`. A mismatch on
+  either offset returns `errFrameProgressConflict` without writing anything — this is
+  deliberately not a defended-against race: the browser UI enforces one writer per key,
+  so a mismatch here always means a client bug, not real concurrent use to reconcile. No
+  separate index/counter tracks "next id"/"next seq" — both are derived via `MAX(...)+1`
+  inside the same transaction, cheap given the relevant index's own ordering.
+  `newProgress.ClosedC2S`/`ClosedS2C` are `false` for every ordinary batch; see
+  "Connection-close signal" below for the one caller that sets them `true`.
 - `purgeOtherFrameVersions(script, keepVersion)` / `purgeAllFrameVersions(script)` — the
   cleanup half of the versioning scheme: since `script_version` is a content hash with no
   history kept, a previous version's persisted data can never be reached again once
@@ -179,20 +231,23 @@ documented in
   a stream is a no-op (its `frame_progress` survives, so the client resumes instead of
   reprocessing from scratch).
 - **Connection-close signal**: a framer script only ever sees raw chunks via
-  `frame(state, chunk)`, with no way on its own to learn its direction's connection has
+  `frame(state, chunk)`, with no way on its own to learn a direction's connection has
   closed — needed for anything whose length is implicit in connection close (e.g. an
   HTTP/1 response with neither `Content-Length` nor chunked `Transfer-Encoding`). Nothing
   here on the Go side detects closure itself — `stream.end` (already set in
   `ConnectionTerminated`, already returned by `/streams`) is the existing source of
   truth. `catchUpFramer` (`web/framerRun.js`) delivers it as one more `frame(state,
-  chunk)` call per direction, with a synthetic `{offset: totalLength, length: 0,
-  direction, data: new Uint8Array(0), closed: true}` chunk — reusing the existing
-  entry point rather than a second script-facing hook — once every real chunk for that
-  direction has been processed and `stream.end` is nonzero. The dedicated closing
-  `appendFrames(..., closed: true)` call (empty `new_frames`, `new_processed_offset`
-  unchanged) only fires after every batch of that run — including whichever one carried
-  the synthetic chunk — has already been persisted normally, so `frame_progress.closed`
-  can never be set before the signal it represents was actually delivered and saved. See
+  chunk)` call *per direction not already closed*, with a synthetic `{offset:
+  totalLength, length: 0, direction, data: new Uint8Array(0), closed: true}` chunk —
+  reusing the existing entry point rather than a second script-facing hook — once every
+  real chunk has been processed and `stream.end` is nonzero. In practice both directions'
+  signals are delivered together in the same run, since one TCP connection closes as a
+  whole (one `ConnID`, one `ConnectionTerminated`), so both synthetic chunks land in the
+  same call to `runFramer`. The dedicated closing `appendFrames(..., ClosedC2S: true,
+  ClosedS2C: true)` call (empty `new_frames`, offsets unchanged) only fires after every
+  batch of that run — including whichever one carried the synthetic chunk(s) — has
+  already been persisted normally, so `frame_progress.closed_c2s`/`closed_s2c` can never
+  be set before the signal they represent was actually delivered and saved. See
   `web/CLAUDE.md`'s "Framer scripts" section for the full client-side orchestration.
 - **TLS info capture**: a framer script also has no way on its own to tell HTTP/1.1 from
   h2 on a stream — `ConnectionUpgraded` (`dbdump.go`, previously a no-op) captures
@@ -222,45 +277,55 @@ documented in
 - **REST endpoints** (base: `/<proxy-name>/api/i/dbdump` or canonical `/api/i/dbdump`,
   same convention as the rest of this API): `/scripts`, `/scripts/{name}` — script CRUD,
   identical shape to `tamper`'s (see `intercept/scriptstore/CLAUDE.md`), just pointed at
-  this interceptor's own `scripts-dir`. `POST /frame-progress` → `frameKeyRequest` body →
-  `{"processed_offset":N,"state":"<base64>"|null,"closed":bool}`. `POST /frames` → `frameKeyRequest`
-  plus `{"start":N,"n":N}` → JSON array of
-  `{"id":N,"offset":N,"length":N,"meta":"..."|null,"direction":N,"stid":N,"time":N}`,
+  this interceptor's own `scripts-dir`. `POST /frame-progress` → `frameTimelineKeyRequest`
+  body →
+  `{"processed_offset_c2s":N,"processed_offset_s2c":N,"state":"<base64>"|null,"closed_c2s":bool,"closed_s2c":bool}`.
+  `POST /frames` → `frameKeyRequest` plus `{"start":N,"n":N}` → JSON array of
+  `{"id":N,"offset":N,"length":N,"meta":"..."|null,"direction":N,"stid":N,"time":N,"seq":N}`,
   ordered by `id`, `id >= start`; `n <= 0` means unlimited. `POST /frames/timeline` →
-  `frameTimelineKeyRequest` (like `frameKeyRequest` but no `direction`) plus
-  `{"start":N,"n":N}` (forward) or `{"beforeStid":N,"n":N}` (backward — exactly one of
-  `start`/`beforeStid` required, `400` otherwise, same convention as `/segments`'
-  `afterStid`/`beforeStid`) → same-shaped JSON array as `/frames`, but spanning both
-  directions, always ordered ascending `(stid, id)` regardless of scan direction.
-  `POST /frames/append` →
-  `frameKeyRequest` plus
-  `{"expected_processed_offset":N,"new_frames":[{"offset":N,"length":N,"meta":"..."|null,"stid":N,"time":N},...],"new_processed_offset":N,"new_state":"<base64>"|null,"closed":bool}`
-  (`closed` defaults `false`) → `204`, or `409` (body `{"error":"..."}`) on the staleness mismatch described above.
-  `POST /frames/clear` → `frameTimelineKeyRequest` body → `204` — see `clearStreamFrames`
-  above.
-  `frameKeyRequest` (embedded by these requests' structs — encoding/json promotes an
-  embedded struct's fields into the same JSON object) is
-  `{"session":N,"stream":N,"direction":N,"script":"...","script_version":"..."}` — full
-  schemas for all of these are in `doc/openapi.yaml` under the `framer` tag.
+  `frameTimelineKeyRequest` plus `{"start":N,"n":N}` (forward) or `{"beforeStid":N,"n":N}`
+  (backward — exactly one of `start`/`beforeStid` required, `400` otherwise, same
+  convention as `/segments`' `afterStid`/`beforeStid`) → same-shaped JSON array as
+  `/frames`, but spanning both directions, always ordered ascending `(stid, id)`
+  regardless of scan direction. `POST /frames/by-seq` — `listFramesBySeq`'s endpoint,
+  identical request/response shape to `/frames/timeline` but `start`/`beforeSeq` and
+  ascending `seq` order instead of `stid`. `POST /frames/append` → `frameTimelineKeyRequest`
+  plus
+  `{"expected_processed_offset_c2s":N,"expected_processed_offset_s2c":N,"new_frames":[{"direction":N,"offset":N,"length":N,"meta":"..."|null,"stid":N,"time":N},...],"new_processed_offset_c2s":N,"new_processed_offset_s2c":N,"new_state":"<base64>"|null,"closed_c2s":bool,"closed_s2c":bool}`
+  (`closed_c2s`/`closed_s2c` default `false`) → `204`, or `409` (body `{"error":"..."}`)
+  on the staleness mismatch described above. `POST /frames/clear` →
+  `frameTimelineKeyRequest` body → `204` — see `clearStreamFrames` above.
+  `frameKeyRequest`/`frameTimelineKeyRequest` (embedded by these requests' structs —
+  encoding/json promotes an embedded struct's fields into the same JSON object) are
+  `{"session":N,"stream":N,"direction":N,"script":"...","script_version":"..."}` and the
+  same minus `"direction"` — full schemas for all of these are in `doc/openapi.yaml`
+  under the `framer` tag.
 - Unit-tested (`frames_test.go`): progress/append/list round-trips (including
-  incremental extension and paging), the conflict-on-stale-offset path, both purge
-  functions directly, `clearStreamFrames` directly (including the same-version-is-a-no-op
-  case and that other streams/sessions are untouched) plus its own HTTP-level pass,
-  HTTP-level end-to-end passes for all four other REST endpoints, one
-  confirming a real script `PUT`/`DELETE` through `RegisterRoutes` triggers the right
-  purge, and `listFramesTimeline`'s ordering/tie-break/group-boundary-pagination
-  correctness specifically (`TestListFramesTimeline_OrderingAndTieBreak` — the core test
-  for the "one chunk, multiple frames" case). `ensureColumn` itself is separately
-  unit-tested in `dbdump_test.go` (adds the column, is idempotent when called again, and
+  incremental extension and paging), the per-direction `id` vs. shared `seq` assignment
+  and `seq`'s continuation across separate `appendFrames` calls, a scenario where
+  `seq` order and `stid` order genuinely diverge (`TestListFramesBySeq_OrderCanDifferFromStid`
+  — a response emitted before its held-back request, both directly exercising why `seq`
+  exists), the conflict-on-stale-offset path (including a mismatch on only one
+  direction's offset), both purge functions directly, `clearStreamFrames` directly
+  (including the same-version-is-a-no-op case and that other streams/sessions are
+  untouched) plus its own HTTP-level pass, HTTP-level end-to-end passes for every other
+  REST endpoint including `/frames/by-seq`, one confirming a real script `PUT`/`DELETE`
+  through `RegisterRoutes` triggers the right purge, and `listFramesTimeline`'s
+  ordering/tie-break/group-boundary-pagination correctness specifically
+  (`TestListFramesTimeline_OrderingAndTieBreak` — the core test for the "one chunk,
+  multiple frames" case). `ensureColumn` itself is separately unit-tested in
+  `dbdump_test.go` (adds the column, is idempotent when called again, and
   works identically whether the table already existed or was just freshly created).
 
-**Dissector scripts** are the (not yet implemented — see the root `CLAUDE.md`'s TODO
-section) client-side counterpart to framer scripts: given one frame's bytes, produce a
-labeled field-tree breakdown for the UI, à la Wireshark's packet-details pane. Full
-design (field node schema, `dissect(bytes, frame)` contract) lives in
-[`doc/design/packet-dissector.md`](../../doc/design/packet-dissector.md). **Only the
-script-storage backend exists so far** — no Worker execution, no UI, nothing runs a
-dissector script yet:
+**Dissector scripts** are the client-side counterpart to framer scripts: given one
+frame's bytes, produce a labeled field-tree breakdown for the UI, à la Wireshark's
+packet-details pane — done, feature-complete for v1 (2026-08-09) and confirmed working
+end-to-end in a real browser (2026-08-10, against `examples/dbdump/dissect/
+http2-dissector.js`). Full design (field node schema, `dissect(bytes, frame)` contract)
+lives in [`doc/design/packet-dissector.md`](../../doc/design/packet-dissector.md). This
+section covers the storage layer and REST surface only — the browser-side Worker
+execution and UI (`DissectPanel.js`, `dissectRuntime.js`) are documented in
+`web/CLAUDE.md`'s "Dissector scripts" section:
 
 - `DissectScriptsDir` (`dissect-scripts-dir` config field): directory dissector scripts
   are stored in, passed to a second, independent `scriptstore.New` call — its own
@@ -287,8 +352,9 @@ dissector script yet:
 **Cross-direction interleaving (`listFramesTimeline` in `frames.go`):** `TrafficView`'s
 frame view merges both directions into one scroll, the same way the raw-chunk view
 already does via `chunks.stid` — via `frames.stid` (see above) and a second query
-shape, since every other `frames`/`frame_progress` access (`frameKey`) is scoped to one
-direction by construction.
+shape, since `listFrames`' own `frameKey` access to the `frames` table is scoped to one
+direction by construction (`frame_progress` itself has no such per-direction shape to
+begin with — see the schema note above).
 
 - **Ties on `stid` are real and expected**, not an edge case: every frame produced from
   the *same* source chunk (e.g. a TCP segment containing several small application-layer
@@ -337,10 +403,11 @@ direction by construction.
 | WS | `/segments` | — | WebSocket; one-shot budgeted fetch of raw chunks in stid order, forward or backward; see protocol below |
 | GET/PUT/DELETE | `/scripts`, `/scripts/{name}` | see "Framer scripts" above | script CRUD, same shape as `tamper`'s |
 | GET/PUT/DELETE | `/dissect/scripts`, `/dissect/scripts/{name}` | see "Dissector scripts" above | dissector script CRUD, own namespace from `/scripts` above |
-| POST | `/frame-progress` | see "Framer scripts" above | persisted framing progress for one key |
+| POST | `/frame-progress` | see "Framer scripts" above | persisted framing progress for one key, both directions |
 | POST | `/frames` | see "Framer scripts" above | JSON array of persisted frames for one key |
 | POST | `/frames/timeline` | see "Framer scripts" above | JSON array of persisted frames for a stream+script across both directions, merged by stid, forward or backward |
-| POST | `/frames/append` | see "Framer scripts" above | `204`, or `409` on a stale `expected_processed_offset` |
+| POST | `/frames/by-seq` | see "Framer scripts" above | same as `/frames/timeline`, merged by emission-order `seq` instead of `stid` |
+| POST | `/frames/append` | see "Framer scripts" above | `204`, or `409` on a stale expected offset |
 | POST | `/frames/clear` | see "Framer scripts" above (`clearStreamFrames`) | `204` — purges every other `(script, script_version)`'s frame data for the given stream |
 
 **WebSocket `/stid-stream` protocol:**

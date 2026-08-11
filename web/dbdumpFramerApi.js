@@ -58,10 +58,13 @@ export async function deleteFramerScript(name) {
 }
 
 // ── Frame index REST API ────────────────────────────────────────────────────────────
-// key: { session, stream, direction, script, scriptVersion } — scriptVersion is a
-// sha256 hex digest of the script's content, computed by the caller.
-// listFramesTimeline's key omits direction (it spans both).
+// Timeline key: { session, stream, script, scriptVersion } — scriptVersion is a sha256
+// hex digest of the script's content, computed by the caller. Every function here except
+// listFrames uses this shape: combined mode's frame_progress has no per-direction row to
+// begin with (see doc/design/framer-cross-direction-correlation.md), so only listFrames
+// (still a per-direction read of the frames table itself) needs a direction to key on.
 
+// listFrames' key adds direction to the timeline shape above.
 function keyBody(key) {
     return {
         session: key.session, stream: key.stream, direction: key.direction,
@@ -69,7 +72,6 @@ function keyBody(key) {
     }
 }
 
-// Like keyBody, but without direction — listFramesTimeline's key spans both.
 function timelineKeyBody(key) {
     return { session: key.session, stream: key.stream, script: key.script, script_version: key.scriptVersion }
 }
@@ -111,18 +113,23 @@ export function decodeState(b64) {
     return JSON.parse(new TextDecoder().decode(parseBase64(b64)), jsonBytesReviver)
 }
 
-// Returns { processedOffset, state, closed }: how far framing has gotten for key, the
-// framer's own persisted state for resuming, and whether the direction's
-// connection-close signal (see catchUpFramer in framerRun.js) has already been
-// delivered. A key with no rows yet is not an error — { processedOffset: 0, state: null,
-// closed: false } just means framing hasn't started for it.
+// Returns { processedOffset: {c2s, s2c}, state, closed: {c2s, s2c} }: how far a
+// combined-mode framer run has gotten for key (both directions' offset/closed live on
+// one shared row — see doc/design/framer-cross-direction-correlation.md), and the
+// framer's own persisted state for resuming. A key with no rows yet is not an error —
+// { processedOffset: {c2s:0, s2c:0}, state: null, closed: {c2s:false, s2c:false} } just
+// means framing hasn't started for it.
 export async function getFrameProgress(key) {
-    const res = await post('/frame-progress', keyBody(key))
-    return { processedOffset: res.processed_offset, state: decodeState(res.state), closed: res.closed }
+    const res = await post('/frame-progress', timelineKeyBody(key))
+    return {
+        processedOffset: { c2s: res.processed_offset_c2s, s2c: res.processed_offset_s2c },
+        state: decodeState(res.state),
+        closed: { c2s: res.closed_c2s, s2c: res.closed_s2c },
+    }
 }
 
 function decodeFrame(f) {
-    return { id: f.id, offset: f.offset, length: f.length, meta: decodeMeta(f.meta), direction: f.direction, stid: f.stid, time: f.time }
+    return { id: f.id, offset: f.offset, length: f.length, meta: decodeMeta(f.meta), direction: f.direction, stid: f.stid, time: f.time, seq: f.seq }
 }
 
 // Returns frames for key with id >= start, ordered by id. n <= 0 means unlimited.
@@ -149,27 +156,50 @@ export async function listFramesTimelineBackward(key, beforeStid, n) {
     return res.map(decodeFrame)
 }
 
+// listFramesTimeline's seq-ordered sibling: frames for key across both directions,
+// ordered by seq (n <= 0 means unlimited) — the server-assigned emission order a
+// combined-mode script actually returned each frame in, which can differ from stid
+// order (e.g. a script holding a request frame until its response is also ready to
+// emit — see doc/design/framer-cross-direction-correlation.md). seq is unique per key
+// by construction, so unlike listFramesTimeline there's no tied-group pagination
+// concern here. Not yet wired into any UI.
+export async function listFramesBySeq(key, start, n) {
+    const res = await post('/frames/by-seq', { ...timelineKeyBody(key), start, n })
+    return res.map(decodeFrame)
+}
+
+// Backward counterpart: frames with seq < beforeSeq (exclusive), still ascending.
+export async function listFramesBySeqBackward(key, beforeSeq, n) {
+    const res = await post('/frames/by-seq', { ...timelineKeyBody(key), beforeSeq, n })
+    return res.map(decodeFrame)
+}
+
 // Extends key's persisted frame index by one computed batch: expectedProcessedOffset
-// must match what's currently stored (0 if framing hasn't started yet) or the call
-// throws — the caller is expected to be the only writer for key. closed (default false)
-// marks the direction's connection-close signal as delivered — see catchUpFramer in
-// framerRun.js, the only caller that ever passes true, and always as its own dedicated
-// trailing call (empty frames, processedOffset unchanged) rather than mixed into an
-// ordinary batch.
+// ({c2s, s2c}) must match what's currently stored (both 0 if framing hasn't started yet)
+// or the call throws — the caller is expected to be the only writer for key. Each entry
+// of frames carries its own numeric direction, since one combined-mode batch can mix
+// frames from either direction. newProcessedOffset is {c2s, s2c}; closed (default
+// {c2s: false, s2c: false}) marks each direction's connection-close signal as delivered
+// — see catchUpFramer in framerRun.js, the only caller that ever sets either true, and
+// always as its own dedicated trailing call (empty frames, offsets unchanged) rather
+// than mixed into an ordinary batch.
 //
 // Doesn't use the shared post() helper: a successful append is 204 No Content, and
 // post() always calls r.json(), which throws on an empty body.
-export async function appendFrames(key, expectedProcessedOffset, frames, newProcessedOffset, newState, closed = false) {
+export async function appendFrames(key, expectedProcessedOffset, frames, newProcessedOffset, newState, closed = { c2s: false, s2c: false }) {
     await checkOk(await fetch(`${BASE}/frames/append`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            ...keyBody(key),
-            expected_processed_offset: expectedProcessedOffset,
-            new_frames: frames.map(f => ({ offset: f.offset, length: f.length, meta: encodeMeta(f.meta), stid: f.stid, time: f.time })),
-            new_processed_offset: newProcessedOffset,
+            ...timelineKeyBody(key),
+            expected_processed_offset_c2s: expectedProcessedOffset.c2s,
+            expected_processed_offset_s2c: expectedProcessedOffset.s2c,
+            new_frames: frames.map(f => ({ direction: f.direction, offset: f.offset, length: f.length, meta: encodeMeta(f.meta), stid: f.stid, time: f.time })),
+            new_processed_offset_c2s: newProcessedOffset.c2s,
+            new_processed_offset_s2c: newProcessedOffset.s2c,
             new_state: encodeState(newState),
-            closed,
+            closed_c2s: closed.c2s,
+            closed_s2c: closed.s2c,
         }),
     }))
 }

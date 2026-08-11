@@ -40,6 +40,7 @@ func (i *DbDumpInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	mux.HandleFunc("POST "+basePath+"/frame-progress", i.handleFrameProgress)
 	mux.HandleFunc("POST "+basePath+"/frames", i.handleFramesList)
 	mux.HandleFunc("POST "+basePath+"/frames/timeline", i.handleFramesTimeline)
+	mux.HandleFunc("POST "+basePath+"/frames/by-seq", i.handleFramesBySeq)
 	mux.HandleFunc("POST "+basePath+"/frames/append", i.handleFramesAppend)
 	mux.HandleFunc("POST "+basePath+"/frames/clear", i.handleFramesClear)
 

@@ -1,12 +1,14 @@
-// Catches a stream direction's persisted frame index up to date against a given framer
-// script: fetches whatever raw chunk data hasn't been framed yet, runs it through the
-// script in a Worker, and persists each computed batch. Idempotent and safe to call
+// Catches a stream's persisted frame index up to date against a given framer script:
+// fetches whatever raw chunk data hasn't been framed yet — merged across *both*
+// directions, in true chronological (stid) order (combined mode; see
+// doc/design/framer-cross-direction-correlation.md) — runs it through the script in a
+// single Worker instance, and persists each computed batch. Idempotent and safe to call
 // repeatedly; a call with nothing new to frame resolves immediately having
 // fetched/computed nothing.
-import { fetchDirectionChunks, getChunkList } from './api.js'
+import { getChunkList, getByteStid, openStidStream } from './api.js'
 import { getFrameProgress, appendFrames } from './dbdumpFramerApi.js'
 import { runFramer } from './frameRuntime.js'
-import { DIRNUM_C2S, dirToStr } from './direction.js'
+import { DIRNUM_C2S, DIRNUM_S2C, dirToStr } from './direction.js'
 
 export async function sha256Hex(text) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
@@ -20,87 +22,117 @@ export async function sha256Hex(text) {
 // every caller computes it identically. streamEnd is the stream's own `end` field
 // (0 while ongoing — same convention TrafficView.js's isClosed(stream) and chunkSegments
 // already use for this exact value) — once nonzero, catchUpFramer delivers one final
-// synthetic frame(state, {closed: true, ...}) call for this direction (see below) so a
-// script can flush anything whose length is implicit in connection close (e.g. an
-// HTTP/1 response with neither Content-Length nor chunked Transfer-Encoding). onLog
-// (optional) is called with (direction, args) for every framer.log(...) call the script
-// makes during this run — direction is this call's own fixed direction, passed through
-// since runFramer's onLog only sees args. tlsInfo is the stream's downstream TLS state
-// (TrafficView.js's streamTlsInfo(stream)) — null for a plain-mode proxy or a
-// not-yet-upgraded detecttls connection, else {sni, alpn, version, cipherSuite} —
-// attached to every chunk the same way direction already is (constant for the whole
-// run, e.g. to let one script branch on ALPN between HTTP/1.1 and h2 framing).
-export async function catchUpFramer(sessionId, streamId, direction, scriptName, scriptSource, streamEnd, tlsInfo, onLog) {
+// synthetic frame(state, {closed: true, ...}) call per direction (see below) so a script
+// can flush anything whose length is implicit in connection close (e.g. an HTTP/1
+// response with neither Content-Length nor chunked Transfer-Encoding). onLog (optional)
+// is called with (direction, args) for every framer.log(...) call the script makes
+// during this run — direction is whichever chunk's frame() call was executing at the
+// time (numeric), passed straight through from runFramer's own onLog, which already
+// carries it per call now that one run spans both directions. tlsInfo is the stream's
+// downstream TLS state (TrafficView.js's streamTlsInfo(stream)) — null for a plain-mode
+// proxy or a not-yet-upgraded detecttls connection, else {sni, alpn, version,
+// cipherSuite} — attached to every chunk the same way direction already is (constant for
+// the whole run, e.g. to let one script branch on ALPN between HTTP/1.1 and h2 framing).
+export async function catchUpFramer(sessionId, streamId, scriptName, scriptSource, streamEnd, tlsInfo, onLog) {
     const scriptVersion = await sha256Hex(scriptSource)
-    const key = { session: sessionId, stream: streamId, direction, script: scriptName, scriptVersion }
+    const key = { session: sessionId, stream: streamId, script: scriptName, scriptVersion }
     const streamClosed = !!streamEnd
 
     const { processedOffset, state, closed } = await getFrameProgress(key)
-    if (closed) return // fully done, including the close signal — nothing can ever change again for this key
+    if (closed.c2s && closed.s2c) return // fully done for both directions, including both close signals
 
     const lengths = await getChunkList(sessionId, streamId)
-    const totalLength = Math.max(0, direction === DIRNUM_C2S ? lengths.length0 : lengths.length1)
-    if (!streamClosed && processedOffset >= totalLength) return // already caught up, not closed yet
+    const totalLength = { c2s: Math.max(0, lengths.length0), s2c: Math.max(0, lengths.length1) }
+    const hasNewBacklog = processedOffset.c2s < totalLength.c2s || processedOffset.s2c < totalLength.s2c
+    if (!streamClosed && !hasNewBacklog) return // already caught up, not closed yet
 
-    // rawChunks backs chunkAtOffset's stid/time lookups below; `chunks` (further down) is
-    // only ever *unprocessed* data actually fed to frame(). The two diverge in exactly
-    // one case: no new backlog to process, but the direction just closed — a frame the
-    // script emits on the synthetic close chunk may still need a real chunk's stid/time
-    // to attribute to, so the stream's last chunk is fetched for that alone (it's not
-    // reprocessed; already handled in an earlier run).
+    // rawChunks (merged, both directions) backs chunkAtOffset's per-direction stid/time
+    // lookups below; `chunks` (further down) is only ever *unprocessed* data actually fed
+    // to frame(). A direction that has never captured any bytes at all is left out of the
+    // fetch trigger entirely (getByteStid 404s if a direction has zero chunks ever) —
+    // its rawByDir entry just stays empty, same "accepted edge case if a frame ever tries
+    // to resolve against it" situation chunkAtOffset already documented pre-combined-mode.
+    const dirsWithHistory = []
+    if (totalLength.c2s > 0) dirsWithHistory.push({ dirNum: DIRNUM_C2S, dirStr: 'c2s' })
+    if (totalLength.s2c > 0) dirsWithHistory.push({ dirNum: DIRNUM_S2C, dirStr: 's2c' })
+
     let rawChunks = []
-    if (processedOffset < totalLength) {
-        rawChunks = await fetchDirectionChunks(sessionId, streamId, direction, processedOffset)
-    } else if (streamClosed && totalLength > 0) {
-        // fetchDirectionChunks(..., totalLength) still resolves to the stream's last
-        // real chunk even though totalLength itself lands one past its end — byte-stid
-        // resolution is a floor lookup (offset <= N), not interval containment.
-        rawChunks = await fetchDirectionChunks(sessionId, streamId, direction, totalLength)
+    if (dirsWithHistory.length > 0) {
+        // Each direction's own starting stid is a floor lookup (offset <= N) — for a
+        // direction with no new backlog (processedOffset already at totalLength), this
+        // resolves to its own last real chunk, exactly what's needed to still attribute a
+        // frame the script emits from that direction's synthetic close chunk. The merged
+        // fetch then starts from whichever direction's starting point is earliest and
+        // pulls everything (both directions) from there to the true end in one go — no
+        // separate per-direction fetch, reusing /stid-stream's existing unfiltered merge
+        // (see the design doc's "Open, not yet decided" note, resolved in favor of this
+        // over a new endpoint).
+        const stids = await Promise.all(dirsWithHistory.map(d => getByteStid(sessionId, streamId, d.dirNum, processedOffset[d.dirStr])))
+        const startStid = Math.min(...stids.map(s => s.stid))
+
+        const ws = openStidStream()
+        try {
+            rawChunks = await ws.fetch(sessionId, streamId, startStid, 0)
+        } finally {
+            ws.close()
+        }
     }
 
-    // direction is fixed for the whole run (this key is scoped to one direction), but
-    // carried per-chunk anyway, so a script branching per direction can read it straight
-    // off the chunk it's given.
-    const dirStr = dirToStr(direction)
+    const rawByDir = {
+        c2s: rawChunks.filter(c => c.direction === DIRNUM_C2S),
+        s2c: rawChunks.filter(c => c.direction === DIRNUM_S2C),
+    }
+
     const chunks = rawChunks
-        .filter(c => c.offset >= processedOffset)
-        .map(c => ({ offset: c.offset, length: c.data.length, direction: dirStr, data: c.data, tls: tlsInfo }))
-    if (streamClosed) chunks.push({ offset: totalLength, length: 0, direction: dirStr, data: new Uint8Array(0), closed: true, tls: tlsInfo })
+        .filter(c => c.offset >= processedOffset[dirToStr(c.direction)])
+        .map(c => ({ offset: c.offset, length: c.data.length, direction: dirToStr(c.direction), data: c.data, tls: tlsInfo }))
+    if (streamClosed) {
+        if (!closed.c2s) chunks.push({ offset: totalLength.c2s, length: 0, direction: 'c2s', data: new Uint8Array(0), closed: true, tls: tlsInfo })
+        if (!closed.s2c) chunks.push({ offset: totalLength.s2c, length: 0, direction: 's2c', data: new Uint8Array(0), closed: true, tls: tlsInfo })
+    }
     if (chunks.length === 0) return // shouldn't happen given the checks above, but nothing to do either way
 
-    // Tags each frame with the stid and time of whichever raw chunk contains its last
-    // byte — stid is the cross-direction ordering key the merged frame timeline sorts
-    // by; time is a frame's only timestamp, since frames aren't captured, they're
-    // computed. chunkIdx only advances forward, since frames are always processed in
-    // increasing offset order. A frame emitted from the synthetic close chunk when
-    // totalLength is 0 (direction closed having captured no bytes at all) has no chunk
-    // to resolve against here and throws — an accepted edge case, surfaced as an
-    // ordinary framer-run error rather than guarded against, since it only arises from a
-    // script emitting a frame that references no real data.
-    let chunkIdx = 0
-    function chunkAtOffset(byteOffset) {
-        while (chunkIdx < rawChunks.length - 1 && rawChunks[chunkIdx].offset + rawChunks[chunkIdx].data.length - 1 < byteOffset) {
-            chunkIdx++
+    // Tags each frame with the stid and time of whichever raw chunk (in ITS OWN
+    // direction's sequence) contains its last byte — stid is the true-wire-order key
+    // listFramesTimeline sorts by; time is a frame's only timestamp, since frames aren't
+    // captured, they're computed. This is deliberately independent of the order frame()
+    // actually returned the frame in (that's what frames.seq is for instead, assigned
+    // server-side in appendFrames) — a script holding a frame in state and returning it
+    // later still gets its true stid, not one reflecting the delayed return. Each
+    // direction's own cursor only advances forward, since a script's own per-direction
+    // parse position is always increasing even when emission is reordered across
+    // directions (see doc/design/framer-cross-direction-correlation.md). A frame emitted
+    // from a synthetic close chunk for a direction with zero bytes ever has no chunk to
+    // resolve against here and throws — an accepted edge case, surfaced as an ordinary
+    // framer-run error rather than guarded against, since it only arises from a script
+    // emitting a frame that references no real data.
+    const chunkIdx = { c2s: 0, s2c: 0 }
+    function chunkAtOffset(dirStr, byteOffset) {
+        const arr = rawByDir[dirStr]
+        while (chunkIdx[dirStr] < arr.length - 1 && arr[chunkIdx[dirStr]].offset + arr[chunkIdx[dirStr]].data.length - 1 < byteOffset) {
+            chunkIdx[dirStr]++
         }
-        return rawChunks[chunkIdx]
+        return arr[chunkIdx[dirStr]]
     }
 
     let expectedOffset = processedOffset
     let finalState = state
-    await runFramer(scriptName, scriptSource, state, chunks, async batch => {
+    await runFramer(scriptName, scriptSource, state, processedOffset, chunks, async batch => {
         const framesWithStid = batch.frames.map(f => {
-            const c = chunkAtOffset(f.offset + f.length - 1)
+            const c = chunkAtOffset(dirToStr(f.direction), f.offset + f.length - 1)
             return { ...f, stid: c.stid, time: c.time }
         })
-        await appendFrames(key, expectedOffset, framesWithStid, batch.processedOffset, batch.state, false)
+        await appendFrames(key, expectedOffset, framesWithStid, batch.processedOffset, batch.state, { c2s: false, s2c: false })
         expectedOffset = batch.processedOffset
         finalState = batch.state
-    }, args => onLog?.(direction, args))
+    }, onLog)
 
-    // Only reached once every batch above — including whichever one carried the
-    // synthetic close chunk — has already persisted successfully, so this can't mark a
-    // key closed before the close signal itself was actually delivered and saved.
+    // Only reached once every batch above — including whichever one carried either
+    // direction's synthetic close chunk — has already persisted successfully, so this
+    // can't mark a key closed before the close signal itself was actually delivered and
+    // saved. Both directions close together (one TCP connection, one stream.end), so this
+    // is always a transition from {false, false} to {true, true} in one call.
     if (streamClosed) {
-        await appendFrames(key, expectedOffset, [], expectedOffset, finalState, true)
+        await appendFrames(key, expectedOffset, [], expectedOffset, finalState, { c2s: true, s2c: true })
     }
 }

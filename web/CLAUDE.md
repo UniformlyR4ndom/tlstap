@@ -657,45 +657,68 @@ This section is implementation notes only:
 
 **Framer scripts (`dbdumpFramerApi.js`, `frameRuntime.js`, `framerRun.js`,
 `framerPrefs.js`, plus `App.js`'s View-menu entry and `TrafficView.js`'s "Framer"
-control):** reassembles a stream direction's raw chunks into logical frames via a
-user-authored script, persisting the result server-side (dbdump's
-`frames`/`frame_progress` tables — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts"
-section) so a stream can be viewed partitioned by frame instead of by raw chunk at
-near-zero repeat cost once cached. Full design in
-[`doc/design/packet-dissector.md`](../doc/design/packet-dissector.md).
+control):** reassembles a stream's raw chunks into logical frames via a user-authored
+script, persisting the result server-side (dbdump's `frames`/`frame_progress` tables —
+see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section) so a stream can be viewed
+partitioned by frame instead of by raw chunk at near-zero repeat cost once cached. Full
+design in [`doc/design/packet-dissector.md`](../doc/design/packet-dissector.md).
 
-Frame view merges both directions into one scroll, the same way the raw-chunk view
-already does via `chunks.stid` — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts"
-section ("Cross-direction interleaving") for the backend half (`frames.stid`,
-`listFramesTimeline`, why ties are routine and how pagination avoids splitting one).
-Known gaps here (buffer-trimming eviction not group-aware, large-frame byte-payload
-pagination, no empty state for zero-result frame view) are tracked in the root
-`CLAUDE.md`'s TODO section, not repeated here.
+**Combined mode**: a script runs **once per `(stream, script)`**, not once per direction
+— one shared script instance and one shared `state`, fed both directions' chunks merged
+into one chronological (`stid`-ordered) sequence. See
+[`doc/design/framer-cross-direction-correlation.md`](../doc/design/framer-cross-direction-correlation.md)
+for the full design/rationale (why this replaces the original one-instance-per-direction
+model, the ordering guarantee it relies on, and the rejected per-direction-snapshot
+alternative). Frame view merges both directions into one scroll, the same way the
+raw-chunk view already does via `chunks.stid` — see `intercept/dbdump/CLAUDE.md`'s
+"Framer scripts" section ("Cross-direction interleaving") for the backend half
+(`frames.stid`, `listFramesTimeline`, why ties are routine and how pagination avoids
+splitting one). Known gaps here (buffer-trimming eviction not group-aware, large-frame
+byte-payload pagination, no empty state for zero-result frame view) are tracked in the
+root `CLAUDE.md`'s TODO section, not repeated here.
 
 Confirmed working end-to-end in a real browser (2026-08-05) against
 `examples/dbdump/framer/tls-framer.js`, a TLS record-layer framer — real frames
-rendered, merged/interleaved across both directions.
+rendered, merged/interleaved across both directions. Also confirmed (2026-08-10) against
+`examples/dbdump/framer/http2-framer.js` over real captured HTTP/2 traffic — a
+substantially more involved script (connection-preface detection, HEADERS/PUSH_PROMISE/
+CONTINUATION reassembly, HPACK decoding via `framer.hpack` below). **Combined mode itself
+(2026-08-11)** is verified via Go unit tests (`intercept/dbdump/frames_test.go`), a
+throwaway Node smoke test exercising all four example scripts' two-sub-state migration
+under interleaved chunks (not committed, same convention as the example scripts' own
+verification), and **confirmed working end-to-end in a real browser** against
+`length-prefix-framer.js` run over a real two-way ~18.6MB/direction capture
+(`test/bulkclient-cli -enable test-large-frame -length-prefix`), including a multi-
+megabyte frame and a clean close on both directions.
 
 - **Script contract**: a plain top-level `function frame(state, chunk)`, no registration
   call — unlike tamper's `tamper.register(hook, fn)`, there's only one hook, so a bare
-  global function is simpler and matches the (not-yet-built) dissector stage's `dissect`
-  convention (see the design doc). `chunk` is `{offset, length, direction, data}` — one raw
-  chunk, in stream order, for the one direction being framed; `direction` (`'c2s'`/`'s2c'`,
-  `direction.js`'s `dirToStr` — same convention `scriptRuntime.js` uses for its own
-  script-facing API) is fixed for the whole run but carried on every chunk anyway, so a
-  script covering both sides of an asymmetric protocol (one script, run once per
-  direction) can branch on it. The *last* call of a run may instead carry
-  `chunk.closed = true` with empty `data` — a synthetic signal that the direction's
-  connection has closed, for a script that needs to flush anything whose length is
-  implicit in connection close (e.g. an HTTP/1 response with neither `Content-Length` nor
-  chunked `Transfer-Encoding`); see `catchUpFramer` below for exactly when this fires.
-  `chunk.tls` is `null` for a plain-mode proxy or a not-yet-upgraded `detecttls`
-  connection, else `{sni, alpn, version, cipherSuite}` from the downstream TLS
-  handshake — constant for the whole run like `direction`, carried per-chunk the same
-  way, e.g. to let one script pick HTTP/1.1 vs h2 framing off `chunk.tls?.alpn`. Returns
-  `{frames, state}` (or nothing,
-  to mean "no new frames, state unchanged"); each frame is `{offset, length, meta?}`.
-  `state`/`meta` are plain JS values from the script's point of view, and may freely
+  global function is simpler and matches the dissector stage's own `dissect` convention
+  (see the design doc). `chunk` is `{offset, length, direction, data}` — one raw chunk,
+  in true chronological (`stid`) order across **both** directions (combined mode, above);
+  `direction` (`'c2s'`/`'s2c'`, `direction.js`'s `dirToStr` — same convention
+  `scriptRuntime.js` uses for its own script-facing API) now varies call to call within
+  one run, rather than being fixed for it, since chunks from both directions interleave
+  through the single merged sequence — a script correlating the two (e.g. HTTP/1's
+  request/response pairing) keeps its own per-direction sub-state inside the one shared
+  `state` (e.g. `state.c2s`/`state.s2c`), the same pattern `tls-framer.js`/
+  `http2-framer.js` both use even though neither actually needs correlation. `offset` is
+  always relative to `chunk.direction`'s own byte stream, same as before. The *last* call
+  for a given direction may instead carry `chunk.closed = true` with empty `data` — a
+  synthetic signal that *that* direction's connection has closed, for a script that needs
+  to flush anything whose length is implicit in connection close (e.g. an HTTP/1 response
+  with neither `Content-Length` nor chunked `Transfer-Encoding`); see `catchUpFramer`
+  below for exactly when this fires — both directions' close signals are delivered within
+  the same run, interleaved into the merged sequence once each direction's own real
+  backlog is exhausted. `chunk.tls` is `null` for a plain-mode proxy or a not-yet-upgraded
+  `detecttls` connection, else `{sni, alpn, version, cipherSuite}` from the downstream TLS
+  handshake — constant for the whole run, carried per-chunk the same way, e.g. to let one
+  script pick HTTP/1.1 vs h2 framing off `chunk.tls?.alpn`. Returns `{frames, state}` (or
+  nothing, to mean "no new frames, state unchanged"); each frame is
+  `{offset, length, meta?}` — **not** tagged with a direction by the script itself;
+  `frameRuntime.js` tags each returned frame with whichever chunk's `frame()` call
+  produced it (see below), since a frame always belongs to the direction it was parsed
+  from. `state`/`meta` are plain JS values from the script's point of view, and may freely
   include a raw `Uint8Array` anywhere in the tree (e.g. a framer's buffered carry bytes
   between calls) — a script never has to encode/decode bytes itself for either, even
   though `frame_progress.state` is a BLOB column and `frames.meta` is TEXT
@@ -730,14 +753,45 @@ rendered, merged/interleaved across both directions.
   misapplied to the wrong protocol (see the "framer never finished" discussion this
   followed from) — and `framer.number.decodeU32be`/`decodeU16be` to parse their own
   length-prefix fields as real numbers, in place of a hand-rolled bit-shift.
-- **`framer.log(...args)`** posts `{kind: 'log', args}`; `runFramer`'s optional `onLog`
-  param (called with `args` in call order) surfaces it to `catchUpFramer`, which wraps it
-  as `args => onLog?.(direction, args)` before passing it on — `direction` is
-  `catchUpFramer`'s own fixed direction for that call, not something `runFramer` itself
-  knows. `TrafficView.js` formats args via `format.js`'s `fmtLogArgs` (shared with
-  tamper's identical need, moved out of `TamperView.js`'s previously-local
-  `formatLogArgs`) and lifts each line to `App.js` via `onFramerLog(direction, text,
-  level)` — see "Framing panel" below for where those lines end up.
+- **`framer.log(...args)`** posts `{kind: 'log', args, direction}` — `direction` is
+  whichever chunk's `frame()` call was executing at the time (`currentDirection`,
+  BOOTSTRAP-scoped, set at the top of each loop iteration, numeric like `frames.direction`
+  rather than `chunk.direction`'s own `'c2s'`/`'s2c'` string), since combined mode has no
+  single fixed direction for the run to fall back on. `runFramer`'s optional `onLog`
+  param is called with `(direction, args)` directly — `catchUpFramer` forwards it through
+  unchanged (no wrapping needed, unlike the pre-combined-mode version which had to inject
+  its own fixed per-call direction). `TrafficView.js` formats args via `format.js`'s
+  `fmtLogArgs` (shared with tamper's identical need, moved out of `TamperView.js`'s
+  previously-local `formatLogArgs`) and lifts each line to `App.js` via
+  `onFramerLog(direction, text, level)` — see "Framing panel" below for where those lines
+  end up.
+- **`framer.hpack.decode(bytes, table)`** — decode-only HPACK (RFC 7541), for an HTTP/2
+  framer script decoding HEADERS/PUSH_PROMISE/CONTINUATION header blocks. Lives in its own module,
+  `hpackDecode.js` (a flat top-level file, not under `transforms/` — it's not a
+  context-free "run this on some bytes" operation the Transform panel could sensibly
+  offer, and isn't part of the shared tamper/framer/dissector transform framework
+  `transform`/`number`/`encode`/`decode` above draw from), dynamically imported
+  alongside `transforms.js`/`format.js` in the same `modulesReady` `Promise.all`. Not
+  exposed to dissector scripts (`dissectRuntime.js`) at all: HPACK's dynamic table is
+  connection/direction-scoped, cumulative across every HEADERS/CONTINUATION frame in
+  order — exactly what a framer script's persisted `state` already provides room for (a
+  script keeps it in its own per-direction sub-state, e.g. `state.c2s.hpackTable`, the
+  same as `http2-framer.js` does), and exactly what a dissector script's deliberate lack
+  of cross-frame state (see "Dissector scripts" below) can't. `table` is the previous
+  call's returned table, or `undefined`/`null` for a direction's first header block; the
+  script threads it back in via its own `state`, the same way it already threads a
+  byte-carry buffer. Reassembling
+  HEADERS+CONTINUATION frames into one complete block before calling this is also the
+  script's own job — `hpackDecode.js` only ever decodes one already-complete block per
+  call, no partial-parse state of its own. Throws on malformed input (bad integer/Huffman
+  encoding, out-of-range table index) rather than a silent best-effort decode, matching
+  the other example framers' "implausible length" error convention. Unit-tested directly
+  (`hpackDecode.test.js`, Node's test runner, not run in a Worker) against RFC 7541
+  Appendix C's own official worked examples (integer encoding; request/response header
+  blocks with and without Huffman coding; dynamic-table eviction under a constrained
+  max size) plus structural checks on the Huffman table itself (forms a complete,
+  prefix-free code). Also confirmed working end-to-end via `http2-framer.js` against real
+  captured HTTP/2 traffic in a browser (2026-08-10).
 - **`frameRuntime.js`** runs the script in a Worker via the same two-Blob-plus-`sourceURL`
   loading technique `scriptRuntime.js` uses (see that file's header comment) — but
   **not** that file's IIFE-wrapping of the script Blob: the framer contract looks
@@ -750,63 +804,80 @@ rendered, merged/interleaved across both directions.
 - No RPC bridge: a framer script is a pure function over bytes
   already fetched onto the main thread, so there's no `peek`/`release`/network access from
   inside the Worker at all, unlike tamper's scripted interception. The only messages are a
-  batch/ack cycle: `runFramer(scriptName, scriptSource, initialState, chunks, onBatch)`
-  posts every chunk in one message; the Worker loops over them calling `frame()`, and posts
-  a `{frames, state, processedOffset}` batch back every `BATCH_FRAMES` (500) frames or
-  `BATCH_BYTES` (2 MB) processed, whichever comes first (plus a final batch, even if
-  empty, so a trailing state-only advance still persists) — `onBatch` must return a
-  Promise, and the Worker waits for it to resolve (`{kind:'continue'}`) before computing
-  the next batch. This is what lets the caller apply backpressure and stop immediately
-  (nothing further computed) if a batch fails to persist. A script that never defines
-  `frame`, or throws, rejects `runFramer`'s promise; so does an `onBatch` rejection (e.g. a
-  409 from `appendFrames`) — in every case the Worker is torn down immediately, not asked
-  to wind down gracefully.
-- **`framerRun.js`**'s `catchUpFramer(sessionId, streamId, direction, scriptName,
-  scriptSource, streamEnd, tlsInfo, onLog?)` (plain scalar ids, matching every other
-  `api.js` wrapper — not whole session/stream objects; `streamEnd` is the stream's own
-  `end` field, `0` while ongoing — same convention `TrafficView.js`'s `isClosed(stream)`
-  and `chunkSegments.js`'s own `end` prop already use; `tlsInfo` is
-  `TrafficView.js`'s `streamTlsInfo(stream)` — `null`, or `{sni, alpn, version,
-  cipherSuite}` from the stream's downstream TLS handshake, attached as `chunk.tls` on
-  every chunk built below, constant for the run like `direction`) is the orchestration: fetches
-  `frame-progress` (how far framing has gotten, the framer's own persisted `state`, and
-  whether the close signal below was already delivered) and `/chunklist`'s length for the
-  target direction; if the close signal was already delivered, or (nothing new *and* the
-  direction hasn't closed), resolves immediately having fetched nothing further.
-  Otherwise fetches the missing tail via `api.js`'s `fetchDirectionChunks` (unbounded — see
-  its own entry above) and runs it through `runFramer`, tagging each returned frame with
-  the `stid` *and* `time` of whichever raw chunk contains its last byte (a frame has no
-  timestamp of its own, since it's computed, not captured) before calling `appendFrames`
-  after each batch with a running `expectedOffset` tracker. `scriptVersion` (sha256 hex of
-  `scriptSource`, via `sha256Hex` — also exported) is computed once per call, not passed
-  in, so every caller derives it identically. Idempotent and safe to call repeatedly —
-  `TrafficView.js`'s live-tailing effect (below) calls it again on every central-poll
-  tick while a stream with an active framer is still growing. `onLog(direction, args)`,
-  if given, is called for every `framer.log(...)` the script makes during this run (see
-  the `framer.log` bullet above).
-  - **Connection-close signal**: once `streamEnd` is nonzero and every real chunk for the
-    direction has been (or, this call, is about to be) processed, `runFramer`'s `chunks`
-    array gets one extra synthetic entry appended —
-    `{offset: totalLength, length: 0, direction, data: new Uint8Array(0), closed: true}`
-    — so it's always the *last* chunk `frame()` sees for the run. If there's no new real
-    backlog to process (already caught up from an earlier run, direction just closed),
-    `rawChunks` still gets populated — via a targeted `fetchDirectionChunks(...,
-    totalLength)`, relying on `/byte-stid`'s floor lookup (`offset <= N`) resolving to the
-    stream's *last* real chunk even though `totalLength` itself lands one past its end —
-    purely so a frame the script emits on the synthetic call can still resolve a real
-    `stid`/`time` via the existing `chunkAtOffset` lookup; that fetched chunk is filtered
-    back out of what's actually fed to `frame()`, since it was already processed in an
-    earlier run. Once `runFramer` resolves — meaning every batch, including whichever one
-    carried the synthetic chunk, already persisted via an ordinary `appendFrames(...,
-    closed: false)` call — one dedicated trailing `appendFrames(key, expectedOffset, [],
-    expectedOffset, finalState, closed: true)` call marks `frame_progress.closed`, so a
-    later call short-circuits instead of ever redelivering the signal (needed because
+  batch/ack cycle: `runFramer(scriptName, scriptSource, initialState,
+  initialProcessedOffset, chunks, onBatch, onLog?)` posts every chunk in one message
+  (`initialProcessedOffset` is `{c2s, s2c}` — the caller's own current progress per
+  direction, seeded so a batch that hasn't yet touched one direction still reports that
+  direction's already-correct offset rather than 0); the Worker loops over them calling
+  `frame()`, tagging each returned frame with the numeric direction of whichever chunk
+  produced it, and posts a `{frames, state, processedOffset}` batch back every
+  `BATCH_FRAMES` (500) frames or `BATCH_BYTES` (2 MB) processed, whichever comes first
+  (plus a final batch, even if empty, so a trailing state-only advance still persists) —
+  `processedOffset` in that batch is `{c2s, s2c}`, only the touched direction's value
+  actually advancing. `onBatch` must return a Promise, and the Worker waits for it to
+  resolve (`{kind:'continue'}`) before computing the next batch. This is what lets the
+  caller apply backpressure and stop immediately (nothing further computed) if a batch
+  fails to persist. A script that never defines `frame`, or throws, rejects `runFramer`'s
+  promise; so does an `onBatch` rejection (e.g. a 409 from `appendFrames`) — in every case
+  the Worker is torn down immediately, not asked to wind down gracefully.
+- **`framerRun.js`**'s `catchUpFramer(sessionId, streamId, scriptName, scriptSource,
+  streamEnd, tlsInfo, onLog?)` (plain scalar ids, matching every other `api.js` wrapper —
+  not whole session/stream objects; no `direction` param — combined mode's key spans both;
+  `streamEnd` is the stream's own `end` field, `0` while ongoing — same convention
+  `TrafficView.js`'s `isClosed(stream)` and `chunkSegments.js`'s own `end` prop already
+  use; `tlsInfo` is `TrafficView.js`'s `streamTlsInfo(stream)` — `null`, or `{sni, alpn,
+  version, cipherSuite}` from the stream's downstream TLS handshake, attached as
+  `chunk.tls` on every chunk built below, constant for the run) is the orchestration:
+  fetches `frame-progress` (both directions' processed offset, the framer's own shared
+  persisted `state`, and whether each direction's close signal was already delivered) and
+  `/chunklist`'s lengths for both directions; if both close signals were already
+  delivered, or (nothing new for either direction *and* the stream hasn't closed),
+  resolves immediately having fetched nothing further.
+  Otherwise resolves each direction's own starting point via `api.js`'s `getByteStid`
+  (skipped for a direction with zero bytes ever captured, since `/byte-stid` 404s with no
+  chunks to floor-resolve against) and fetches everything from the earliest of the two
+  onward, merged across both directions in one `openStidStream()` call (unfiltered,
+  unbounded — reusing the same underlying mechanism `fetchDirectionChunks` already
+  wrapped for the pre-combined-mode per-direction fetch, rather than a new endpoint; see
+  the design doc's "Open, not yet decided" note, resolved this way). Runs the merged
+  result through `runFramer` (one shared instance, both directions), tagging each
+  returned frame with the `stid` *and* `time` of whichever raw chunk **in that frame's own
+  direction's sequence** contains its last byte (via a per-direction `chunkAtOffset`
+  cursor — deliberately independent of the order the script actually returned the frame
+  in; see `frames.seq` in `intercept/dbdump/CLAUDE.md` for that separate, emission-order
+  concept) — a frame has no timestamp of its own, since it's computed, not captured —
+  before calling `appendFrames` after each batch with a running `{c2s, s2c}`
+  `expectedOffset` tracker. `scriptVersion` (sha256 hex of `scriptSource`, via
+  `sha256Hex` — also exported) is computed once per call, not passed in, so every caller
+  derives it identically. Idempotent and safe to call repeatedly — `TrafficView.js`'s
+  live-tailing effect (below) calls it again on every central-poll tick while a stream
+  with an active framer is still growing. `onLog`, if given, is passed straight through to
+  `runFramer` unchanged — `runFramer`'s own `onLog(direction, args)` already carries the
+  right per-call direction now that one run spans both (see the `framer.log` bullet
+  above), so `catchUpFramer` no longer needs to wrap it with a fixed direction of its own.
+  - **Connection-close signal**: once `streamEnd` is nonzero, for each direction not
+    already marked closed, `runFramer`'s `chunks` array gets one extra synthetic entry
+    appended — `{offset: totalLength, length: 0, direction, data: new Uint8Array(0),
+    closed: true}` — interleaved in wherever that direction's own real backlog ends (in
+    practice both land at the very end of the merged sequence, since a full catch-up run
+    processes both directions all the way to the true end). Each direction's own starting
+    point is always resolved (see above) even when it has no new backlog of its own —
+    floor-lookup naturally resolves to that direction's last real chunk, which is exactly
+    what's needed so a frame the script emits on that direction's synthetic call can still
+    resolve a real `stid`/`time` via `chunkAtOffset`. Once `runFramer` resolves — meaning
+    every batch, including whichever one(s) carried a synthetic chunk, already persisted
+    via an ordinary `appendFrames(..., closed: {c2s: false, s2c: false})` call — one
+    dedicated trailing `appendFrames(key, expectedOffset, [], expectedOffset, finalState,
+    {c2s: true, s2c: true})` call marks `frame_progress.closed_c2s`/`closed_s2c`, so a
+    later call short-circuits instead of ever redelivering either signal (needed because
     `TrafficView.js`'s live-tailing effect keeps re-polling on every central-poll tick
-    regardless of whether the stream has closed). A frame emitted from the synthetic call
-    when the direction closed having captured **zero bytes ever** has no real chunk for
-    `chunkAtOffset` to resolve against and throws — an accepted edge case (surfaces as an
-    ordinary framer-run error), not worth guarding since it only arises from a script
-    emitting a frame that references no real data.
+    regardless of whether the stream has closed). Both flags are always set together in
+    this one call — the two directions share a single TCP connection and thus a single
+    `stream.end`, so there's no scenario where only one has actually closed. A frame
+    emitted from a synthetic call for a direction that captured **zero bytes ever** has no
+    real chunk for that direction's `chunkAtOffset` to resolve against and throws — an
+    accepted edge case (surfaces as an ordinary framer-run error), not worth guarding
+    since it only arises from a script emitting a frame that references no real data.
 - **`framerPrefs.js`**: two `localStorage`-backed preferences, deliberately **not** the
   same in-memory-only mechanism "remember stream position" uses (App.js) — these survive
   a reload. `loadDefaultFramerScript`/`saveDefaultFramerScript` (one global default,
@@ -820,10 +891,11 @@ rendered, merged/interleaved across both directions.
     at `'raw'` on a stream (re)selection; only the *script selection* survives that (via
     `framerPrefs.js`). Entering `'framed'` is always an explicit "Run" click (never
     automatic just from picking a script) — **blocking**: the raw view stays up, "Run"
-    shows "Framing…" and is disabled, until `catchUpFramer` resolves for both directions
-    (`Promise.all`) or throws. `handleRunFramer` computes `scriptVersion` (`sha256Hex`) and
-    calls `clearStreamFrames` (`dbdumpFramerApi.js`) *before* that `Promise.all` — enforces
-    "at most one framing view per stream" (see `intercept/dbdump/CLAUDE.md`'s
+    shows "Framing…" and is disabled, until the single `catchUpFramer` call (combined
+    mode — one call now covers both directions, unlike the pre-combined-mode
+    `Promise.all` of two) resolves or throws. `handleRunFramer` computes `scriptVersion`
+    (`sha256Hex`) and calls `clearStreamFrames` (`dbdumpFramerApi.js`) *before* that call
+    — enforces "at most one framing view per stream" (see `intercept/dbdump/CLAUDE.md`'s
     `clearStreamFrames`) on every run, not just a script edit/delete; a rerun of the
     already-active `(script, version)` is a no-op there, so `catchUpFramer` still resumes
     rather than reprocessing. On success the picked script is also persisted as this
@@ -855,8 +927,8 @@ rendered, merged/interleaved across both directions.
     under "Virtual scroll" above for the `⋯` continued-segment marker this migration also
     added to `HexDump.js`.
   - **Live-tailing (eager)**: a `useEffect` keyed on `latestStid` (the same prop the raw
-    view already reacts to) calls `catchUpFramer` again for both directions whenever
-    frame view is active, then bumps a `frameRefreshKey` fed into the frame-mode hook's
+    view already reacts to) calls `catchUpFramer` again (one call, both directions)
+    whenever frame view is active, then bumps a `frameRefreshKey` fed into the frame-mode hook's
     own `refreshKey` — reusing its existing unconditional top-up path rather than
     inventing a `latestId`-style mechanism for frames (no per-stream "latest frame id" is
     available from `App.js`'s central poll the way `latestStid` already is for chunks).
@@ -925,6 +997,10 @@ labeled field-tree breakdown of one frame's bytes, à la Wireshark's packet-deta
 Full design (field node schema, `dissect(bytes, frame)` contract) in
 [`doc/design/packet-dissector.md`](../doc/design/packet-dissector.md); backend script
 storage in `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section.
+
+Confirmed working end-to-end in a real browser (2026-08-10) against
+`examples/dbdump/dissect/http2-dissector.js` — field tree renders, clicking a field
+highlights the corresponding hex-view bytes.
 
 - **Script contract**: a plain top-level `function dissect(bytes, frame)`, looked up by
   name — same convention as the framer's `frame(state, chunk)`, and for the same reason

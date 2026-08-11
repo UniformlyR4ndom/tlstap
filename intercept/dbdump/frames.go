@@ -7,7 +7,8 @@ import (
 )
 
 // frameKey identifies one script's persisted frame index for one (session, stream,
-// direction) — the frames/frame_progress tables' shared key prefix.
+// direction) — the frames table's per-direction access key (listFrames, and the
+// per-direction Direction carried on each frameInput appendFrames writes).
 type frameKey struct {
 	Session       int64
 	Stream        int64
@@ -17,9 +18,10 @@ type frameKey struct {
 }
 
 // frameTimelineKey identifies one script's persisted frame index for a stream *across
-// both directions* — listFramesTimeline's key, deliberately without Direction (every
-// other frames/frame_progress access is scoped to one direction; the merged
-// cross-direction listing is the one exception).
+// both directions* — listFramesTimeline/listFramesBySeq's key, and frame_progress's own
+// key (see doc/design/framer-cross-direction-correlation.md: a combined-mode script run
+// tracks both directions' progress/state/closed at once, so frame_progress has no
+// Direction of its own to begin with).
 type frameTimelineKey struct {
 	Session       int64
 	Stream        int64
@@ -27,10 +29,10 @@ type frameTimelineKey struct {
 	ScriptVersion string
 }
 
-// frameRecord is one persisted frame, as returned by listFrames/listFramesTimeline.
-// Direction is redundant for listFrames (already fixed by its request's frameKey) but
-// shared here anyway rather than a second near-identical type, since it's harmless and
-// keeps one scan implementation for both.
+// frameRecord is one persisted frame, as returned by listFrames/listFramesTimeline/
+// listFramesBySeq. Direction is redundant for listFrames (already fixed by its request's
+// frameKey) but shared here anyway rather than a second near-identical type, since it's
+// harmless and keeps one scan implementation for all three.
 type frameRecord struct {
 	ID        int64
 	Offset    int64
@@ -39,49 +41,69 @@ type frameRecord struct {
 	Direction int
 	Stid      int64 // inherited from whichever raw chunk this frame completes on
 	Time      int64 // ditto — that same completing chunk's own timestamp
+	Seq       int64 // emission order across both directions — see listFramesBySeq
 }
 
-// frameInput is one newly-computed frame, as submitted to appendFrames — no ID, since
-// that's assigned sequentially, continuing from whatever's already stored for key.
+// frameInput is one newly-computed frame, as submitted to appendFrames — no ID or Seq,
+// since both are assigned sequentially server-side (ID continuing per-direction,
+// Seq per-key across both directions) from whatever's already stored. Direction is
+// carried per-frame (rather than fixed by the request's key, the way frameKey's used to
+// fix it) since one combined-mode batch can mix frames from either direction.
 type frameInput struct {
-	Offset int64
-	Length int64
-	Meta   *string
-	Stid   int64
-	Time   int64
+	Direction int
+	Offset    int64
+	Length    int64
+	Meta      *string
+	Stid      int64
+	Time      int64
 }
 
-// errFrameProgressConflict is returned by appendFrames when the caller's
-// expectedProcessedOffset no longer matches what's stored — see its doc comment.
+// frameProgress is frame_progress's row shape for one key: both directions' processed
+// offset and connection-close flag, plus the one shared framer state. Used both to
+// report current progress (getFrameProgress) and, in appendFrames, as both the
+// expected-current-value CAS check (State is ignored there — only the offsets are
+// compared) and the new value to write.
+type frameProgress struct {
+	ProcessedOffsetC2S int64
+	ProcessedOffsetS2C int64
+	State              []byte
+	ClosedC2S          bool
+	ClosedS2C          bool
+}
+
+// errFrameProgressConflict is returned by appendFrames when the caller's expected
+// offsets no longer match what's stored — see its doc comment.
 var errFrameProgressConflict = errors.New("frame progress has advanced past the expected offset")
 
-// getFrameProgress reports how far framing has progressed for key: the processed
-// offset (0 if framing hasn't started for key yet), the framer's own opaque persisted
-// state (nil if none), and whether the direction's connection-close signal has already
-// been delivered to (and persisted by) the script — see catchUpFramer in
-// web/framerRun.js. "Not started" is a normal, common state, not an error.
-func (i *DbDumpInterceptor) getFrameProgress(key frameKey) (processedOffset int64, state []byte, closed bool, err error) {
+// getFrameProgress reports how far a combined-mode framer run has progressed for key:
+// both directions' processed offset (0 if framing hasn't started for key yet), the
+// framer's own opaque persisted state (nil if none), and whether each direction's
+// connection-close signal has already been delivered to (and persisted by) the script —
+// see catchUpFramer in web/framerRun.js. "Not started" is a normal, common state, not an
+// error.
+func (i *DbDumpInterceptor) getFrameProgress(key frameTimelineKey) (frameProgress, error) {
 	row := i.db.QueryRow(
-		`SELECT processed_offset, state, closed FROM frame_progress
-		 WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ?`,
-		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion,
+		`SELECT processed_offset_c2s, processed_offset_s2c, state, closed_c2s, closed_s2c FROM frame_progress
+		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ?`,
+		key.Session, key.Stream, key.Script, key.ScriptVersion,
 	)
-	err = row.Scan(&processedOffset, &state, &closed)
+	var p frameProgress
+	err := row.Scan(&p.ProcessedOffsetC2S, &p.ProcessedOffsetS2C, &p.State, &p.ClosedC2S, &p.ClosedS2C)
 	if err == sql.ErrNoRows {
-		return 0, nil, false, nil
+		return frameProgress{}, nil
 	}
-	return processedOffset, state, closed, err
+	return p, err
 }
 
 // scanFrameRows reads every row of rows into a frameRecord slice, closing rows itself.
-// Shared by listFrames and listFramesTimeline, whose SELECTs return the same seven
-// columns in the same order.
+// Shared by listFrames/listFramesTimeline/listFramesBySeq (and their backward
+// counterparts), whose SELECTs all return the same eight columns in the same order.
 func scanFrameRows(rows *sql.Rows) ([]frameRecord, error) {
 	defer rows.Close()
 	frames := []frameRecord{}
 	for rows.Next() {
 		var f frameRecord
-		if err := rows.Scan(&f.ID, &f.Offset, &f.Length, &f.Meta, &f.Direction, &f.Stid, &f.Time); err != nil {
+		if err := rows.Scan(&f.ID, &f.Offset, &f.Length, &f.Meta, &f.Direction, &f.Stid, &f.Time, &f.Seq); err != nil {
 			return nil, err
 		}
 		frames = append(frames, f)
@@ -92,7 +114,7 @@ func scanFrameRows(rows *sql.Rows) ([]frameRecord, error) {
 // listFrames returns up to n frames for key with id >= start, ordered by id. n <= 0
 // means unlimited.
 func (i *DbDumpInterceptor) listFrames(key frameKey, start int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time FROM frames
+	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
 	          WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ? AND id >= ?
 	          ORDER BY id`
 	args := []any{key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, start}
@@ -123,7 +145,7 @@ func (i *DbDumpInterceptor) listFrames(key frameKey, start int64, n int) ([]fram
 // glitch) — see intercept/dbdump/CLAUDE.md's "Framer scripts" section, "Known
 // limitation" note, for the full rationale.
 func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time FROM frames
+	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid >= ?
 	          ORDER BY stid, id`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, start}
@@ -166,7 +188,7 @@ func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64
 		}
 	}
 	groupRows, err := i.db.Query(
-		`SELECT id, offset, length, meta, direction, stid, time FROM frames
+		`SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
 		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid = ?
 		 ORDER BY id`,
 		key.Session, key.Stream, key.Script, key.ScriptVersion, boundaryStid,
@@ -192,7 +214,7 @@ func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64
 // the reverse walk: never returns a page that splits a tied-stid group. n <= 0 means
 // unlimited.
 func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, beforeStid int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time FROM frames
+	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid < ?
 	          ORDER BY stid DESC, id DESC`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, beforeStid}
@@ -230,7 +252,7 @@ func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, bef
 				before[l], before[r] = before[r], before[l]
 			}
 			groupRows, err := i.db.Query(
-				`SELECT id, offset, length, meta, direction, stid, time FROM frames
+				`SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
 				 WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid = ?
 				 ORDER BY id`,
 				key.Session, key.Stream, key.Script, key.ScriptVersion, boundaryStid,
@@ -257,70 +279,143 @@ func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, bef
 	return frames, nil
 }
 
+// listFramesBySeq returns frames for key across both directions, ordered by seq — the
+// server-assigned emission order (see appendFrames), reflecting whatever order a
+// combined-mode script actually returned each frame in, which need not match stid order
+// (a script may hold a fully-parsed frame in its own state and return it later, once
+// e.g. a correlated frame from the other direction is also ready — see
+// doc/design/framer-cross-direction-correlation.md). Unlike listFramesTimeline, seq is
+// unique per key by construction (a bare per-key counter, never shared across two
+// frames), so no tied-group pagination safety net is needed here: a plain LIMIT is
+// always a safe page boundary. n <= 0 means unlimited. Not yet surfaced in any UI.
+func (i *DbDumpInterceptor) listFramesBySeq(key frameTimelineKey, start int64, n int) ([]frameRecord, error) {
+	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND seq >= ?
+	          ORDER BY seq`
+	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, start}
+	if n > 0 {
+		query += ` LIMIT ?`
+		args = append(args, n)
+	}
+
+	rows, err := i.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanFrameRows(rows)
+}
+
+// listFramesBySeqBackward is listFramesBySeq's backward counterpart: frames with
+// seq < beforeSeq (exclusive), always returned in ascending seq order like the forward
+// version. n <= 0 means unlimited.
+func (i *DbDumpInterceptor) listFramesBySeqBackward(key frameTimelineKey, beforeSeq int64, n int) ([]frameRecord, error) {
+	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND seq < ?
+	          ORDER BY seq DESC`
+	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, beforeSeq}
+	if n > 0 {
+		query += ` LIMIT ?`
+		args = append(args, n)
+	}
+
+	rows, err := i.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	frames, err := scanFrameRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	for l, r := 0, len(frames)-1; l < r; l, r = l+1, r-1 {
+		frames[l], frames[r] = frames[r], frames[l]
+	}
+	return frames, nil
+}
+
 // appendFrames extends key's persisted frame index by one batch, computed by a
-// browser-run framer script: newFrames are inserted with sequential ids continuing from
-// whatever's already stored, and processed_offset/state/closed are advanced to
-// newProcessedOffset/newState/closed — all in one transaction. expectedProcessedOffset
-// must match the currently-stored processed_offset (0 if framing hasn't started for key
-// yet); a mismatch returns errFrameProgressConflict without writing anything. There is
-// deliberately no retry/CAS-defense beyond that single check: the UI enforces one writer
-// per key, so a mismatch here always indicates a client bug, not a real race to resolve
-// gracefully.
+// browser-run combined-mode framer script: newFrames (each carrying its own Direction)
+// are inserted with sequential per-direction ids continuing from whatever's already
+// stored for that direction, and a sequential per-key seq continuing from whatever's
+// already stored for key — assigned in newFrames' own array order, i.e. the order the
+// script actually returned them in, spanning both directions (see listFramesBySeq).
+// frame_progress is then advanced from expected to newProgress — all in one transaction.
+// expected's ProcessedOffsetC2S/S2C must match what's currently stored (0 if framing
+// hasn't started for key yet); a mismatch returns errFrameProgressConflict without
+// writing anything. There is deliberately no retry/CAS-defense beyond that check: the UI
+// enforces one writer per key, so a mismatch here always indicates a client bug, not a
+// real race to resolve gracefully.
 //
-// closed is normally false — ordinary batches processing real backlog never set it.
-// catchUpFramer (web/framerRun.js) passes true in exactly one dedicated call per
-// direction, once its synthetic connection-close chunk has itself already been
-// persisted via a prior (closed=false) call to this same function.
-func (i *DbDumpInterceptor) appendFrames(key frameKey, expectedProcessedOffset int64, newFrames []frameInput, newProcessedOffset int64, newState []byte, closed bool) error {
+// newProgress.ClosedC2S/S2C are normally false — ordinary batches processing real
+// backlog never set them. catchUpFramer (web/framerRun.js) passes true in exactly one
+// dedicated trailing call, once every direction's synthetic connection-close chunk has
+// itself already been persisted via a prior (closed=false) call to this same function.
+func (i *DbDumpInterceptor) appendFrames(key frameTimelineKey, expected frameProgress, newFrames []frameInput, newProgress frameProgress) error {
 	tx, err := i.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() // no-op once Commit succeeds
 
-	var current int64
+	var currentC2S, currentS2C int64
 	err = tx.QueryRow(
-		`SELECT processed_offset FROM frame_progress
-		 WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ?`,
-		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion,
-	).Scan(&current)
+		`SELECT processed_offset_c2s, processed_offset_s2c FROM frame_progress
+		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ?`,
+		key.Session, key.Stream, key.Script, key.ScriptVersion,
+	).Scan(&currentC2S, &currentS2C)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
-	if current != expectedProcessedOffset {
+	if currentC2S != expected.ProcessedOffsetC2S || currentS2C != expected.ProcessedOffsetS2C {
 		return errFrameProgressConflict
 	}
 
-	var nextID int64
+	var nextSeq int64
 	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(id) + 1, 0) FROM frames
-		 WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ?`,
-		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion,
-	).Scan(&nextID); err != nil {
+		`SELECT COALESCE(MAX(seq) + 1, 0) FROM frames
+		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ?`,
+		key.Session, key.Stream, key.Script, key.ScriptVersion,
+	).Scan(&nextSeq); err != nil {
 		return err
 	}
 
+	// nextID is computed lazily, per direction, the first time that direction actually
+	// appears in newFrames — most batches only ever touch one direction.
+	nextID := map[int]int64{}
+
 	stmt, err := tx.Prepare(
-		`INSERT INTO frames (session, stream, direction, script, script_version, id, offset, length, meta, stid, time)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO frames (session, stream, direction, script, script_version, id, offset, length, meta, stid, time, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, f := range newFrames {
-		if _, err := stmt.Exec(key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, nextID, f.Offset, f.Length, f.Meta, f.Stid, f.Time); err != nil {
+		id, ok := nextID[f.Direction]
+		if !ok {
+			if err := tx.QueryRow(
+				`SELECT COALESCE(MAX(id) + 1, 0) FROM frames
+				 WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ?`,
+				key.Session, key.Stream, f.Direction, key.Script, key.ScriptVersion,
+			).Scan(&id); err != nil {
+				return err
+			}
+		}
+		if _, err := stmt.Exec(key.Session, key.Stream, f.Direction, key.Script, key.ScriptVersion, id, f.Offset, f.Length, f.Meta, f.Stid, f.Time, nextSeq); err != nil {
 			return err
 		}
-		nextID++
+		nextID[f.Direction] = id + 1
+		nextSeq++
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO frame_progress (session, stream, direction, script, script_version, processed_offset, state, closed)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (session, stream, direction, script, script_version)
-		 DO UPDATE SET processed_offset = excluded.processed_offset, state = excluded.state, closed = excluded.closed`,
-		key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, newProcessedOffset, newState, closed,
+		`INSERT INTO frame_progress (session, stream, script, script_version, processed_offset_c2s, processed_offset_s2c, state, closed_c2s, closed_s2c)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (session, stream, script, script_version)
+		 DO UPDATE SET processed_offset_c2s = excluded.processed_offset_c2s, processed_offset_s2c = excluded.processed_offset_s2c,
+		               state = excluded.state, closed_c2s = excluded.closed_c2s, closed_s2c = excluded.closed_s2c`,
+		key.Session, key.Stream, key.Script, key.ScriptVersion,
+		newProgress.ProcessedOffsetC2S, newProgress.ProcessedOffsetS2C, newProgress.State, newProgress.ClosedC2S, newProgress.ClosedS2C,
 	); err != nil {
 		return err
 	}
@@ -401,9 +496,9 @@ func (i *DbDumpInterceptor) clearStreamFrames(keep frameTimelineKey) error {
 
 // ── REST handlers ───────────────────────────────────────────────────────────────────
 
-// frameKeyRequest is the JSON shape every frames/frame-progress request shares as its
-// key prefix; handlers needing extra fields embed it (encoding/json promotes an
-// embedded struct's fields into the same JSON object).
+// frameKeyRequest is /frames' request shape — the one remaining per-direction access
+// pattern, since the frames table itself (unlike frame_progress) is still scoped to one
+// direction per row.
 type frameKeyRequest struct {
 	Session       int64  `json:"session"`
 	Stream        int64  `json:"stream"`
@@ -419,9 +514,9 @@ func (r frameKeyRequest) key() frameKey {
 	}
 }
 
-// frameTimelineKeyRequest is frameKeyRequest without Direction — listFramesTimeline's
-// request shape, since a merged cross-direction listing has no single direction to key
-// on.
+// frameTimelineKeyRequest is frameKeyRequest without Direction — shared by every
+// cross-direction request shape: /frame-progress, /frames/timeline, /frames/by-seq,
+// /frames/append, /frames/clear.
 type frameTimelineKeyRequest struct {
 	Session       int64  `json:"session"`
 	Stream        int64  `json:"stream"`
@@ -433,9 +528,10 @@ func (r frameTimelineKeyRequest) key() frameTimelineKey {
 	return frameTimelineKey{Session: r.Session, Stream: r.Stream, Script: r.Script, ScriptVersion: r.ScriptVersion}
 }
 
-// frameResponse is the wire shape of one frame, shared by /frames and /frames/timeline
-// (identical fields; /frames' direction is technically redundant with its own request,
-// but including it uniformly is harmless and keeps one response builder for both).
+// frameResponse is the wire shape of one frame, shared by /frames, /frames/timeline, and
+// /frames/by-seq (identical fields; /frames' direction is technically redundant with its
+// own request, but including it uniformly is harmless and keeps one response builder for
+// all three).
 type frameResponse struct {
 	ID        int64   `json:"id"`
 	Offset    int64   `json:"offset"`
@@ -444,33 +540,39 @@ type frameResponse struct {
 	Direction int     `json:"direction"`
 	Stid      int64   `json:"stid"`
 	Time      int64   `json:"time"`
+	Seq       int64   `json:"seq"`
 }
 
 func buildFrameResponse(frames []frameRecord) []frameResponse {
 	resp := make([]frameResponse, len(frames))
 	for j, f := range frames {
-		resp[j] = frameResponse{ID: f.ID, Offset: f.Offset, Length: f.Length, Meta: f.Meta, Direction: f.Direction, Stid: f.Stid, Time: f.Time}
+		resp[j] = frameResponse{ID: f.ID, Offset: f.Offset, Length: f.Length, Meta: f.Meta, Direction: f.Direction, Stid: f.Stid, Time: f.Time, Seq: f.Seq}
 	}
 	return resp
 }
 
 func (i *DbDumpInterceptor) handleFrameProgress(w http.ResponseWriter, r *http.Request) {
-	var req frameKeyRequest
+	var req frameTimelineKeyRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 
-	offset, state, closed, err := i.getFrameProgress(req.key())
+	p, err := i.getFrameProgress(req.key())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	writeJSON(w, struct {
-		ProcessedOffset int64  `json:"processed_offset"`
-		State           []byte `json:"state"`
-		Closed          bool   `json:"closed"`
-	}{ProcessedOffset: offset, State: state, Closed: closed})
+		ProcessedOffsetC2S int64  `json:"processed_offset_c2s"`
+		ProcessedOffsetS2C int64  `json:"processed_offset_s2c"`
+		State              []byte `json:"state"`
+		ClosedC2S          bool   `json:"closed_c2s"`
+		ClosedS2C          bool   `json:"closed_s2c"`
+	}{
+		ProcessedOffsetC2S: p.ProcessedOffsetC2S, ProcessedOffsetS2C: p.ProcessedOffsetS2C,
+		State: p.State, ClosedC2S: p.ClosedC2S, ClosedS2C: p.ClosedS2C,
+	})
 }
 
 func (i *DbDumpInterceptor) handleFramesList(w http.ResponseWriter, r *http.Request) {
@@ -527,20 +629,56 @@ func (i *DbDumpInterceptor) handleFramesTimeline(w http.ResponseWriter, r *http.
 	writeJSON(w, buildFrameResponse(frames))
 }
 
+// handleFramesBySeq is /frames/timeline's seq-ordered sibling — see listFramesBySeq.
+// Exactly one of start (forward, inclusive) or beforeSeq (backward, exclusive) must be
+// given, same convention as handleFramesTimeline's start/beforeStid.
+func (i *DbDumpInterceptor) handleFramesBySeq(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		frameTimelineKeyRequest
+		Start     *int64 `json:"start"`
+		BeforeSeq *int64 `json:"beforeSeq"`
+		N         int    `json:"n"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if (req.Start == nil) == (req.BeforeSeq == nil) {
+		writeError(w, http.StatusBadRequest, "exactly one of start/beforeSeq must be given")
+		return
+	}
+
+	var frames []frameRecord
+	var err error
+	if req.Start != nil {
+		frames, err = i.listFramesBySeq(req.key(), *req.Start, req.N)
+	} else {
+		frames, err = i.listFramesBySeqBackward(req.key(), *req.BeforeSeq, req.N)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, buildFrameResponse(frames))
+}
+
 func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		frameKeyRequest
-		ExpectedProcessedOffset int64 `json:"expected_processed_offset"`
-		NewFrames               []struct {
-			Offset int64   `json:"offset"`
-			Length int64   `json:"length"`
-			Meta   *string `json:"meta"`
-			Stid   int64   `json:"stid"`
-			Time   int64   `json:"time"`
+		frameTimelineKeyRequest
+		ExpectedProcessedOffsetC2S int64 `json:"expected_processed_offset_c2s"`
+		ExpectedProcessedOffsetS2C int64 `json:"expected_processed_offset_s2c"`
+		NewFrames                  []struct {
+			Direction int     `json:"direction"`
+			Offset    int64   `json:"offset"`
+			Length    int64   `json:"length"`
+			Meta      *string `json:"meta"`
+			Stid      int64   `json:"stid"`
+			Time      int64   `json:"time"`
 		} `json:"new_frames"`
-		NewProcessedOffset int64  `json:"new_processed_offset"`
-		NewState           []byte `json:"new_state"`
-		Closed             bool   `json:"closed"`
+		NewProcessedOffsetC2S int64  `json:"new_processed_offset_c2s"`
+		NewProcessedOffsetS2C int64  `json:"new_processed_offset_s2c"`
+		NewState              []byte `json:"new_state"`
+		ClosedC2S             bool   `json:"closed_c2s"`
+		ClosedS2C             bool   `json:"closed_s2c"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -548,10 +686,17 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 
 	inputs := make([]frameInput, len(req.NewFrames))
 	for j, f := range req.NewFrames {
-		inputs[j] = frameInput{Offset: f.Offset, Length: f.Length, Meta: f.Meta, Stid: f.Stid, Time: f.Time}
+		inputs[j] = frameInput{Direction: f.Direction, Offset: f.Offset, Length: f.Length, Meta: f.Meta, Stid: f.Stid, Time: f.Time}
 	}
 
-	err := i.appendFrames(req.key(), req.ExpectedProcessedOffset, inputs, req.NewProcessedOffset, req.NewState, req.Closed)
+	err := i.appendFrames(req.key(),
+		frameProgress{ProcessedOffsetC2S: req.ExpectedProcessedOffsetC2S, ProcessedOffsetS2C: req.ExpectedProcessedOffsetS2C},
+		inputs,
+		frameProgress{
+			ProcessedOffsetC2S: req.NewProcessedOffsetC2S, ProcessedOffsetS2C: req.NewProcessedOffsetS2C,
+			State: req.NewState, ClosedC2S: req.ClosedC2S, ClosedS2C: req.ClosedS2C,
+		},
+	)
 	if err == errFrameProgressConflict {
 		writeError(w, http.StatusConflict, err.Error())
 		return

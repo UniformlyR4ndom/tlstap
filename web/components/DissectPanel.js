@@ -53,7 +53,7 @@ function resolveValue(node, frameBytes) {
     }
 }
 
-function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick }) {
+function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick, onFieldContextMenu }) {
     const [expanded, setExpanded] = useState(true)
     // A non-object array entry is a script bug — render inline rather than throw (see
     // resolveValue's own comment on why this codebase has no error boundary to catch it).
@@ -64,16 +64,29 @@ function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick }) {
     }
     const hasSub = Array.isArray(node.sub) && node.sub.length > 0
     const highlightable = node.offset != null && node.length != null
-    const { text } = resolveValue(node, frameBytes)
+    const { text, bytes } = resolveValue(node, frameBytes)
 
     function handleClick() {
         if (!highlightable) return
         onNodeClick(node.offset + frameOffset, node.offset + node.length - 1 + frameOffset)
     }
 
+    // Same absolute-offset translation handleClick uses, for a byte-range value's hexdump
+    // base address; a content-derived value (decoded base64, or no bytes at all) has no
+    // real position in the frame, so the menu falls back to 0.
+    function handleContextMenu(e) {
+        e.preventDefault()
+        e.stopPropagation()
+        onFieldContextMenu({
+            x: e.clientX, y: e.clientY,
+            label: node.label, text, bytes,
+            baseOffset: highlightable ? node.offset + frameOffset : 0,
+        })
+    }
+
     return html`
         <div class="dissect-node" style=${`padding-left: ${depth * 14}px`}>
-            <div class=${'dissect-node-row' + (highlightable ? ' dissect-node-clickable' : '')} onClick=${handleClick}>
+            <div class=${'dissect-node-row' + (highlightable ? ' dissect-node-clickable' : '')} onClick=${handleClick} onContextMenu=${handleContextMenu}>
                 ${hasSub
                     ? html`<span class="dissect-node-toggle" onClick=${e => { e.stopPropagation(); setExpanded(v => !v) }}>${expanded ? '▾' : '▸'}</span>`
                     : html`<span class="dissect-node-toggle-spacer" />`}
@@ -81,7 +94,7 @@ function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick }) {
                 ${text !== '' && html`<span class="dissect-node-value">${text}</span>`}
             </div>
             ${hasSub && expanded && node.sub.map((child, i) => html`
-                <${FieldNode} key=${i} node=${child} depth=${depth + 1} frameOffset=${frameOffset} frameBytes=${frameBytes} onNodeClick=${onNodeClick} />
+                <${FieldNode} key=${i} node=${child} depth=${depth + 1} frameOffset=${frameOffset} frameBytes=${frameBytes} onNodeClick=${onNodeClick} onFieldContextMenu=${onFieldContextMenu} />
             `)}
         </div>
     `
@@ -97,6 +110,20 @@ export default function DissectPanel({ selectedFrame, dissectScripts, dissectorS
     const [nodes,   setNodes]   = useState(null)
     const [loading, setLoading] = useState(false)
     const [error,   setError]   = useState(null)
+    const [menu,    setMenu]    = useState(null)  // null | { x, y, label, text, bytes, baseOffset }
+
+    // Dismiss context menu on outside click or Escape — same convention as HexDump.js's own menu.
+    useEffect(() => {
+        if (!menu) return
+        const close = () => setMenu(null)
+        const onKey = e => { if (e.key === 'Escape') setMenu(null) }
+        document.addEventListener('mousedown', close)
+        document.addEventListener('keydown', onKey)
+        return () => {
+            document.removeEventListener('mousedown', close)
+            document.removeEventListener('keydown', onKey)
+        }
+    }, [!!menu])
 
     useEffect(() => {
         if (!selectedFrame || !dissectorSelected) { setNodes(null); setError(null); return }
@@ -137,9 +164,27 @@ export default function DissectPanel({ selectedFrame, dissectScripts, dissectorS
                         key=${i} node=${node} depth=${0}
                         frameOffset=${selectedFrame.frame.offset} frameBytes=${selectedFrame.bytes}
                         onNodeClick=${(start, end) => onNodeClick(selectedFrame.frame.direction, start, end)}
+                        onFieldContextMenu=${setMenu}
                     />
                 `)}
             </div>
+            ${menu && html`
+                <div class="ctx-menu" style=${{ left: menu.x + 'px', top: menu.y + 'px' }}
+                     onMouseDown=${e => e.stopPropagation()}>
+                    ${menu.bytes && html`
+                        <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsHex(menu.bytes)); setMenu(null) }}>Copy as hex</div>
+                        <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsAscii(menu.bytes)); setMenu(null) }}>Copy as ASCII</div>
+                        <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsHexdump(menu.bytes, menu.baseOffset)); setMenu(null) }}>Copy as hexdump</div>
+                        <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(fmtAsBase64(menu.bytes)); setMenu(null) }}>Copy as base64</div>
+                        <div class="ctx-sep" />
+                    `}
+                    ${!menu.bytes && menu.text !== '' && html`
+                        <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(menu.text); setMenu(null) }}>Copy value</div>
+                        <div class="ctx-sep" />
+                    `}
+                    <div class="ctx-item" onClick=${() => { navigator.clipboard.writeText(menu.label); setMenu(null) }}>Copy label</div>
+                </div>
+            `}
         </div>
     `
 }

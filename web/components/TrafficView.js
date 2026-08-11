@@ -183,10 +183,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
             // (script, version) is already the one active here, so catchUpFramer still
             // resumes rather than reprocessing.
             await clearStreamFrames({ session: stream.session, stream: stream.id, script: framerSelected, scriptVersion: version })
-            await Promise.all([
-                catchUpFramer(stream.session, stream.id, DIRNUM_C2S, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
-                catchUpFramer(stream.session, stream.id, DIRNUM_S2C, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
-            ])
+            await catchUpFramer(stream.session, stream.id, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog)
             saveStreamFramerScript(stream.session, stream.id, framerSelected)
             setFrameScriptRunning({ name: framerSelected, version, content })
             setFrameState('framed')
@@ -208,10 +205,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         let cancelled = false
         ;(async () => {
             try {
-                await Promise.all([
-                    catchUpFramer(stream.session, stream.id, DIRNUM_C2S, frameScriptRunning.name, frameScriptRunning.content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
-                    catchUpFramer(stream.session, stream.id, DIRNUM_S2C, frameScriptRunning.name, frameScriptRunning.content, stream.end, streamTlsInfo(stream), handleFramerScriptLog),
-                ])
+                await catchUpFramer(stream.session, stream.id, frameScriptRunning.name, frameScriptRunning.content, stream.end, streamTlsInfo(stream), handleFramerScriptLog)
             } catch { /* best-effort; see comment above */ }
             if (!cancelled) setFrameRefreshKey(k => k + 1)
         })()

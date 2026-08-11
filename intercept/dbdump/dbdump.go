@@ -109,10 +109,11 @@ type pendingStream struct {
 //	sessions(id, start, config)
 //	stream(id, session, src, dst, start, end)
 //	chunks(id, stream, direction, offset, time, data)  PK: (stream, direction, id)
-//	frames(session, stream, direction, script, script_version, id, offset, length, meta)
+//	frames(session, stream, direction, script, script_version, id, offset, length, meta, seq)
 //	  PK: (session, stream, direction, script, script_version, id)
-//	frame_progress(session, stream, direction, script, script_version, processed_offset, state)
-//	  PK: (session, stream, direction, script, script_version)
+//	frame_progress(session, stream, script, script_version, processed_offset_c2s,
+//	  processed_offset_s2c, state, closed_c2s, closed_s2c)
+//	  PK: (session, stream, script, script_version)
 //
 // Timestamps are milliseconds since the Unix epoch.
 // stream.id equals the proxy's connection counter (ConnID).
@@ -262,6 +263,27 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// Migrates the pre-combined-mode frame_progress shape (marked by its own now-gone
+	// direction column) by dropping both frames and frame_progress together, rather than
+	// altering either in place — frame data is a purgeable/regenerable cache (the same
+	// reasoning clearStreamFrames already relies on), and leaving stale pre-migration
+	// frames rows in place while frame_progress resets to processed_offset 0 would desync
+	// the two (duplicate frames on the next run) and leave frames.seq — introduced in the
+	// same reshape — unpopulated for them. A no-op (both queries return false) for a
+	// fresh database or one already on the new shape.
+	oldShape, err := columnExists(db, "frame_progress", "direction")
+	if err != nil {
+		return nil, err
+	}
+	if oldShape {
+		if _, err = db.Exec(`DROP TABLE frames`); err != nil {
+			return nil, err
+		}
+		if _, err = db.Exec(`DROP TABLE frame_progress`); err != nil {
+			return nil, err
+		}
+	}
+
 	// The PK's own btree is already ordered (session, stream, direction, script,
 	// script_version, id), which is exactly the per-direction access pattern
 	// listFrames/appendFrames need (equality filter on the first five columns, ordered
@@ -300,6 +322,23 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// seq added the same way, for combined-mode's per-frame emission order: a single
+	// counter per (session, stream, script, script_version) — deliberately no direction
+	// column in its own scope, unlike id — assigned in appendFrames as
+	// MAX(seq)+1-continuing, in newFrames' own array order. That order is exactly
+	// whatever order a combined-mode script chose to return each frame in, spanning both
+	// directions — e.g. a script that holds a fully-parsed request frame in state until
+	// its response completes, then returns both together, produces a request-then-
+	// response seq order even though the request's own stid may be earlier than an
+	// intervening, unrelated frame's. Unlike stid, seq is unique per key by construction
+	// (a bare counter, not derived from any shared chunk), so no tie-break/group-boundary
+	// pagination logic is needed for it the way stid needs via id. Not yet surfaced in
+	// any UI — see listFramesBySeq/listFramesBySeqBackward and web/CLAUDE.md's "Framer
+	// scripts" section.
+	if err = ensureColumn(db, "frames", "seq", "INTEGER"); err != nil {
+		return nil, err
+	}
+
 	// Backs listFramesTimeline's cross-direction query (session/stream/script/version
 	// filter, ordered by stid then id) — the frames table has no direction-less index
 	// otherwise, since every other access pattern here filters by direction too.
@@ -309,29 +348,33 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// Backs listFramesBySeq/listFramesBySeqBackward, the seq-ordered counterpart to
+	// idx_frames_stid above.
 	if _, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS frame_progress (
-			session          INTEGER NOT NULL REFERENCES sessions(id),
-			stream           INTEGER NOT NULL,
-			direction        INTEGER NOT NULL,
-			script           TEXT    NOT NULL,
-			script_version   TEXT    NOT NULL,
-			processed_offset INTEGER NOT NULL,
-			state            BLOB,
-			PRIMARY KEY (session, stream, direction, script, script_version)
-		)
+		CREATE INDEX IF NOT EXISTS idx_frames_seq ON frames (session, stream, script, script_version, seq)
 	`); err != nil {
 		return nil, err
 	}
 
-	// closed added after frame_progress first shipped, via ensureColumn like stid/time
-	// above — NOT NULL DEFAULT 0 (unlike those) since "not yet closed" is an unambiguous
-	// default for every row, old or new. Set once a framer script has been given its
-	// direction's final synthetic frame(state, {closed: true, ...}) call (see
-	// catchUpFramer in web/framerRun.js) — lets that caller's "already caught up" fast
-	// path recognize a direction that finished closing, instead of redelivering the
-	// close signal forever on every live-tail poll.
-	if err = ensureColumn(db, "frame_progress", "closed", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	// No direction column (unlike the pre-combined-mode shape this replaces, migrated
+	// above): a combined-mode script run tracks both directions' progress/closed state
+	// at once, in one shared state value, so one row per (session, stream, script,
+	// script_version) is the natural key — see doc/design/framer-cross-direction-
+	// correlation.md.
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS frame_progress (
+			session               INTEGER NOT NULL REFERENCES sessions(id),
+			stream                INTEGER NOT NULL,
+			script                TEXT    NOT NULL,
+			script_version        TEXT    NOT NULL,
+			processed_offset_c2s  INTEGER NOT NULL DEFAULT 0,
+			processed_offset_s2c  INTEGER NOT NULL DEFAULT 0,
+			state                 BLOB,
+			closed_c2s            INTEGER NOT NULL DEFAULT 0,
+			closed_s2c            INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (session, stream, script, script_version)
+		)
+	`); err != nil {
 		return nil, err
 	}
 
@@ -373,9 +416,21 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 // too — PRAGMA table_info simply won't find the column yet in that case either, and the
 // ALTER adds it, so callers don't need to know or care which case they're in.
 func ensureColumn(db *sql.DB, table, column, ddlType string) error {
+	exists, err := columnExists(db, table, column)
+	if err != nil || exists {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, ddlType))
+	return err
+}
+
+// columnExists reports whether table has column, via PRAGMA table_info — false, nil for
+// a table that doesn't exist yet (an empty result set, not an error), which is exactly
+// what a caller migrating a not-yet-created table wants.
+func columnExists(db *sql.DB, table, column string) (bool, error) {
 	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rows.Close()
 
@@ -385,18 +440,13 @@ func ensureColumn(db *sql.DB, table, column, ddlType string) error {
 		var notNull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if name == column {
-			return nil
+			return true, nil
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	_, err = db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, ddlType))
-	return err
+	return false, rows.Err()
 }
 
 func (i *DbDumpInterceptor) Init(addr net.TCPAddr) error {

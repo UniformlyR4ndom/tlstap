@@ -22,8 +22,13 @@ const MAX_FRAME_SIZE = 16 * 1024 * 1024 // sanity cap: throw instead of bufferin
 const LENGTH_FIELD_END = LENGTH_OFFSET + LENGTH_SIZE // byte offset immediately after the length field
 
 function frame(state, chunk) {
-    // `state.carry` holds whatever tail bytes didn't yet form a complete frame last time
-    const carry = state && state.carry ? state.carry : new Uint8Array(0)
+    // Combined mode runs one script instance across both directions (see
+    // doc/design/framer-cross-direction-correlation.md), so state carries two
+    // independent sub-states — state.c2s/state.s2c — one per direction; only the
+    // current call's own chunk.direction sub-state is ever read or written.
+    const sub = (state && state[chunk.direction]) || {}
+    // sub.carry holds whatever tail bytes didn't yet form a complete frame last time
+    const carry = sub.carry || new Uint8Array(0)
 
     const buf = new Uint8Array(carry.length + chunk.data.length)
     buf.set(carry, 0)
@@ -71,6 +76,6 @@ function frame(state, chunk) {
         frames,
         // .slice(), not .subarray(): a view would keep the whole (possibly much larger)
         // accumulated buf alive in memory for as long as this carry is held.
-        state: { carry: buf.slice(pos) },
+        state: { ...state, [chunk.direction]: { carry: buf.slice(pos) } },
     }
 }

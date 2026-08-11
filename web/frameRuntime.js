@@ -1,15 +1,19 @@
 // Runs one user framer script's frame(state, chunk) function in a Worker over a
-// pre-fetched list of raw chunks, producing frame-index batches to persist. No RPC
-// bridge: a framer script is a pure function over bytes already in hand, so the only
-// back-and-forth is a batch/ack cycle — the caller awaits each batch's persistence
-// before the Worker computes the next one.
+// pre-fetched list of raw chunks — both directions merged into one chronological
+// sequence (combined mode; see doc/design/framer-cross-direction-correlation.md) —
+// producing frame-index batches to persist. No RPC bridge: a framer script is a pure
+// function over bytes already in hand, so the only back-and-forth is a batch/ack cycle —
+// the caller awaits each batch's persistence before the Worker computes the next one.
 //
 // Script contract: a plain top-level function frame(state, chunk). chunk is
-// {offset, length, direction, data} — one raw chunk, in stream order for one direction
-// ('c2s'/'s2c', fixed for the run but carried on every chunk). state and the returned
+// {offset, length, direction, data} — one raw chunk, in true chronological (stid) order
+// across *both* directions, so chunk.direction ('c2s'/'s2c') now varies call to call
+// within one run rather than being fixed for it; a script correlating the two keeps
+// per-direction sub-state (e.g. state.c2s/state.s2c) itself. state and the returned
 // {frames, state} are plain JSON-serializable values, never bytes/base64. Each returned
-// frame is {offset, length, meta?}. No frame function defined, or one that throws,
-// rejects runFramer's returned promise.
+// frame is {offset, length, meta?} — direction is not part of that shape; runScript below
+// tags each with whichever chunk's frame() call produced it. No frame function defined,
+// or one that throws, rejects runFramer's returned promise.
 //
 // A global `framer` object exposes the same transform framework tamper scripts get, under
 // framer.transform.*/encode.*/decode.*/number.* (mirroring tamper.*'s shape, sans the
@@ -19,7 +23,12 @@
 // finishing first; a framer script's own top level, outside frame(), has no such
 // guarantee and shouldn't reference framer.* there. framer.log(...args) — a plain
 // postMessage, no OPERATIONS/FORMAT dependency — is surfaced to runFramer's caller via
-// the optional onLog callback below.
+// the optional onLog callback below. framer.hpack.decode(bytes, table) — decode-only
+// HPACK (hpackDecode.js), the odd one out here: unlike transform/encode/decode/number,
+// it's not part of the shared tamper/framer/dissector transform framework — HPACK's
+// per-direction dynamic table state doesn't fit dissector scripts (which carry no
+// cross-frame state at all), so it's exposed to framer scripts only. See
+// hpackDecode.js's own header comment for the table-threading contract.
 
 import { buildTransformApiSource, buildNumberApiSource, HEX_DEFAULTS, BASE64_DEFAULTS } from './transformWorkerApi.js'
 
@@ -31,6 +40,7 @@ const BATCH_BYTES = 2 * 1024 * 1024 // ...or this many bytes processed, whicheve
 // wouldn't resolve.
 const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
 const FORMAT_URL = new URL('./format.js', import.meta.url).href
+const HPACK_URL = new URL('./hpackDecode.js', import.meta.url).href
 
 // framer.transform.<category>'s function bodies call OPERATIONS directly — always plain
 // sync, since runScript never calls frame() before modulesReady has resolved.
@@ -54,20 +64,29 @@ const BOOTSTRAP = `
     let FORMAT = null
     let decodeNumberValue = null
     let encodeNumberValue = null
+    // Set at the top of each loop iteration below, before calling frame() — lets
+    // framer.log tag its own postMessage with whichever chunk's call it was made
+    // from, since a script's log call has no other way to say which direction it's
+    // about (combined mode's chunks span both).
+    let currentDirection = null
 
     const HEX_DEFAULTS = ${JSON.stringify(HEX_DEFAULTS)}
     const BASE64_DEFAULTS = ${JSON.stringify(BASE64_DEFAULTS)}
 
+    let hpackMod = null
+
     const modulesReady = (async () => {
-        const [transformsMod, formatMod] = await Promise.all([
+        const [transformsMod, formatMod, hpackModule] = await Promise.all([
             import(${JSON.stringify(TRANSFORMS_URL)}),
             import(${JSON.stringify(FORMAT_URL)}),
+            import(${JSON.stringify(HPACK_URL)}),
         ])
         await transformsMod.warmupWhirlpool()
         OPERATIONS = transformsMod.OPERATIONS
         FORMAT = formatMod
         decodeNumberValue = transformsMod.decodeNumberValue
         encodeNumberValue = transformsMod.encodeNumberValue
+        hpackMod = hpackModule
         self.framer = {
             transform: ${FRAMER_TRANSFORM_API_SOURCE},
             encode: {
@@ -81,7 +100,14 @@ const BOOTSTRAP = `
                 hexdump: (text) => FORMAT.parseHexdump(text),
             },
             number: ${FRAMER_NUMBER_API_SOURCE},
-            log: (...args) => postMessage({ kind: 'log', args }),
+            // Decode-only HPACK (RFC 7541): decode(bytes, table) turns one complete,
+            // already-reassembled HEADERS/CONTINUATION header block into { headers,
+            // table } — table is the previous call's returned table, or
+            // undefined/null for a direction's first block. Threading it back in on
+            // the next call (via the script's own persisted state, same as a carry
+            // buffer) is the script's job — this function carries no state of its own.
+            hpack: { decode: (bytes, table) => hpackMod.decodeHeaderBlock(bytes, table) },
+            log: (...args) => postMessage({ kind: 'log', args, direction: currentDirection }),
         }
     })()
 
@@ -92,7 +118,7 @@ const BOOTSTRAP = `
         })
     }
 
-    async function runScript(initialState, chunks) {
+    async function runScript(initialState, initialProcessedOffset, chunks) {
         if (typeof frame !== 'function') {
             throw new Error('framer script must define a top-level function named "frame"')
         }
@@ -101,14 +127,26 @@ const BOOTSTRAP = `
         let state = initialState
         let pending = []
         let pendingBytes = 0
-        let processedOffset = 0
+        // Per-direction, seeded from the caller's own current progress rather than 0:
+        // a batch flushed after only one direction's chunks have been touched so far
+        // this run must still report the OTHER direction's already-correct offset, not
+        // rewind it to 0.
+        let processedOffset = { c2s: initialProcessedOffset.c2s, s2c: initialProcessedOffset.s2c }
 
         for (const chunk of chunks) {
+            // Numeric (0/1), matching frames.direction's own wire convention (and what
+            // catchUpFramer's onLog(direction, args) contract expects) rather than
+            // chunk.direction's script-facing 'c2s'/'s2c' string. Shared by the frame
+            // tagging below and framer.log's own postMessage (via currentDirection).
+            const dirNum = chunk.direction === 'c2s' ? 0 : 1
+            currentDirection = dirNum
             const result = frame(state, chunk) || {}
             if ('state' in result) state = result.state
-            for (const f of result.frames || []) pending.push(f)
+            // direction isn't part of a script's own {offset, length, meta?} return
+            // shape — tagged here from whichever chunk produced it.
+            for (const f of result.frames || []) pending.push({ ...f, direction: dirNum })
             pendingBytes += chunk.length
-            processedOffset = chunk.offset + chunk.length
+            processedOffset = { ...processedOffset, [chunk.direction]: chunk.offset + chunk.length }
 
             if (pending.length >= ${BATCH_FRAMES} || pendingBytes >= ${BATCH_BYTES}) {
                 await postBatchAndWait(pending, state, processedOffset)
@@ -126,7 +164,7 @@ const BOOTSTRAP = `
     self.onmessage = (e) => {
         const msg = e.data
         if (msg.kind === 'run') {
-            runScript(msg.initialState, msg.chunks)
+            runScript(msg.initialState, msg.initialProcessedOffset, msg.chunks)
                 .then(() => postMessage({ kind: 'done' }))
                 .catch(err => postMessage({ kind: 'error', message: (err && (err.stack || err.message)) || String(err) }))
         } else if (msg.kind === 'continue') {
@@ -163,18 +201,25 @@ try {
 `
 }
 
-// Runs the script's frame function over chunks (in order), starting from initialState.
-// onBatch(batch) is called with { frames, state, processedOffset } after every
-// BATCH_FRAMES frames or BATCH_BYTES bytes, whichever comes first, and once more at the
-// end (even if empty) so a final state-only advance still persists; it must return a
-// Promise, and the Worker waits for it before computing the next batch.
+// Runs the script's frame function over chunks (in true chronological order, spanning
+// both directions), starting from initialState. initialProcessedOffset is {c2s, s2c} —
+// the caller's own current progress for each direction, seeded into the offset each
+// batch reports so a batch that hasn't yet touched one direction still reports that
+// direction's already-correct value rather than 0 (see runScript's own comment).
+// onBatch(batch) is called with { frames, state, processedOffset } — frames now each
+// carry their own numeric direction (tagged from whichever chunk produced them) and
+// processedOffset is {c2s, s2c} — after every BATCH_FRAMES frames or BATCH_BYTES bytes,
+// whichever comes first, and once more at the end (even if empty) so a final state-only
+// advance still persists; it must return a Promise, and the Worker waits for it before
+// computing the next batch.
 //
 // Rejects and stops the Worker immediately, computing nothing further, if the script
 // throws, never defines frame, or an onBatch call rejects (e.g. a 409 indicating someone
-// else already advanced this key). onLog (optional) is called with a script's own
-// framer.log(...) arguments, in call order, whenever it uses that — best-effort, doesn't
-// affect the run either way.
-export function runFramer(scriptName, scriptSource, initialState, chunks, onBatch, onLog) {
+// else already advanced this key). onLog (optional) is called with (direction, args) for
+// a script's own framer.log(...) calls, in call order, whenever it uses that — direction
+// is whichever chunk's frame() call was executing at the time, numeric (0/1). Best-effort,
+// doesn't affect the run either way.
+export function runFramer(scriptName, scriptSource, initialState, initialProcessedOffset, chunks, onBatch, onLog) {
     return new Promise((resolve, reject) => {
         const scriptBlobUrl = URL.createObjectURL(new Blob([buildScriptSource(scriptName, scriptSource)], { type: 'text/javascript' }))
         const bootstrapBlobUrl = URL.createObjectURL(new Blob([buildWorkerSource(scriptBlobUrl)], { type: 'text/javascript' }))
@@ -199,7 +244,7 @@ export function runFramer(scriptName, scriptSource, initialState, chunks, onBatc
                 cleanup()
                 reject(new Error(msg.message))
             } else if (msg.kind === 'log') {
-                onLog?.(msg.args)
+                onLog?.(msg.direction, msg.args)
             }
         }
         worker.onerror = (e) => {
@@ -208,6 +253,6 @@ export function runFramer(scriptName, scriptSource, initialState, chunks, onBatc
             e.preventDefault()
         }
 
-        worker.postMessage({ kind: 'run', initialState, chunks })
+        worker.postMessage({ kind: 'run', initialState, initialProcessedOffset, chunks })
     })
 }

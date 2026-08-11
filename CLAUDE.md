@@ -91,13 +91,18 @@ intercept/          ← built-in interceptor implementations
     buffer.go       ← heldBuffer: per-(stream,direction) growing buffer + chunk bounds
     fs.go           ← fs-root: scoped REST read/write/list of one host directory, for scripts
 web/                ← embedded web frontend (Preact + htm, no build step)
-  server.go         ← //go:embed; exports FS (embedded into binary)
+  server.go         ← //go:embed; exports FS (embedded into binary). The embed directive
+                      is an explicit filename whitelist, not a glob — a new top-level
+                      web/*.js file needs adding there too, or the built binary silently
+                      omits it (surfaces at runtime as "error loading dynamically
+                      imported module", not a build failure)
   index.html        ← HTML shell, importmap, all CSS (dark theme)
   main.js           ← mounts App into #root
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
   tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, fs-root)
   dbdumpFramerApi.js ← REST wrappers for /api/i/dbdump/* framer-script CRUD + frame-progress/frames/frames-append (see "Framer scripts" in web/CLAUDE.md)
   frameRuntime.js   ← Worker bootstrap that runs a framer script's frame() function over pre-fetched chunks (no RPC bridge, unlike scriptRuntime.js — see web/CLAUDE.md)
+  hpackDecode.js    ← decode-only HPACK (RFC 7541); exposed to framer scripts only, as framer.hpack.decode(bytes, table) — see "Framer scripts" in web/CLAUDE.md
   framerRun.js      ← catchUpFramer(): orchestrates fetching un-framed chunks, running frameRuntime.js, and persisting each batch via dbdumpFramerApi.js
   framerPrefs.js    ← localStorage: global default framer script + per-stream override (see "Framer scripts" in web/CLAUDE.md)
   dissectRuntime.js ← Worker bootstrap that runs a dissector script's dissect() function once over one frame's bytes (no RPC bridge, no batch/ack cycle, unlike frameRuntime.js — see "Dissector scripts" in web/CLAUDE.md)
@@ -371,18 +376,75 @@ when working in that directory.
 
 Known gaps and deferred work, collected here so they aren't rediscovered from scratch.
 
-- **HTTP/1 and HTTP/2 example framer/dissector pairs — deferred, not started; both
-  prerequisites below are now done.** `examples/dbdump/framer/`/`examples/dbdump/dissect/`
-  cover TLS records and a couple of generic length-prefixed shapes, but nothing for HTTP
-  itself, despite it being the most common protocol this tool would be pointed at.
-  Originally scoped as two independent pairs, on the assumption that a framer script
-  couldn't see ALPN to auto-pick between them — that assumption no longer holds now that
-  `chunk.tls?.alpn` is available (see the "Route TLS info" item below), so it's worth
-  reconsidering a single ALPN-branching HTTP framer instead of two, when this is actually
-  picked up (not decided yet — flagging so it isn't missed). HTTP/1 in particular needs
-  body-length handling per RFC 9112 §6.3 (`Content-Length` vs `Transfer-Encoding: chunked`
-  vs the no-body cases vs the connection-close-delimited case, now handled via the
-  close-signal item below).
+- **HTTP/1 and HTTP/2 example framer/dissector pairs — kept as two independent pairs
+  (user call, 2026-08-10), even though `chunk.tls?.alpn` (see the "Route TLS info" item
+  below) would now make a single ALPN-branching framer possible.**
+  `examples/dbdump/framer/http2-framer.js` — **done**: splits a stream into HTTP/2
+  frames (RFC 9113 §4.1's fixed 9-byte header), detects/emits the client's one-time
+  connection preface (§3.4, c2s only), and reassembles HEADERS/PUSH_PROMISE/CONTINUATION
+  field blocks (§6.2/§6.6/§6.10 — including their PADDED/PRIORITY payload layouts) into
+  complete HPACK blocks decoded via `framer.hpack.decode`, attached as `meta.headers` on
+  whichever frame carries `END_HEADERS` (forced to be the *last* frame of a sequence, not
+  the first — see the script's own comment: earlier frames may already be persisted by
+  the time a later CONTINUATION completes the block). A malformed/desynced HPACK block
+  (e.g. a capture starting mid-connection, missing dynamic-table state the real peer
+  already had) is logged and latches header-decoding off for the rest of that direction
+  rather than aborting framing entirely — framing itself never depends on HPACK
+  succeeding. Verified via a throwaway Node smoke test (single-chunk, split-across-calls,
+  HEADERS+CONTINUATION reassembly, PADDED/PRIORITY stripping, PUSH_PROMISE, an atomicity
+  violation throwing, and the HPACK-failure latch) — not committed to the repo, matching
+  this codebase's no-automated-tests-for-example-scripts precedent — **and confirmed
+  working against a real captured HTTP/2 stream in a browser (2026-08-10)**.
+
+  `examples/dbdump/dissect/http2-dissector.js` — **done**: the frame-header breakdown
+  (Length/Type/Flags/Stream Identifier) plus, deliberately going further than
+  `tls-dissector.js`'s own "just the shared header" scope, a full structural payload
+  breakdown for *every* defined frame type (RFC 9113 §6.1–§6.9 — Pad Length/Priority/
+  Promised-Stream-ID/Padding layouts for HEADERS/PUSH_PROMISE/DATA, repeating SETTINGS
+  entries, RST_STREAM/GOAWAY error-code name lookup, WINDOW_UPDATE's increment, PING's
+  opaque data), each turning out to be small and fixed once actually checked against the
+  RFC — not the deep, effortful lift "shallow scope" was meant to guard against.
+  Decoded headers (`frame.meta.headers`, when the framer succeeded) render as
+  `content`-only children of the Field Block Fragment node — no byte range to highlight,
+  since a reassembled block can span multiple frames — everything else uses real
+  offset/length for hex-view highlighting. Verified via a throwaway Node smoke test
+  (preface, HEADERS-with-decoded-headers, PADDED+PRIORITY layout, SETTINGS with multiple/
+  unknown entries, RST_STREAM/GOAWAY error codes, the truncated-header and
+  still-loading-payload fallbacks) — same not-committed convention as the framer's own
+  test — **and confirmed working in a real browser (2026-08-10)**: field tree renders,
+  click-to-highlight works.
+
+  Its prerequisite, **combined-mode framer execution — done (2026-08-11)**: framer
+  scripts now run once per `(stream, script)` rather than once per direction, one
+  shared-state instance processing both directions' chunks merged into one chronological
+  (`stid`-ordered) sequence — a breaking change to the framer contract (`chunk.direction`
+  now varies call to call within a run) and to `frame_progress`'s schema (one row per
+  key, not one per direction — old-shaped rows are dropped, not migrated, on first
+  startup after the upgrade). See
+  [`doc/design/framer-cross-direction-correlation.md`](doc/design/framer-cross-direction-correlation.md)
+  for the full design, `intercept/dbdump/CLAUDE.md`'s and `web/CLAUDE.md`'s "Framer
+  scripts" sections for the backend/frontend mechanics (including the new `frames.seq`
+  emission-order column/`/frames/by-seq` endpoint — an addition beyond that design doc's
+  original scope, for a script that holds a frame back and reveals it alongside a later
+  correlated one — not yet used by any script, see below). All four existing example
+  framer scripts migrated to the new two-sub-state shape (`state.c2s`/`state.s2c`) with
+  no behavior change. Verified via Go unit tests, a throwaway Node smoke test (not
+  committed), and confirmed working end-to-end in a real browser: `length-prefix-framer.js`
+  run against a real two-way ~18.6MB/direction capture, producing correct frames
+  (including a multi-megabyte one) and a clean close.
+
+  The HTTP/1 framer/dissector pair this unblocked is **done too (2026-08-11/12)**: full
+  RFC 9112 §6.3 body-length handling, including the three cases needing the *other*
+  direction's stream (HEAD responses, `101` upgrade, `CONNECT` tunnels) that combined
+  mode exists for. Full design in `doc/design/http1-framer.md` (message-length rules,
+  `meta` shape, state machine, error handling, and a "Known limitations" section — notably
+  that a `frames.seq`-based reorder would *not* fix `Expect: 100-continue`'s
+  response-before-request display order, and why). Verified via a throwaway Node smoke
+  test (39 checks) and a real browser session against real HTTP/1.1 traffic (a local
+  origin plus, through the TLS proxy, httpbin.org for broader variety — POST/PUT/DELETE
+  bodies, redirects, gzip, cookies, Basic auth, `Expect: 100-continue`); that last case
+  surfaced and got a real bug fixed — a `1xx` interim response was incorrectly consuming
+  a `pendingMethods` queue slot meant for its request's actual final response.
 - **Signal connection close to framer scripts — done.** A framer script's final
   `frame(state, chunk)` call for a direction may now carry `chunk.closed = true` (empty
   `data`) once that direction's connection has closed, letting a script flush a body
@@ -401,6 +463,24 @@ Known gaps and deferred work, collected here so they aren't rediscovered from sc
   and `web/CLAUDE.md`'s "Framer scripts" section (`catchUpFramer`'s `tlsInfo` param) for
   the full mechanism. Not yet verified against a real TLS proxy run in a browser — only
   `proxy`/`intercept/dbdump` Go unit tests and the `web/` test suite have run against it.
+- **Decode-only HPACK (RFC 7541) for framer scripts — done.** `framer.hpack.decode(bytes,
+  table)` (`web/hpackDecode.js`) turns one complete, already-reassembled HEADERS/
+  CONTINUATION header block into `{headers, table}`; the dynamic table threads through
+  the calling script's own persisted `state`, the same way a byte-carry buffer already
+  does. Not wired into any interceptor or `dissector.*` — see `web/CLAUDE.md`'s "Framer
+  scripts" section for why dissector scripts specifically can't host this (no cross-frame
+  state to build a real dynamic table from) and the full contract. An existing library
+  (`hpack.js`/indutny) was considered and ruled out: unmaintained ~10 years, built on
+  Node's `Buffer`, and a streaming API mismatched to this codebase's one-shot call shape —
+  see git history of this design conversation if that need resurfaces. Unit-tested
+  (`hpackDecode.test.js`) against RFC 7541 Appendix C's official worked examples (fetched
+  from the RFC text directly, not transcribed from memory, after an initial attempt via a
+  lossy summarizing fetch produced a subtly wrong vector that didn't match its own
+  internal byte-count accounting — caught before it was used) plus structural checks on
+  the Huffman table (Kraft's-inequality completeness, prefix-freedom). Now actually used
+  by `http2-framer.js` above and confirmed decoding real captured traffic correctly
+  (after one deploy pitfall — see the Architecture tree's `server.go` note on
+  `//go:embed` being a filename whitelist, not a glob).
 - **`doc/openapi.yaml`'s `{path}` parameters don't survive standard OpenAPI tooling.**
   `/api/i/tamper/fs/list/{path}` and `/fs/file/{path}` document `path` as a single
   `in: path` string, but the real route is a `{path...}` wildcard that can embed
@@ -414,8 +494,10 @@ Known gaps and deferred work, collected here so they aren't rediscovered from sc
   (done 2026-08-09 — script store, Worker execution, REST wrappers, and the
   `TrafficView.js` side panel with click-to-select-frame/click-to-highlight-node — see
   `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section and `web/CLAUDE.md`'s section
-  of the same name). Not verified in an actual browser yet — same standing note the
-  framer stage's own memory carries; no automated UI testing exists in this repo.
+  of the same name). Both confirmed working end-to-end in a real browser — framer
+  2026-08-05 against `tls-framer.js`, dissector 2026-08-10 against `http2-dissector.js`
+  (field tree render + click-to-highlight); no automated UI testing exists in this repo,
+  so this remains the only verification either stage gets.
 - **Byte-budgeted segment buffer — `TrafficView.js` fully migrated, `CombinedView.js`
   still pending (deliberately deferred).** `doc/design/hexview-segment-buffer.md` has the
   full migration plan; all of `TrafficView.js` (raw and frame mode) now runs on
