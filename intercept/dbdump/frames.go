@@ -2,6 +2,7 @@ package dbdump
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 )
@@ -29,19 +30,27 @@ type frameTimelineKey struct {
 	ScriptVersion string
 }
 
+// frameRange is one {offset, length} pair within a frame's ranges — the unit
+// frames.ranges' JSON array holds. A frame's logical length is sum(ranges[].length),
+// computed by consumers as needed; never persisted redundantly.
+type frameRange struct {
+	Offset int64 `json:"offset"`
+	Length int64 `json:"length"`
+}
+
 // frameRecord is one persisted frame, as returned by listFrames/listFramesTimeline/
 // listFramesBySeq. Direction is redundant for listFrames (already fixed by its request's
 // frameKey) but shared here anyway rather than a second near-identical type, since it's
 // harmless and keeps one scan implementation for all three.
 type frameRecord struct {
-	ID        int64
-	Offset    int64
-	Length    int64
-	Meta      *string // nil if the framer attached no metadata for this frame
-	Direction int
-	Stid      int64 // inherited from whichever raw chunk this frame completes on
-	Time      int64 // ditto — that same completing chunk's own timestamp
-	Seq       int64 // emission order across both directions — see listFramesBySeq
+	ID            int64
+	Ranges        []frameRange
+	Meta          *string // nil if the framer attached no metadata for this frame
+	Direction     int
+	Stid          int64 // inherited from whichever raw chunk this frame completes on
+	Time          int64 // ditto — that same completing chunk's own timestamp
+	Seq           int64 // emission order across both directions — see listFramesBySeq
+	VirtualOffset int64 // per-direction running byte total — see appendFrames
 }
 
 // frameInput is one newly-computed frame, as submitted to appendFrames — no ID or Seq,
@@ -51,8 +60,7 @@ type frameRecord struct {
 // fix it) since one combined-mode batch can mix frames from either direction.
 type frameInput struct {
 	Direction int
-	Offset    int64
-	Length    int64
+	Ranges    []frameRange
 	Meta      *string
 	Stid      int64
 	Time      int64
@@ -97,13 +105,20 @@ func (i *DbDumpInterceptor) getFrameProgress(key frameTimelineKey) (frameProgres
 
 // scanFrameRows reads every row of rows into a frameRecord slice, closing rows itself.
 // Shared by listFrames/listFramesTimeline/listFramesBySeq (and their backward
-// counterparts), whose SELECTs all return the same eight columns in the same order.
+// counterparts), whose SELECTs all return the same nine columns in the same order.
+// ranges is stored as a JSON-array TEXT column — unlike meta (opaque to Go end to end),
+// the wire response needs it as a real nested array, not a string-embedded blob, so it's
+// unmarshaled here rather than passed through as *string.
 func scanFrameRows(rows *sql.Rows) ([]frameRecord, error) {
 	defer rows.Close()
 	frames := []frameRecord{}
 	for rows.Next() {
 		var f frameRecord
-		if err := rows.Scan(&f.ID, &f.Offset, &f.Length, &f.Meta, &f.Direction, &f.Stid, &f.Time, &f.Seq); err != nil {
+		var rangesJSON string
+		if err := rows.Scan(&f.ID, &rangesJSON, &f.Meta, &f.Direction, &f.Stid, &f.Time, &f.Seq, &f.VirtualOffset); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(rangesJSON), &f.Ranges); err != nil {
 			return nil, err
 		}
 		frames = append(frames, f)
@@ -114,7 +129,7 @@ func scanFrameRows(rows *sql.Rows) ([]frameRecord, error) {
 // listFrames returns up to n frames for key with id >= start, ordered by id. n <= 0
 // means unlimited.
 func (i *DbDumpInterceptor) listFrames(key frameKey, start int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	query := `SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 	          WHERE session = ? AND stream = ? AND direction = ? AND script = ? AND script_version = ? AND id >= ?
 	          ORDER BY id`
 	args := []any{key.Session, key.Stream, key.Direction, key.Script, key.ScriptVersion, start}
@@ -145,7 +160,7 @@ func (i *DbDumpInterceptor) listFrames(key frameKey, start int64, n int) ([]fram
 // glitch) — see intercept/dbdump/CLAUDE.md's "Framer scripts" section, "Known
 // limitation" note, for the full rationale.
 func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	query := `SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid >= ?
 	          ORDER BY stid, id`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, start}
@@ -188,7 +203,7 @@ func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64
 		}
 	}
 	groupRows, err := i.db.Query(
-		`SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+		`SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid = ?
 		 ORDER BY id`,
 		key.Session, key.Stream, key.Script, key.ScriptVersion, boundaryStid,
@@ -214,7 +229,7 @@ func (i *DbDumpInterceptor) listFramesTimeline(key frameTimelineKey, start int64
 // the reverse walk: never returns a page that splits a tied-stid group. n <= 0 means
 // unlimited.
 func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, beforeStid int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	query := `SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid < ?
 	          ORDER BY stid DESC, id DESC`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, beforeStid}
@@ -252,7 +267,7 @@ func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, bef
 				before[l], before[r] = before[r], before[l]
 			}
 			groupRows, err := i.db.Query(
-				`SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+				`SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 				 WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND stid = ?
 				 ORDER BY id`,
 				key.Session, key.Stream, key.Script, key.ScriptVersion, boundaryStid,
@@ -289,7 +304,7 @@ func (i *DbDumpInterceptor) listFramesTimelineBackward(key frameTimelineKey, bef
 // frames), so no tied-group pagination safety net is needed here: a plain LIMIT is
 // always a safe page boundary. n <= 0 means unlimited. Not yet surfaced in any UI.
 func (i *DbDumpInterceptor) listFramesBySeq(key frameTimelineKey, start int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	query := `SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND seq >= ?
 	          ORDER BY seq`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, start}
@@ -309,7 +324,7 @@ func (i *DbDumpInterceptor) listFramesBySeq(key frameTimelineKey, start int64, n
 // seq < beforeSeq (exclusive), always returned in ascending seq order like the forward
 // version. n <= 0 means unlimited.
 func (i *DbDumpInterceptor) listFramesBySeqBackward(key frameTimelineKey, beforeSeq int64, n int) ([]frameRecord, error) {
-	query := `SELECT id, offset, length, meta, direction, stid, time, seq FROM frames
+	query := `SELECT id, ranges, meta, direction, stid, time, seq, virtual_offset FROM frames
 	          WHERE session = ? AND stream = ? AND script = ? AND script_version = ? AND seq < ?
 	          ORDER BY seq DESC`
 	args := []any{key.Session, key.Stream, key.Script, key.ScriptVersion, beforeSeq}
@@ -349,6 +364,19 @@ func (i *DbDumpInterceptor) listFramesBySeqBackward(key frameTimelineKey, before
 // backlog never set them. catchUpFramer (web/framerRun.js) passes true in exactly one
 // dedicated trailing call, once every direction's synthetic connection-close chunk has
 // itself already been persisted via a prior (closed=false) call to this same function.
+//
+// Also assigns each new frame's VirtualOffset: a per-direction running byte total
+// (frame_progress.virtual_length_c2s/virtual_length_s2c), advanced by sum(ranges[].length)
+// as each frame of that direction is appended, in the same array-order pass id/seq are
+// already assigned in — so, like id, it reflects per-direction emission order (provably
+// identical to seq restricted to one direction, since both are assigned in that same
+// pass). Deliberately a plain sum, not the length of the merged/deduplicated byte span —
+// a frame whose ranges overlap each other, or another frame's, is simply counted (and
+// later displayed) twice, matching /byte-ranges' and selectByBudget's own no-dedup
+// treatment of overlapping ranges elsewhere in this codebase. Purely internal
+// bookkeeping — frame_progress's own running totals are never read back by any caller
+// other than this function, only each frame's own resulting VirtualOffset matters
+// downstream (via frameResponse).
 func (i *DbDumpInterceptor) appendFrames(key frameTimelineKey, expected frameProgress, newFrames []frameInput, newProgress frameProgress) error {
 	tx, err := i.db.Begin()
 	if err != nil {
@@ -357,11 +385,12 @@ func (i *DbDumpInterceptor) appendFrames(key frameTimelineKey, expected framePro
 	defer tx.Rollback() // no-op once Commit succeeds
 
 	var currentC2S, currentS2C int64
+	var virtualLen [2]int64 // indexed by direction (directionC2S/directionS2C)
 	err = tx.QueryRow(
-		`SELECT processed_offset_c2s, processed_offset_s2c FROM frame_progress
+		`SELECT processed_offset_c2s, processed_offset_s2c, virtual_length_c2s, virtual_length_s2c FROM frame_progress
 		 WHERE session = ? AND stream = ? AND script = ? AND script_version = ?`,
 		key.Session, key.Stream, key.Script, key.ScriptVersion,
-	).Scan(&currentC2S, &currentS2C)
+	).Scan(&currentC2S, &currentS2C, &virtualLen[directionC2S], &virtualLen[directionS2C])
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -383,7 +412,7 @@ func (i *DbDumpInterceptor) appendFrames(key frameTimelineKey, expected framePro
 	nextID := map[int]int64{}
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO frames (session, stream, direction, script, script_version, id, offset, length, meta, stid, time, seq)
+		`INSERT INTO frames (session, stream, direction, script, script_version, id, ranges, meta, stid, time, seq, virtual_offset)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
@@ -401,21 +430,33 @@ func (i *DbDumpInterceptor) appendFrames(key frameTimelineKey, expected framePro
 				return err
 			}
 		}
-		if _, err := stmt.Exec(key.Session, key.Stream, f.Direction, key.Script, key.ScriptVersion, id, f.Offset, f.Length, f.Meta, f.Stid, f.Time, nextSeq); err != nil {
+		rangesJSON, err := json.Marshal(f.Ranges)
+		if err != nil {
+			return err
+		}
+		var length int64
+		for _, rg := range f.Ranges {
+			length += rg.Length
+		}
+		virtualOffset := virtualLen[f.Direction]
+		if _, err := stmt.Exec(key.Session, key.Stream, f.Direction, key.Script, key.ScriptVersion, id, string(rangesJSON), f.Meta, f.Stid, f.Time, nextSeq, virtualOffset); err != nil {
 			return err
 		}
 		nextID[f.Direction] = id + 1
 		nextSeq++
+		virtualLen[f.Direction] += length
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO frame_progress (session, stream, script, script_version, processed_offset_c2s, processed_offset_s2c, state, closed_c2s, closed_s2c)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO frame_progress (session, stream, script, script_version, processed_offset_c2s, processed_offset_s2c, virtual_length_c2s, virtual_length_s2c, state, closed_c2s, closed_s2c)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (session, stream, script, script_version)
 		 DO UPDATE SET processed_offset_c2s = excluded.processed_offset_c2s, processed_offset_s2c = excluded.processed_offset_s2c,
+		               virtual_length_c2s = excluded.virtual_length_c2s, virtual_length_s2c = excluded.virtual_length_s2c,
 		               state = excluded.state, closed_c2s = excluded.closed_c2s, closed_s2c = excluded.closed_s2c`,
 		key.Session, key.Stream, key.Script, key.ScriptVersion,
-		newProgress.ProcessedOffsetC2S, newProgress.ProcessedOffsetS2C, newProgress.State, newProgress.ClosedC2S, newProgress.ClosedS2C,
+		newProgress.ProcessedOffsetC2S, newProgress.ProcessedOffsetS2C, virtualLen[directionC2S], virtualLen[directionS2C],
+		newProgress.State, newProgress.ClosedC2S, newProgress.ClosedS2C,
 	); err != nil {
 		return err
 	}
@@ -533,20 +574,23 @@ func (r frameTimelineKeyRequest) key() frameTimelineKey {
 // own request, but including it uniformly is harmless and keeps one response builder for
 // all three).
 type frameResponse struct {
-	ID        int64   `json:"id"`
-	Offset    int64   `json:"offset"`
-	Length    int64   `json:"length"`
-	Meta      *string `json:"meta"`
-	Direction int     `json:"direction"`
-	Stid      int64   `json:"stid"`
-	Time      int64   `json:"time"`
-	Seq       int64   `json:"seq"`
+	ID            int64        `json:"id"`
+	Ranges        []frameRange `json:"ranges"`
+	Meta          *string      `json:"meta"`
+	Direction     int          `json:"direction"`
+	Stid          int64        `json:"stid"`
+	Time          int64        `json:"time"`
+	Seq           int64        `json:"seq"`
+	VirtualOffset int64        `json:"virtual_offset"`
 }
 
 func buildFrameResponse(frames []frameRecord) []frameResponse {
 	resp := make([]frameResponse, len(frames))
 	for j, f := range frames {
-		resp[j] = frameResponse{ID: f.ID, Offset: f.Offset, Length: f.Length, Meta: f.Meta, Direction: f.Direction, Stid: f.Stid, Time: f.Time, Seq: f.Seq}
+		resp[j] = frameResponse{
+			ID: f.ID, Ranges: f.Ranges, Meta: f.Meta, Direction: f.Direction,
+			Stid: f.Stid, Time: f.Time, Seq: f.Seq, VirtualOffset: f.VirtualOffset,
+		}
 	}
 	return resp
 }
@@ -667,12 +711,11 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 		ExpectedProcessedOffsetC2S int64 `json:"expected_processed_offset_c2s"`
 		ExpectedProcessedOffsetS2C int64 `json:"expected_processed_offset_s2c"`
 		NewFrames                  []struct {
-			Direction int     `json:"direction"`
-			Offset    int64   `json:"offset"`
-			Length    int64   `json:"length"`
-			Meta      *string `json:"meta"`
-			Stid      int64   `json:"stid"`
-			Time      int64   `json:"time"`
+			Direction int          `json:"direction"`
+			Ranges    []frameRange `json:"ranges"`
+			Meta      *string      `json:"meta"`
+			Stid      int64        `json:"stid"`
+			Time      int64        `json:"time"`
 		} `json:"new_frames"`
 		NewProcessedOffsetC2S int64  `json:"new_processed_offset_c2s"`
 		NewProcessedOffsetS2C int64  `json:"new_processed_offset_s2c"`
@@ -686,7 +729,7 @@ func (i *DbDumpInterceptor) handleFramesAppend(w http.ResponseWriter, r *http.Re
 
 	inputs := make([]frameInput, len(req.NewFrames))
 	for j, f := range req.NewFrames {
-		inputs[j] = frameInput{Direction: f.Direction, Offset: f.Offset, Length: f.Length, Meta: f.Meta, Stid: f.Stid, Time: f.Time}
+		inputs[j] = frameInput{Direction: f.Direction, Ranges: f.Ranges, Meta: f.Meta, Stid: f.Stid, Time: f.Time}
 	}
 
 	err := i.appendFrames(req.key(),

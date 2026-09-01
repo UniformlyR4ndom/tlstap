@@ -64,6 +64,28 @@ test('buildRows: a front-trimmed (continued) window keeps its header and offsets
     assert.equal(rows[2].localOffset, 116)
 })
 
+test('buildRows: a segment without virtualOffset (chunk mode) leaves hex rows\' virtualOffset undefined', () => {
+    const s = seg(1, 0, 0, 0, 20, 1000)
+    const rows = buildRows([fullWin(s)], 0)
+    assert.equal(rows[1].virtualOffset, undefined)
+    assert.equal(rows[2].virtualOffset, undefined)
+})
+
+test('buildRows: a segment carrying virtualOffset (frame mode) offsets each hex row by it, using the same localBase real offset already uses', () => {
+    const s = { ...seg(5, 2, 1, 100, 1000, 2000), virtualOffset: 300 } // frame's own virtual start
+    const w = win(s, 200, 232) // trimmed 100 bytes into the frame — localBase=100
+    const rows = buildRows([w], 0)
+    assert.equal(rows[1].offset, 200)
+    assert.equal(rows[1].virtualOffset, 400) // 300 + localBase(100) + off(0)
+    assert.equal(rows[2].virtualOffset, 416) // 300 + 100 + 16
+})
+
+test('buildRows: a frame\'s first real virtual offset of 0 is not mistaken for absent', () => {
+    const s = { ...seg(1, 0, 0, 0, 20, 1000), virtualOffset: 0 }
+    const rows = buildRows([fullWin(s)], 0)
+    assert.equal(rows[1].virtualOffset, 0)
+})
+
 test('buildRows: multiple windows concatenate in order', () => {
     const w1 = fullWin(seg(1, 0, 0, 0, 16, 0))
     const w2 = fullWin(seg(2, 0, 1, 0, 16, 0))

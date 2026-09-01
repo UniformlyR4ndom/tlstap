@@ -1,3 +1,9 @@
+// TODO: remove this whole file (and segments_test.go, and the /segments route in
+// api.go) — superseded by /byte-ranges (byteranges.go) + /chunks/timeline (chunks.go).
+// Nothing in web/ calls this anymore (openSegmentsStream/splitSegments in api.js are
+// likewise dead). Left in place pending manual end-to-end browser verification of the
+// replacement; see doc/design/hexview-segment-buffer.md's "Migration plan" step 6.
+
 package dbdump
 
 import (

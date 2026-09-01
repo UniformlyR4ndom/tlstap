@@ -1,37 +1,59 @@
-import { openSegmentsStream } from './api.js'
+import { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges } from './api.js'
+import { selectByBudget, computeReachedEnd } from './frameSegmentsCore.js'
 
 // Chunk-mode adapter for useByteBuffer.js — maps its generic openConnection/fillForward/
-// fillBackward contract directly onto /segments (api.js's openSegmentsStream), see
-// doc/design/hexview-segment-buffer.md's "Chunk-mode adapter" section. Every returned
-// SegmentWindow is already fully loaded, since /segments always delivers a chunk's
-// metadata and bytes together in one exchange — resumeWindow is accepted (for contract
-// uniformity with the frame adapter, byteBufferCore.js's fillToTarget always passes the
-// current edge whether or not it's fully loaded) but never read here: a chunk-mode window
-// is always fully loaded already, and chunks never tie on `stid` the way frames can, so
-// there's never anything for this adapter to do with it.
+// fillBackward contract onto POST /chunks/timeline (metadata) + POST /byte-ranges
+// (bytes), replacing the old single-WS /segments (see intercept/dbdump/CLAUDE.md).
+// Candidate selection now happens client-side via selectByBudget — the exact same
+// function frame mode already uses (frameSegmentsCore.js) — rather than a second,
+// server-side copy of the same "checked only between whole items" budget discipline.
+// Every returned SegmentWindow is still always fully loaded: a chunk row's data is
+// written as one complete, immutable blob, so requesting exactly a listed chunk's own
+// (offset, length) from /byte-ranges can never come back short. resumeWindow/excludeIds
+// are dropped entirely from fillForward/fillBackward's destructured params — dead for
+// chunk mode, since chunks never tie on stid the way frames can and are always fully
+// loaded already; byteBufferCore.js's fillToTarget still passes them (for contract
+// uniformity with the frame adapter), they're just ignored here.
 
-// entity is unused — a /segments connection is entity-agnostic; session/stream are sent
-// per fetchForward/fetchBackward call instead. Kept as a parameter anyway to match the
-// adapter contract's documented openConnection(entity) signature.
+// entity is unused — the returned handle is entity-agnostic; session/stream are sent per
+// call instead. Kept as a parameter anyway to match the adapter contract's documented
+// openConnection(entity) signature.
 export function openConnection(entity) {
-    return openSegmentsStream()
+    return { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges }
 }
 
-function toSegmentWindow(s) {
-    return {
-        segment: { stid: s.stid, id: s.segmentId, direction: s.direction, offset: s.offset, length: s.length, time: s.time },
-        loadedStart: s.offset,
-        loadedEnd:   s.offset + s.length,
-        bytes:       s.data,
-    }
+async function fetchWindows(handle, entity, candidates) {
+    if (candidates.length === 0) return []
+    const ranges = candidates.map(c => ({ offset: c.offset, direction: c.direction, length: c.length }))
+    const bytesList = await handle.fetchByteRanges(entity.session, entity.id, ranges)
+    return candidates.map((c, j) => ({
+        segment:     { stid: c.stid, id: c.id, direction: c.direction, offset: c.offset, length: c.length, time: c.time },
+        loadedStart: c.offset,
+        loadedEnd:   c.offset + c.length,
+        bytes:       bytesList[j],
+    }))
 }
 
 export async function fillForward(handle, entity, { afterStid, maxBytes, maxSegments }) {
-    const { segments, reachedEnd } = await handle.fetchForward(entity.session, entity.id, afterStid, maxSegments, maxBytes)
-    return { windows: segments.map(toSegmentWindow), reachedEnd }
+    const requestN = maxSegments + 1
+    // /chunks/timeline's start is inclusive, unlike useByteBuffer.js's exclusive
+    // afterStid convention — +1 bridges the two. No resumeWindow-aware inclusive-requery
+    // exception needed here (unlike frameSegments.js), since chunks never tie.
+    const chunks = await handle.listChunksTimeline(entity.session, entity.id, afterStid + 1, requestN)
+    const { included } = selectByBudget(chunks, maxSegments, maxBytes, 1)
+    const reachedEnd = computeReachedEnd(chunks, requestN, included)
+    return { windows: await fetchWindows(handle, entity, included), reachedEnd }
 }
 
 export async function fillBackward(handle, entity, { beforeStid, maxBytes, maxSegments }) {
-    const { segments, reachedEnd } = await handle.fetchBackward(entity.session, entity.id, beforeStid, maxSegments, maxBytes)
-    return { windows: segments.map(toSegmentWindow), reachedEnd }
+    const requestN = maxSegments + 1
+    const chunks = await handle.listChunksTimelineBackward(entity.session, entity.id, beforeStid, requestN)
+    // chunks comes back ascending (smallest stid first); reverse to nearest-to-
+    // beforeStid-first (largest stid first) for selection, same convention frame mode's
+    // fillBackward uses.
+    const { included } = selectByBudget(chunks.slice().reverse(), maxSegments, maxBytes, -1)
+    const reachedEnd = computeReachedEnd(chunks, requestN, included)
+    const windows = await fetchWindows(handle, entity, included)
+    windows.reverse() // included was nearest-first (descending); flip back to ascending
+    return { windows, reachedEnd }
 }

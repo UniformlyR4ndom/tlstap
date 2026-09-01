@@ -881,6 +881,16 @@ body {
     min-height: 0;
     overflow: hidden;
 }
+/* TamperFramerScriptsPanel.js: ScriptsCrudPanel.js reused directly (same shape as
+   .tamper-scripts-main above), but sits directly under the "Framer Scripts" sub-tab as
+   its own top-level sub-tab body — no Run/Stop, no log panel sibling — rather than
+   inside .tamper-scripts-view alongside the interception-script editor. */
+.tamper-framer-scripts-view {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    overflow: hidden;
+}
 /* Analysis tab's "Framing" bottom-panel tab (FramingPanel.js): Scripts/Log as sub-tabs,
    same shape as the Tamper tab's own Intercept/Scripts split — .tamper-subtabs is reused
    directly (nothing tamper-specific in its styling, just a generic sub-tab row). */
@@ -1178,8 +1188,28 @@ body {
 .dissect-node-label { color: var(--text-dim); flex-shrink: 0; }
 .dissect-node-value {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    word-break: break-all;
+    min-width: 0;
+}
+.dissect-node-hexdump-wrap {
+    padding: 0 10px 4px;
+}
+.dissect-node-hexdump-wrap.dissect-node-clickable { cursor: pointer; }
+.dissect-node-hexdump-wrap.dissect-node-clickable:hover { background: rgba(255,255,255,0.05); }
+.dissect-node-hexdump {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 15px;
+    white-space: pre;
+    overflow: auto;
+    max-height: 120px; /* ~8 lines; content beyond this scrolls rather than growing the tree */
+}
+.dissect-node-hexdump-more {
+    font-size: 11px;
+    color: var(--text-dim);
+    padding-top: 2px;
 }
 
 .markers-io-bar {

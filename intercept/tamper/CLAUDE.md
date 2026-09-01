@@ -273,71 +273,42 @@ tamper-specific:
   own wiring — the real server's basePath, config-driven enable/disable, and that a
   PUT/DELETE actually pushes `script-updated` over the control connection.
 
-**Filesystem access (`fs.go`)** grants a running script scoped read/write/list access to
-one host directory, for reading fixtures or persisting artifacts across a session —
-independent of script storage above (that's the script's own source code; this is
-arbitrary data the script reads/writes at runtime). Deliberately a plain REST API, not
-folded into the control WebSocket protocol: file I/O has no relation to connection/hold
-state or the control channel's push-event model, so REST (mirroring the `/scripts`
-convention) keeps it uniform and — like `/scripts` — usable from `curl`/`tapctl` too, not
-just the browser.
+**A second, independent `scriptstore.Store` instance** (`FramerScriptsDir`/
+`framer-scripts-dir`, `i.framerScripts`) holds framer scripts — `frame(state, chunk)`
+scripts that reassemble live traffic into frames for a selected interception script's
+`onFrame` hook to react to, entirely client-side (see `web/CLAUDE.md`'s "Scripted
+interception" section and [`doc/design/tamper-framer.md`](../../doc/design/tamper-framer.md)
+for the full mechanism/rationale). Same mechanics as `ScriptsDir` above in every
+respect, just a second, separate directory/namespace — same name in both stores is not
+a collision, matching how dbdump already runs two independent `scriptstore.Store`
+instances (`ScriptsDir`/`DissectScriptsDir`) side by side:
 
-- `FsRoot` (`fs-root` config field): the directory exposed. Empty disables the feature
-  entirely — the REST endpoints still exist but every request gets `501`, same convention
-  as `scripts-dir`. Unlike `scripts-dir`, this directory is **not** auto-created: it's
-  expected to already exist (e.g. a test-fixtures folder the operator chose), so a
-  typo'd path fails interceptor construction outright rather than silently creating an
-  arbitrary directory tree — checked in `newFsStore`, called from `NewTamperInterceptor`
-  for the same "must be ready the moment `RegisterRoutes` runs" reason `scripts-dir` is.
-- **Path containment** (`fsStore.resolve`): a request path is always slash-separated
-  (arrives via a URL wildcard) and is neither charset-restricted nor symlink-resolved —
-  unlike script names, nested subdirectories are the whole point, and a symlink planted
-  inside `fs-root` escaping it is treated as a host-filesystem concern out of scope for
-  this store to solve. Containment instead falls out structurally: `path.Clean("/" +
-  relPath)` is computed first, with the synthetic leading `/` making any leading `..`
-  segments collapse against that boundary before the result is ever joined onto the root
-  — so the cleaned path can never climb above where it started, regardless of how many
-  `..` segments a request throws at it. `filepath.Join(root, ...)` plus a
-  boundary-aware suffix check (`strings.HasPrefix(full, root+separator)`, not a bare
-  prefix check, which would wrongly accept a sibling directory like `<root>-evil`) is a
-  second, independent guard against the same escape. Unit-tested directly
-  (`fs_test.go`), including deep `../../..` traversal attempts.
-- **REST endpoints** (base: `/<proxy-name>/api/i/tamper` or canonical `/api/i/tamper`):
-  `GET /fs/list` and `GET /fs/list/{path...}` → `[{name, dir, size}]`, one directory level
-  (not recursive — `dir:true` entries are listed again by requesting that path); `size` is
-  whatever the OS reports for a directory (meaningless — callers should key off `dir`
-  instead). `GET /fs/file/{path...}` → raw bytes, `Content-Type:
-  application/octet-stream` (unlike `/scripts`, content here is arbitrary binary, not
-  always UTF-8 JS, hence the generic content type and no JSON/base64 wrapping either).
-  `PUT /fs/file/{path...}` → raw body, `204` on success; creates/overwrites, and
-  auto-creates missing parent directories (a script writing into a new subdirectory
-  shouldn't need a separate mkdir call this store doesn't offer). `POST
-  /fs/file/{path...}` → raw body, `204` on success; **appends** rather than overwriting
-  (creating the file, and any missing parent directories, if it doesn't exist yet) — see
-  `Append` below for why this is `POST`, not `PUT`. No `DELETE` in this first cut. Two
-  patterns are registered for `list` (with and without the trailing wildcard) because
-  Go's `{path...}` wildcard doesn't match an empty trailing segment, so root and
-  subdirectory listing need separate routes to the same handler.
-- **`Put` is atomic**, the same `.tmp-*`-then-`os.Rename` discipline `intercept/scriptstore`
-  uses for its own writes (a separate copy here, not shared code — this store's target may
-  be nested under a subdirectory, not `fs-root` itself, rather than always a single fixed
-  directory).
-- **`Append`** opens the target with `O_APPEND` (creating it if needed) rather than
-  being a client-side `Get`+concatenate+`Put`: two scripts (or their `onReceive`
-  handlers for different connections, which run on independent per-conn goroutines — see
-  the root `CLAUDE.md`'s "Per-connection event serialization" note, under "Scripted
-  interception") appending to the same file around the same time would otherwise race,
-  silently losing one side's data. `O_APPEND` delegates the seek-to-end-and-write to the
-  kernel, which performs it atomically per `Write` call — the same mechanism the
-  interceptor's own `log-file` already relies on (`writeScriptLog`/`Init` in
-  `tamper.go`) — so no locking of our own is needed. `handleFsAppend` is registered as
-  `POST`, not `PUT`: `PUT` is expected to be idempotent (repeat = same result), which an
-  append explicitly isn't (repeat = appended twice); `POST` is the generic "process this
-  at the target resource, non-idempotent" verb, despite every other `fs-root` endpoint
-  being `GET`/`PUT`.
-- Unit-tested in isolation (`fs_test.go`): path resolution (including traversal attempts
-  and the boundary-vs-bare-prefix distinction), construction requiring an existing
-  directory, put/get/list/append round-trips including nested subdirectories, atomic-write
-  cleanup, an HTTP-level end-to-end pass over the real REST handlers (including `POST`),
-  and a concurrent-append race test (20 goroutines × 50 appends each to the same file,
-  asserting no lost or duplicated lines) verifying the `O_APPEND` safety claim above.
+- Created in `NewTamperInterceptor` alongside `i.scripts`, same synchronous-before-`Init`
+  reasoning, same empty-string-disables-with-501 convention.
+- **REST endpoints** nested under `/framer` (base: `/<proxy-name>/api/i/tamper/framer` or
+  canonical `/api/i/tamper/framer`) — `RegisterRoutes` always registers at
+  `{basePath}/scripts`, so a distinct `basePath` is what keeps this store's routes from
+  colliding with `ScriptsDir`'s own `/scripts` routes at the un-nested base. Same
+  `GET /scripts` → `[{name, size}]` / `GET,PUT,DELETE /scripts/{name}` shape as
+  `ScriptsDir`'s endpoints.
+- A `PUT`/`DELETE` pushes a **distinct** control-channel event,
+  `{"type":"framer-script-updated","name":"..."}` (`framerScriptUpdatedMsg`,
+  `protocol.go`) — a separate message type from `script-updated` rather than a shared
+  struct with a "kind" discriminator, since no such discriminator pattern exists
+  anywhere else in this codebase and the two stores are otherwise fully independent.
+- Covered by the same `tapctl tamper framer-script-list/-get/-put/-delete` commands as
+  `ScriptsDir`'s own `script-*` commands — see `test/tapctl/CLAUDE.md`.
+- Unit-tested in `framer_scripts_test.go`, mirroring `scripts_test.go`'s own coverage
+  plus one additional test confirming the two stores don't collide on a shared name.
+
+**Filesystem/key-value access (`tamper.fs.*`/`tamper.kv.*`)** grants a running script
+scoped read/write/list access to one host directory, plus a general-purpose key-value
+store, for reading fixtures or persisting artifacts/state across a session — backed by
+`core/fs`/`core/kv`, `CoreService`s independent of any interceptor, reachable at
+`/api/core/fs/...`/`/api/core/kv/...`. See `core/CLAUDE.md` for the implementation
+(path-containment algorithm, atomic-write discipline, REST endpoint shapes) and root
+`CLAUDE.md`'s "Core Services" section for the config (`core.fs.dir`/`core.kv.file`).
+Nothing in this package touches either directly: `scriptRuntime.js`'s `fs.*`/`kv.*` call
+straight into `web/coreApiClient.js` (`createFsApi`/`createKvApi`) via a direct `fetch()`
+from inside the script's own Worker — no RPC bridge, independent of the control
+connection's lifecycle — see `web/CLAUDE.md`'s "Scripted interception" section.

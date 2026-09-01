@@ -10,9 +10,10 @@ function load() {
         return {
             defaultScript: typeof parsed?.defaultScript === 'string' ? parsed.defaultScript : null,
             perStream: parsed?.perStream && typeof parsed.perStream === 'object' ? parsed.perStream : {},
+            resumeScript: parsed?.resumeScript && typeof parsed.resumeScript === 'object' ? parsed.resumeScript : {},
         }
     } catch {
-        return { defaultScript: null, perStream: {} }
+        return { defaultScript: null, perStream: {}, resumeScript: {} }
     }
 }
 
@@ -44,5 +45,24 @@ export function saveStreamFramerScript(session, streamId, name) {
     const prefs = load()
     if (name) prefs.perStream[streamKey(session, streamId)] = name
     else delete prefs.perStream[streamKey(session, streamId)]
+    save(prefs)
+}
+
+// Separate from perStream above: perStream is "what's selected in the dropdown",
+// resumeScript is "what this stream was last successfully framed with" — the two only
+// coincide once a Run has actually succeeded. TrafficView.js's stream-reselection effect
+// auto-resumes framed view iff loadResumeScript(...) still equals the current
+// loadStreamFramerScript(...) for that stream; changing the dropdown selection without
+// re-running, or an explicit "Show raw chunks" (which clears this via name=null), makes
+// them diverge and falls back to plain raw view — a script is never auto-run against a
+// stream it hasn't already been run against at least once.
+export function loadResumeScript(session, streamId) {
+    return load().resumeScript[streamKey(session, streamId)] ?? null
+}
+
+export function saveResumeScript(session, streamId, name) {
+    const prefs = load()
+    if (name) prefs.resumeScript[streamKey(session, streamId)] = name
+    else delete prefs.resumeScript[streamKey(session, streamId)]
     save(prefs)
 }

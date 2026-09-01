@@ -14,8 +14,9 @@ export { MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS, FILL_TARGET_SEGMENTS }
 // file only needs to satisfy the design, not any particular caller yet.
 //
 // entity: current stream/session (or the synthetic frame-mode entity), or null.
-// openConnection(entity): opens whatever connection fillForward/fillBackward need (a
-// persistent WS for chunk mode; a no-op stub for frame mode, which is plain REST) —
+// openConnection(entity): opens whatever connection fillForward/fillBackward need — a
+// no-op stub for both adapters today (chunk and frame mode are both plain REST, via
+// /chunks/timeline+/byte-ranges and /frames/timeline+/byte-ranges respectively) —
 // returns a handle with an optional close(), mirroring useChunkBuffer.js's openStream.
 // fillForward(handle, entity, {afterStid, resumeWindow, maxBytes, maxSegments}) /
 // fillBackward(handle, entity, {beforeStid, resumeWindow, maxBytes, maxSegments}) both

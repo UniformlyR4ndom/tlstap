@@ -1,3 +1,5 @@
+import { encodeByteRangesRequest, decodeByteRangesResponse } from './byteRangesCore.js'
+
 const BASE = '/api/i/dbdump'
 
 function wsUrl(path) {
@@ -184,6 +186,42 @@ function splitSegments(metas, buffer) {
         return { stid: m.stid, segmentId: m.segmentId, direction: m.direction, time: m.time, offset: m.offset, length: m.length, data }
     })
 }
+
+// fetchByteRanges resolves ranges ([{offset, direction, length}]) to a same-length,
+// same-order Uint8Array[] via POST /byte-ranges — see intercept/dbdump/CLAUDE.md's
+// "POST /byte-ranges" section for the full wire format. Each result may be shorter than
+// requested (never longer, never an error on its own — see that section for what a short
+// read means). Throws on a whole-request validation failure (400) or an unknown
+// session/stream (404). An empty ranges list is a harmless no-op (no request sent).
+export async function fetchByteRanges(sessionId, streamId, ranges) {
+    if (ranges.length === 0) return []
+    const res = await fetch(`${BASE}/byte-ranges?session=${sessionId}&stream=${streamId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: encodeByteRangesRequest(ranges),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    return decodeByteRangesResponse(await res.arrayBuffer(), ranges.length)
+}
+
+// listChunksTimeline/listChunksTimelineBackward — POST /chunks/timeline's client
+// wrapper, mirroring dbdumpFramerApi.js's listFramesTimeline/listFramesTimelineBackward
+// minus any script key (chunks have none — just session/stream). n <= 0 means unlimited.
+// No server-side budget selection, unlike the old /segments — callers apply their own
+// (frameSegmentsCore.js's selectByBudget), same as frame mode already does.
+export function listChunksTimeline(sessionId, streamId, start, n) {
+    return post('/chunks/timeline', { session: sessionId, stream: streamId, start, n })
+}
+
+export function listChunksTimelineBackward(sessionId, streamId, beforeStid, n) {
+    return post('/chunks/timeline', { session: sessionId, stream: streamId, beforeStid, n })
+}
+
+// TODO: remove openSegmentsStream/splitSegments below — superseded by fetchByteRanges +
+// listChunksTimeline/listChunksTimelineBackward above. Nothing calls this anymore
+// (chunkSegments.js/frameSegments.js are both off it); left in place pending manual
+// end-to-end browser verification of the replacement, see doc/design/
+// hexview-segment-buffer.md's "Migration plan" step 6.
 
 // Opens a persistent WebSocket for /segments: one request gets exactly one response
 // (metadata text frame + binary frame), not a per-item stream like openStidStream/

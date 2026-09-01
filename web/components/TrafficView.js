@@ -4,7 +4,7 @@ import htm from 'htm'
 import { getChunkStid, getByteStid } from '../api.js'
 import { getFramerScript, clearStreamFrames } from '../dbdumpFramerApi.js'
 import { catchUpFramer, sha256Hex } from '../framerRun.js'
-import { loadStreamFramerScript, saveStreamFramerScript } from '../framerPrefs.js'
+import { loadStreamFramerScript, saveStreamFramerScript, loadResumeScript, saveResumeScript } from '../framerPrefs.js'
 import { loadStreamDissectScript, saveStreamDissectScript } from '../dissectPrefs.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
 import DissectPanel from './DissectPanel.js'
@@ -37,15 +37,22 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     const viewHeightRef = useRef(0)
     const scrollTopRef = useRef(0)
 
-    // Framer state. frameState: 'raw' | 'framing' | 'framed'; never persisted (always
-    // starts back at 'raw' on a stream (re)selection — only the script choice below
-    // survives that). frameScriptRunning caches the content/version Run last used, so
-    // the live-tailing effect below doesn't need to re-fetch the script on every poll tick.
+    // Framer state. frameState: 'raw' | 'framing' | 'framed' — not itself persisted, but
+    // the stream-reselection effect below auto-resumes 'framed' (re-running the framer)
+    // when framerPrefs.js's resumeScript still matches the current script selection; see
+    // that effect's own comment. frameScriptRunning caches the content/version Run last
+    // used, so the live-tailing effect below doesn't need to re-fetch the script on every
+    // poll tick.
     const [framerSelected, setFramerSelected] = useState('')
     const [frameState, setFrameState] = useState('raw')
     const [frameError, setFrameError] = useState(null)
     const [frameScriptRunning, setFrameScriptRunning] = useState(null) // { name, version, content }
     const [frameRefreshKey, setFrameRefreshKey] = useState(0)
+    // Bumped by the stream-reselection effect; a runFramerFor call in flight checks this
+    // hasn't moved on before applying its result, so a stream switch that fires while an
+    // auto-resume (or a manual Run) is still pending can't clobber the newly-selected
+    // stream's state with a stale completion.
+    const streamGenRef = useRef(0)
 
     // Dissector state (frame view only). selectedFrame: null | { key, frame: {offset,
     // length, direction, kind, meta}, bytes } — set by clicking a frame's header row
@@ -58,7 +65,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     const [dissectorSelected, setDissectorSelected] = useState('')
     const [selectedFrame, setSelectedFrame] = useState(null)
     const [dissectHighlight, setDissectHighlight] = useState(null)
-    const [dissectPanelWidth, handleDissectPanelResize] = useResizableLayout('dissectPanelWidth', { sign: -1, min: 200, max: 500 })
+    const [dissectPanelWidth, handleDissectPanelResize] = useResizableLayout('dissectPanelWidth', { sign: -1, min: 200, max: 800 })
 
     const {
         display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
@@ -111,18 +118,86 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         latestId: latestStid,
     })
 
-    // Resets on every stream (re)selection — frame view is never remembered across a
-    // switch, only which script is selected is (falls back to the global default when
-    // this stream has no override of its own yet).
+    // Shared between the initial Run and the live-tailing effect below — both must
+    // format/tag a script's framer.log(...) calls identically.
+    function handleFramerScriptLog(direction, args) {
+        onFramerLog?.(direction, fmtLogArgs(args), 'log')
+    }
+
+    // Shared by the button's own Run click and the stream-reselection effect below's
+    // auto-resume — takes scriptName/targetStream explicitly rather than reading
+    // framerSelected/stream from closure, since the auto-resume call fires from inside the
+    // very effect that's still in the middle of updating framerSelected for the newly
+    // (re)selected stream. Guards against a stream switch firing again while this is still
+    // in flight (manual or automatic) via streamGenRef — without it, a stale completion
+    // could clobber the newly-selected stream's state with the old one's result.
+    async function runFramerFor(scriptName, targetStream) {
+        if (!targetStream || !scriptName) return
+        const gen = streamGenRef.current
+        setFrameState('framing')
+        setFrameError(null)
+        // clearStreamFrames below wipes any other (script, version)'s frame data for this
+        // stream — a frame previously selected for dissection may no longer exist.
+        setSelectedFrame(null)
+        setDissectHighlight(null)
+        try {
+            const content = await getFramerScript(scriptName)
+            const version = await sha256Hex(content)
+            // Enforces "at most one framing view per stream": purges any other
+            // script/version's frame data for this stream first. A no-op if this exact
+            // (script, version) is already the one active here, so catchUpFramer still
+            // resumes rather than reprocessing — this is what makes an auto-resume of an
+            // up-to-date stream cheap, and a resume after the script was edited a correct
+            // full reprocess, with no separate version comparison needed on our side.
+            await clearStreamFrames({ session: targetStream.session, stream: targetStream.id, script: scriptName, scriptVersion: version })
+            await catchUpFramer(targetStream.session, targetStream.id, scriptName, content, targetStream.end, streamTlsInfo(targetStream), handleFramerScriptLog)
+            if (streamGenRef.current !== gen) return // superseded by a newer stream selection
+            saveStreamFramerScript(targetStream.session, targetStream.id, scriptName)
+            saveResumeScript(targetStream.session, targetStream.id, scriptName)
+            setFrameScriptRunning({ name: scriptName, version, content })
+            setFrameState('framed')
+        } catch (e) {
+            if (streamGenRef.current !== gen) return
+            setFrameError(`Framer "${scriptName}" failed: ${e.message}`)
+            setFrameState('raw')
+            // direction: null — a script-level failure (e.g. no top-level frame function)
+            // isn't attributable to one direction specifically.
+            onFramerLog?.(null, e.message, 'error')
+        }
+    }
+
+    function handleRunFramer() {
+        runFramerFor(framerSelected, stream)
+    }
+
+    // Resets on every stream (re)selection. Which script is selected always survives (via
+    // framerPrefs.js, falling back to the global default when this stream has no override
+    // of its own yet) — frame view itself auto-resumes too, but only when this exact
+    // stream was actually successfully framed with this exact script before:
+    // loadResumeScript(...) (set on a successful run, cleared by "Show raw chunks") must
+    // still equal the script currently selected. A script merely being selected (e.g. an
+    // inherited global default the user never actually ran here) is not enough — this is
+    // what stops a framer from ever being run against a stream it has no established
+    // business with. When it does match, runFramerFor below re-runs the exact same Run
+    // path a click would — cheap/idempotent if nothing changed since, a real catch-up or
+    // reprocess if the stream grew or the script was edited.
     useEffect(() => {
-        setFrameState('raw')
+        streamGenRef.current += 1
         setFrameError(null)
         setFrameScriptRunning(null)
-        setFramerSelected(stream ? (loadStreamFramerScript(stream.session, stream.id) ?? '') : '')
-        setDissectorSelected(stream ? (loadStreamDissectScript(stream.session, stream.id) ?? '') : '')
         setSelectedFrame(null)
         setDissectHighlight(null)
         onFramerLogReset?.()
+        const savedScript = stream ? (loadStreamFramerScript(stream.session, stream.id) ?? '') : ''
+        setFramerSelected(savedScript)
+        setDissectorSelected(stream ? (loadStreamDissectScript(stream.session, stream.id) ?? '') : '')
+
+        const canResume = stream && savedScript && loadResumeScript(stream.session, stream.id) === savedScript
+        if (canResume) {
+            runFramerFor(savedScript, stream)
+        } else {
+            setFrameState('raw')
+        }
     }, [stream?.id])
 
     function handleFramerSelect(name) {
@@ -139,6 +214,9 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         setFrameState('raw')
         setSelectedFrame(null)
         setDissectHighlight(null)
+        // Explicit opt-out: stops the next reselection of this stream from auto-resuming
+        // framed view again (see the stream-reselection effect above).
+        if (stream) saveResumeScript(stream.session, stream.id, null)
     }
 
     // A frame's own header row, from HexDump's onHeaderClick — bytesInfo is exactly what
@@ -159,41 +237,6 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
 
     function handleDissectNodeClick(direction, start, end) {
         setDissectHighlight({ direction, start, end })
-    }
-
-    // Shared between the initial Run and the live-tailing effect below — both must
-    // format/tag a script's framer.log(...) calls identically.
-    function handleFramerScriptLog(direction, args) {
-        onFramerLog?.(direction, fmtLogArgs(args), 'log')
-    }
-
-    async function handleRunFramer() {
-        if (!stream || !framerSelected) return
-        setFrameState('framing')
-        setFrameError(null)
-        // clearStreamFrames below wipes any other (script, version)'s frame data for this
-        // stream — a frame previously selected for dissection may no longer exist.
-        setSelectedFrame(null)
-        setDissectHighlight(null)
-        try {
-            const content = await getFramerScript(framerSelected)
-            const version = await sha256Hex(content)
-            // Enforces "at most one framing view per stream": purges any other
-            // script/version's frame data for this stream first. A no-op if this exact
-            // (script, version) is already the one active here, so catchUpFramer still
-            // resumes rather than reprocessing.
-            await clearStreamFrames({ session: stream.session, stream: stream.id, script: framerSelected, scriptVersion: version })
-            await catchUpFramer(stream.session, stream.id, framerSelected, content, stream.end, streamTlsInfo(stream), handleFramerScriptLog)
-            saveStreamFramerScript(stream.session, stream.id, framerSelected)
-            setFrameScriptRunning({ name: framerSelected, version, content })
-            setFrameState('framed')
-        } catch (e) {
-            setFrameError(`Framer "${framerSelected}" failed: ${e.message}`)
-            setFrameState('raw')
-            // direction: null — a script-level failure (e.g. no top-level frame function)
-            // isn't attributable to one direction specifically.
-            onFramerLog?.(null, e.message, 'error')
-        }
     }
 
     // Live-tailing (eager): once frame view is active, re-runs the framer against

@@ -1,90 +1,68 @@
-import { getByteStid, openSegmentsStream } from './api.js'
 import { listFramesTimeline, listFramesTimelineBackward } from './dbdumpFramerApi.js'
+import { fetchByteRanges } from './api.js'
 import { isWindowFull } from './byteBufferCore.js'
+import { mergeUint8Arrays } from './format.js'
 import {
-    selectByBudget, wantRangeFor, rangesByDirection, buildFrameWindow,
+    selectByBudget, wantRangeFor, buildFrameWindow, virtualRangeToReal,
     extendRange, mergeExtendedWindow, computeReachedEnd, excludeAlreadyLoaded,
 } from './frameSegmentsCore.js'
 
 // Frame-mode adapter for useByteBuffer.js — see doc/design/hexview-segment-buffer.md's
-// "Frame-mode adapter" section, and frameSegmentsCore.js for the pure selection/range
-// math this wraps with the real network calls. Metadata (offset/length, no bytes) comes
-// from /frames/timeline via dbdumpFramerApi.js, already cheap regardless of how huge a
-// frame is; bytes come from the same /segments endpoint chunk mode uses (this module has
-// no special access to it — a frame's bytes are always sliced out of the underlying raw
-// chunks), via the offset→stid resolution api.js's fetchDirectionChunks does today.
+// "Frame-mode adapter" section, and frameSegmentsCore.js's module comment for the virtual-
+// addressing convention (a frame's own 0-based concatenation of ranges, independent of
+// real stream position) and the pure selection/range math built on it. Metadata (ranges,
+// length, no bytes) comes from /frames/timeline via dbdumpFramerApi.js, already cheap
+// regardless of how huge a frame is; bytes come from POST /byte-ranges (api.js's
+// fetchByteRanges) — a frame's virtual want-range is mapped to its own real
+// (offset, length) sub-spans via virtualRangeToReal (one or more per frame, batched
+// together across every included frame into a single request), with no stid resolution
+// or covering-chunk over-fetch needed (unlike the old /segments-backed version): a range
+// fetch can name an arbitrary byte span itself now, not just whole raw chunks.
 //
 // entity: the synthetic frame-mode object TrafficView.js builds —
-// {id, session, streamId, script, scriptVersion, end}. Not yet wired into any view; see
-// the design doc's "Migration plan".
+// {id, session, streamId, script, scriptVersion, end}.
 
 export function openConnection() {
-    return openSegmentsStream()
+    return { listFramesTimeline, listFramesTimelineBackward, fetchByteRanges }
 }
 
 function timelineKey(entity) {
     return { session: entity.session, stream: entity.streamId, script: entity.script, scriptVersion: entity.scriptVersion }
 }
 
-// Slices [offset, offset+length) out of a set of possibly-overlapping raw chunks (a
-// frame's own bytes can span more than one underlying chunk). Deliberately duplicated
-// from TrafficView.js's identical function rather than shared, for now — TrafficView.js
-// still owns the production (unmigrated) frame view and this module must not touch it;
-// once that view is cut over to useByteBuffer.js, TrafficView.js's copy is deleted and
-// this becomes the only one (see the design doc's "Migration plan").
-function sliceFrameBytes(chunks, offset, length) {
-    const out = new Uint8Array(length)
-    const end = offset + length
-    for (const c of chunks) {
-        const cEnd = c.offset + c.data.length
-        if (cEnd <= offset || c.offset >= end) continue
-        const srcStart  = Math.max(0, offset - c.offset)
-        const srcEnd    = Math.min(c.data.length, end - c.offset)
-        const destStart = Math.max(0, c.offset - offset)
-        out.set(c.data.subarray(srcStart, srcEnd), destStart)
-    }
-    return out
+// A frame's own virtual want-range (see frameSegmentsCore.js's module comment) may span
+// more than one of its real ranges, needing more than one /byte-ranges request entry —
+// concatMerge collapses a frame's own slice of the flat response back into one virtual
+// bytes buffer, skipping mergeUint8Arrays' copy for the common single-entry case.
+function concatMerge(parts) {
+    return parts.length === 1 ? parts[0] : mergeUint8Arrays(parts)
 }
 
-// Fetches every underlying raw chunk covering [fromOffset, toOffset) for direction, via
-// the shared /segments connection (handle) — the same offset→stid resolution
-// api.js's fetchDirectionChunks does for /stid-stream, just backed by /segments instead.
-// toOffset is resolved the same "possibly slightly past, if it lands mid-chunk" way
-// fetchDirectionChunks already documents; callers always trim to the exact byte range
-// they want via sliceFrameBytes afterward, so the harmless overshoot is never observed.
-async function fetchDirectionRange(handle, session, streamId, direction, fromOffset, toOffset) {
-    const { stid: startStid } = await getByteStid(session, streamId, direction, fromOffset)
-    const { stid: endStid }   = await getByteStid(session, streamId, direction, toOffset)
-    const maxSegments = endStid - startStid + 1
-    const { segments } = await handle.fetchForward(session, streamId, startStid - 1, maxSegments, 0)
-    return segments.filter(s => s.direction === direction).map(s => ({ offset: s.offset, data: s.data }))
-}
-
-// Fetches bytes for every entry of included (grouped by direction into one
-// fetchDirectionRange call each, not one per frame — rangesByDirection is what computes
-// the combined range) and builds their SegmentWindows.
+// Fetches bytes for every entry of included (one /byte-ranges call covering all of them
+// at once — no dedup/overlap-awareness needed or wanted, see intercept/dbdump/CLAUDE.md's
+// "POST /byte-ranges" section) and builds their SegmentWindows. Each frame's virtual
+// want-range is mapped to its own real (offset, length) sub-spans via virtualRangeToReal —
+// one frame may contribute more than one entry to the single flat batched request.
 async function fetchFrameWindows(handle, entity, included, openRange) {
-    const ranges = rangesByDirection(included, openRange)
-
-    const chunksByDirection = new Map()
-    for (const direction of Object.keys(ranges)) {
-        const { from, to } = ranges[direction]
-        chunksByDirection.set(Number(direction), await fetchDirectionRange(handle, entity.session, entity.streamId, Number(direction), from, to))
-    }
-
-    return included.map(f => {
-        const { wantStart, wantEnd } = wantRangeFor(f, included, openRange)
-        const bytes = sliceFrameBytes(chunksByDirection.get(f.direction), wantStart, wantEnd - wantStart)
-        return buildFrameWindow(f, wantStart, wantEnd, bytes)
+    if (included.length === 0) return []
+    const wants = included.map(f => wantRangeFor(f, included, openRange))
+    const perFrameEntries = included.map((f, j) => virtualRangeToReal(f.ranges, f.direction, wants[j].wantStart, wants[j].wantEnd))
+    const bytesList = await handle.fetchByteRanges(entity.session, entity.streamId, perFrameEntries.flat())
+    let cursor = 0
+    return included.map((f, j) => {
+        const n = perFrameEntries[j].length
+        const bytes = concatMerge(bytesList.slice(cursor, cursor + n))
+        cursor += n
+        return buildFrameWindow(f, wants[j].wantStart, wants[j].wantEnd, bytes)
     })
 }
 
 async function extendResumeWindow(handle, entity, resumeWindow, maxBytes, dir) {
     const { wantStart, wantEnd } = extendRange(resumeWindow, maxBytes, dir)
-    const chunks   = await fetchDirectionRange(handle, entity.session, entity.streamId, resumeWindow.segment.direction, wantStart, wantEnd)
-    const newBytes = sliceFrameBytes(chunks, wantStart, wantEnd - wantStart)
-    const window   = mergeExtendedWindow(resumeWindow, dir, wantStart, wantEnd, newBytes)
-    return { windows: [window], reachedEnd: false }
+    const entries = virtualRangeToReal(resumeWindow.segment.ranges, resumeWindow.segment.direction, wantStart, wantEnd)
+    const bytesList = await handle.fetchByteRanges(entity.session, entity.streamId, entries)
+    const bytes = concatMerge(bytesList)
+    return { windows: [mergeExtendedWindow(resumeWindow, dir, wantStart, wantEnd, bytes)], reachedEnd: false }
 }
 
 export async function fillForward(handle, entity, { afterStid, resumeWindow, excludeIds, maxBytes, maxSegments }) {
@@ -100,7 +78,7 @@ export async function fillForward(handle, entity, { afterStid, resumeWindow, exc
     // so the original exclusive "+1" still applies. excludeIds (every id already consumed
     // at this exact stid, not just resumeWindow's own — see excludeAlreadyLoaded) turns the
     // inclusive result back into "only what's genuinely new".
-    const rawFrames = await listFramesTimeline(timelineKey(entity), resumeWindow ? afterStid : afterStid + 1, requestN)
+    const rawFrames = await handle.listFramesTimeline(timelineKey(entity), resumeWindow ? afterStid : afterStid + 1, requestN)
     const frames = excludeAlreadyLoaded(rawFrames, afterStid, excludeIds)
 
     // Already ascending = nearest-to-afterStid-first for a forward walk.
@@ -119,7 +97,7 @@ export async function fillBackward(handle, entity, { beforeStid, resumeWindow, e
     // listFramesTimelineBackward is exclusive of beforeStid already (stid < beforeStid);
     // "+1" makes it inclusive of beforeStid whenever resumeWindow is given, mirroring
     // fillForward's adjustment above for the same tied-stid-group reason.
-    const rawFrames = await listFramesTimelineBackward(timelineKey(entity), resumeWindow ? beforeStid + 1 : beforeStid, requestN)
+    const rawFrames = await handle.listFramesTimelineBackward(timelineKey(entity), resumeWindow ? beforeStid + 1 : beforeStid, requestN)
     const frames = excludeAlreadyLoaded(rawFrames, beforeStid, excludeIds)
 
     // frames comes back ascending (smallest stid first); reverse to nearest-to-

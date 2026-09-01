@@ -5,6 +5,16 @@ import { mergeUint8Arrays } from './format.js'
 // itself calls listFramesTimeline/getByteStid, live network calls not easily mocked via
 // plain ES module imports). See doc/design/hexview-segment-buffer.md's "Frame-mode
 // adapter" section.
+//
+// Frames are addressed here in their own virtual coordinate space, not real stream
+// positions: a frame is treated as its own independent, always-contiguous 0-based
+// concatenation of its `ranges`, regardless of how many it has or where they physically
+// sit (two frames' real ranges may legitimately overlap — each is fetched/rendered fully
+// independently, matching /byte-ranges' own no-dedup design). This is what lets
+// byteBufferCore.js's generic offset/length arithmetic keep working completely unchanged
+// for a multi-range frame: `SegmentWindow.segment.offset` is simply always `0` here.
+// `virtualRangeToReal` is the one place real byte positions come back into it, mapping a
+// virtual sub-window onto the real (offset, length) spans actually needed to fetch it.
 
 // Drops every frame at exactly `stid` whose id is in excludeIds — used after a metadata
 // fetch made *inclusive* of a boundary stid already partly consumed (see frameSegments.js),
@@ -20,16 +30,18 @@ export function excludeAlreadyLoaded(frames, stid, excludeIds) {
     return frames.filter(f => !(f.stid === stid && ids.has(f.id)))
 }
 
-// The sub-range of a too-big-to-load-whole frame f to fetch on its first touch.
-// Forward (dir=1, opened while scrolling *into* it from its start): anchor at f.offset,
-// so later forward extension grows loadedEnd — exactly mergeExtendedWindow's forward
+// The sub-range of a too-big-to-load-whole frame f to fetch on its first touch, in f's
+// own virtual coordinate space (see virtualRangeToReal below — a frame is addressed as
+// its own independent, 0-based concatenation of ranges here, never by real stream
+// position). Forward (dir=1, opened while scrolling *into* it from its start): anchor at
+// 0, so later forward extension grows loadedEnd — exactly mergeExtendedWindow's forward
 // case. Backward (dir=-1, opened while scrolling *into* it from its end): anchor at
-// f.offset+f.length, so later backward extension shrinks loadedStart instead — the
-// mirror image, matching where the buffer's already-visible content sits relative to it.
+// f.length, so later backward extension shrinks loadedStart instead — the mirror image,
+// matching where the buffer's already-visible content sits relative to it.
 export function initialWindowRange(dir, f, maxBytes) {
     return dir === 1
-        ? { wantStart: f.offset, wantEnd: f.offset + maxBytes }
-        : { wantStart: f.offset + f.length - maxBytes, wantEnd: f.offset + f.length }
+        ? { wantStart: 0, wantEnd: maxBytes }
+        : { wantStart: f.length - maxBytes, wantEnd: f.length }
 }
 
 // True only if there is genuinely nothing left to fetch in this direction: the metadata
@@ -78,39 +90,54 @@ export function selectByBudget(candidatesNearestFirst, maxSegments, maxBytes, di
     return { included, openRange }
 }
 
-// The exact byte range needed for one entry of included — openRange (if set) always
-// applies to included[0] (see selectByBudget); every other entry wants its full
-// [offset, offset+length).
+// The exact virtual byte range needed for one entry of included, in f's own 0-based
+// virtual coordinate space — openRange (if set) always applies to included[0] (see
+// selectByBudget); every other entry wants its full [0, f.length).
 export function wantRangeFor(f, included, openRange) {
-    return openRange && f === included[0] ? openRange : { wantStart: f.offset, wantEnd: f.offset + f.length }
+    return openRange && f === included[0] ? openRange : { wantStart: 0, wantEnd: f.length }
 }
 
-// The combined [from, to) byte range needed per direction to cover every entry of
-// included — one fetch per direction is enough, not one per frame. Returns a plain
-// object (not a Map) keyed by direction number, for straightforward assert.deepEqual in
-// tests.
-export function rangesByDirection(included, openRange) {
-    const ranges = {}
-    for (const f of included) {
-        const { wantStart, wantEnd } = wantRangeFor(f, included, openRange)
-        const r = ranges[f.direction]
-        if (!r) ranges[f.direction] = { from: wantStart, to: wantEnd }
-        else { r.from = Math.min(r.from, wantStart); r.to = Math.max(r.to, wantEnd) }
-    }
-    return ranges
-}
-
+// segment.offset is always 0 here — see the module comment above: a frame-mode segment is
+// addressed purely in its own virtual space, never a real stream position, so byteBufferCore.js's
+// generic offset/length arithmetic (isWindowFull, buildRows, etc.) just works unmodified.
+// segment.ranges carries the frame's real ranges forward, since a later extendResumeWindow
+// call (frameSegments.js) still needs them to map a further virtual extension back onto
+// real bytes to fetch.
 export function buildFrameWindow(f, wantStart, wantEnd, bytes) {
     return {
-        segment:     { stid: f.stid, id: f.id, direction: f.direction, offset: f.offset, length: f.length, time: f.time, meta: f.meta },
+        segment:     { stid: f.stid, id: f.id, direction: f.direction, offset: 0, length: f.length, time: f.time, meta: f.meta, virtualOffset: f.virtualOffset, ranges: f.ranges },
         loadedStart: wantStart,
         loadedEnd:   wantEnd,
         bytes,
     }
 }
 
+// Maps a virtual [vStart, vEnd) sub-window (positions within a frame's own 0-based
+// concatenation of ranges — see the module comment above) back onto the real
+// (offset, length) sub-spans needed to fetch it, in range order. For a single-range frame
+// this always emits exactly one entry, identical to a direct real-offset request. Used by
+// frameSegments.js to turn a virtual want-range into one or more /byte-ranges request
+// entries, then concatenate the responses back into one virtual bytes buffer.
+export function virtualRangeToReal(ranges, direction, vStart, vEnd) {
+    const entries = []
+    let vCursor = 0
+    for (const r of ranges) {
+        const rEnd = vCursor + r.length
+        const overlapStart = Math.max(vStart, vCursor)
+        const overlapEnd = Math.min(vEnd, rEnd)
+        if (overlapStart < overlapEnd) {
+            entries.push({ offset: r.offset + (overlapStart - vCursor), length: overlapEnd - overlapStart, direction })
+        }
+        vCursor = rEnd
+    }
+    return entries
+}
+
 // The byte range to newly fetch this round to extend resumeWindow further, in direction
-// dir (1 = grow loadedEnd forward, -1 = shrink loadedStart backward).
+// dir (1 = grow loadedEnd forward, -1 = shrink loadedStart backward). Still virtual-space
+// arithmetic — segment.offset is always 0 for a frame-mode resumeWindow (see
+// buildFrameWindow above), so this needs no changes despite segment.offset no longer
+// being a real position.
 export function extendRange(resumeWindow, maxBytes, dir) {
     const { segment, loadedStart, loadedEnd } = resumeWindow
     return dir === 1

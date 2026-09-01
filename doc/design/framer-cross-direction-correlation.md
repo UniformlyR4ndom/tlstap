@@ -146,9 +146,12 @@ scoping the HTTP/1 framer's request/response interleaving (see `http1-framer.md`
 discussion): a script that holds a fully-parsed frame in `state` and returns it later
 (e.g. a request, held until its matching response is also ready to emit, so the two can
 be revealed together) doesn't change that frame's `stid` — `stid` is always resolved from
-the frame's own byte offset via `chunkAtOffset`, never from when `frame()` happened to
-return it — so `stid` order alone can't express "the order the script actually chose to
-reveal frames in" (e.g. a neat request-then-response interleaving for display). `seq`
+the frame's own byte offset (`max(range.offset + range.length)` across the frame's
+`ranges` array, since `frames.offset`/`length` generalized to a list — see
+`intercept/dbdump/CLAUDE.md`'s schema notes) via `chunkAtOffset`, never from when
+`frame()` happened to return it — so `stid` order alone can't express "the order the
+script actually chose to reveal frames in" (e.g. a neat request-then-response
+interleaving for display). `seq`
 does: a single counter per `(session, stream, script, script_version)` (no `direction`
 partition, unlike `id`), auto-assigned server-side in `appendFrames` from `newFrames`'
 own array order — no script-facing API, deliberately: the runtime already knows emission

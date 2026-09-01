@@ -53,6 +53,28 @@ function resolveValue(node, frameBytes) {
     }
 }
 
+// Hard cap on how many fmtAsHexdump lines (16 bytes each) a multi-line value ever renders
+// — a DOM-size guard against a pathologically large script-decoded field (e.g. a
+// decompressed body), not the compactness mechanism (that's the block's own CSS
+// max-height + scroll — see .dissect-node-hexdump). The full bytes stay reachable via the
+// context menu's own Copy as hexdump, which operates on `bytes` directly rather than this
+// truncated display text.
+const MAX_HEXDUMP_LINES = 512
+
+function HexdumpValue({ text, bytes, depth, clickable, onClick, onContextMenu }) {
+    const lines = text.split('\n')
+    const truncated = lines.length > MAX_HEXDUMP_LINES
+    const shown = truncated ? lines.slice(0, MAX_HEXDUMP_LINES).join('\n') : text
+    const moreBytes = truncated ? bytes.length - Math.min(bytes.length, MAX_HEXDUMP_LINES * 16) : 0
+    return html`
+        <div class=${'dissect-node-hexdump-wrap' + (clickable ? ' dissect-node-clickable' : '')}
+             style=${`padding-left: ${depth * 14 + 18}px`} onClick=${onClick} onContextMenu=${onContextMenu}>
+            <pre class="dissect-node-hexdump">${shown}</pre>
+            ${truncated && html`<div class="dissect-node-hexdump-more">… ${moreBytes} more bytes</div>`}
+        </div>
+    `
+}
+
 function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick, onFieldContextMenu }) {
     const [expanded, setExpanded] = useState(true)
     // A non-object array entry is a script bug — render inline rather than throw (see
@@ -65,6 +87,7 @@ function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick, onFieldC
     const hasSub = Array.isArray(node.sub) && node.sub.length > 0
     const highlightable = node.offset != null && node.length != null
     const { text, bytes } = resolveValue(node, frameBytes)
+    const multiline = text.includes('\n')
 
     function handleClick() {
         if (!highlightable) return
@@ -91,8 +114,12 @@ function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick, onFieldC
                     ? html`<span class="dissect-node-toggle" onClick=${e => { e.stopPropagation(); setExpanded(v => !v) }}>${expanded ? '▾' : '▸'}</span>`
                     : html`<span class="dissect-node-toggle-spacer" />`}
                 <span class="dissect-node-label">${node.label}</span>
-                ${text !== '' && html`<span class="dissect-node-value">${text}</span>`}
+                ${!multiline && text !== '' && html`<span class="dissect-node-value">${text}</span>`}
             </div>
+            ${multiline && html`
+                <${HexdumpValue} text=${text} bytes=${bytes} depth=${depth}
+                    clickable=${highlightable} onClick=${handleClick} onContextMenu=${handleContextMenu} />
+            `}
             ${hasSub && expanded && node.sub.map((child, i) => html`
                 <${FieldNode} key=${i} node=${child} depth=${depth + 1} frameOffset=${frameOffset} frameBytes=${frameBytes} onNodeClick=${onNodeClick} onFieldContextMenu=${onFieldContextMenu} />
             `)}

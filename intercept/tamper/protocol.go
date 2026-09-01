@@ -5,15 +5,16 @@ package tamper
 type msgType string
 
 const (
-	msgStreamCreated    msgType = "stream-created"    // control, unsolicited: a new stream appeared
-	msgStreamTerminated msgType = "stream-terminated" // control, unsolicited: a stream ended
-	msgHeld             msgType = "held"              // control, unsolicited: one new chunk was appended to a held buffer
-	msgStreamList       msgType = "stream-list"       // control, reply to "list-streams"
-	msgScriptUpdated    msgType = "script-updated"    // control, unsolicited: a script was written or deleted via REST
-	msgOk               msgType = "ok"                // control, reply acknowledging a command
-	msgError            msgType = "error"             // control or watch, reply to any failed command
-	msgPending          msgType = "pending"           // watch, reply to "peek"
-	msgPeekDone         msgType = "peek-done"         // watch, terminates a "peek" reply
+	msgStreamCreated       msgType = "stream-created"        // control, unsolicited: a new stream appeared
+	msgStreamTerminated    msgType = "stream-terminated"     // control, unsolicited: a stream ended
+	msgHeld                msgType = "held"                  // control, unsolicited: one new chunk was appended to a held buffer
+	msgStreamList          msgType = "stream-list"           // control, reply to "list-streams"
+	msgScriptUpdated       msgType = "script-updated"        // control, unsolicited: a script was written or deleted via REST
+	msgFramerScriptUpdated msgType = "framer-script-updated" // control, unsolicited: a framer script was written or deleted via REST
+	msgOk                  msgType = "ok"                    // control, reply acknowledging a command
+	msgError               msgType = "error"                 // control or watch, reply to any failed command
+	msgPending             msgType = "pending"               // watch, reply to "peek"
+	msgPeekDone            msgType = "peek-done"             // watch, terminates a "peek" reply
 )
 
 // cmdType is the "type" field of every message a client sends to the proxy (JSON
@@ -84,6 +85,13 @@ type streamListMsg struct {
 // REST API — Name alone is enough for a client to know what to re-pull or forget; whether
 // it still exists is a plain GET/list away, so no separate "deleted" flag is carried.
 type scriptUpdatedMsg struct {
+	Type msgType `json:"type"`
+	Name string  `json:"name"`
+}
+
+// framerScriptUpdatedMsg is scriptUpdatedMsg's counterpart for the separate framer-script
+// store — a distinct message type only because it comes from a distinct store.
+type framerScriptUpdatedMsg struct {
 	Type msgType `json:"type"`
 	Name string  `json:"name"`
 }

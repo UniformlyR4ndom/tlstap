@@ -1,5 +1,15 @@
 {
   "proxies": {
+    "ws-verify": {
+      "mode": "tls",
+      "listen": "127.0.0.1:8543",
+      "connect": "127.0.0.1:8544",
+      "server": "basic-server",
+      "client": "basic-client",
+      "interceptors": [
+        "dbdump"
+      ]
+    },
     "tcp-forwarder": {
       "mode": "plain",
       "listen": "127.0.0.1:8000",

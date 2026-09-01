@@ -24,3 +24,20 @@ export const DIRSTR_S2C = 's2c'
 export function dirToStr(direction) {
     return direction === DIRNUM_C2S ? DIRSTR_C2S : DIRSTR_S2C
 }
+
+// Encodes/decodes a /byte-ranges wire entry's direction+magnitude into/from the sign of
+// the wire format's single signedLength field — offset can legitimately be 0, so length's
+// sign is the only field that can safely carry direction (a valid range's length is
+// always non-zero). Mirrors the Go side's identically named helpers
+// (intercept/dbdump/byteranges.go) exactly. Unlike the Go side, no overflow guard is
+// needed here — JS numbers aren't int64 two's complement, and magnitude is always well
+// under 2^53 (128MB max, see intercept/dbdump/CLAUDE.md's "POST /byte-ranges" section).
+export function encodeSignedLength(direction, magnitude) {
+    return direction === DIRNUM_C2S ? -magnitude : magnitude
+}
+
+export function decodeSignedLength(signedLength) {
+    return signedLength < 0
+        ? { direction: DIRNUM_C2S, magnitude: -signedLength }
+        : { direction: DIRNUM_S2C, magnitude: signedLength }
+}

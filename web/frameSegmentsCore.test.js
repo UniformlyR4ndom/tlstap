@@ -1,25 +1,30 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-    initialWindowRange, selectByBudget, computeReachedEnd, wantRangeFor, rangesByDirection,
-    buildFrameWindow, extendRange, mergeExtendedWindow, excludeAlreadyLoaded,
+    initialWindowRange, selectByBudget, computeReachedEnd, wantRangeFor,
+    buildFrameWindow, virtualRangeToReal, extendRange, mergeExtendedWindow, excludeAlreadyLoaded,
 } from './frameSegmentsCore.js'
 import { fillToTarget, idsAtStid } from './byteBufferCore.js'
 
+// offset/length build a single-range frame's ranges — a frame's real range's own offset
+// is irrelevant to most of these functions (they address a frame purely in its own
+// virtual, 0-based space; see frameSegmentsCore.js's module comment), kept as a
+// convenience arg anyway so call sites reflecting a "real capture position" stay
+// self-documenting even where it isn't asserted on.
 function frame(stid, id, direction, offset, length, time) {
-    return { stid, id, direction, offset, length, time, meta: null }
+    return { stid, id, direction, ranges: [{ offset, length }], length, time, meta: null }
 }
 
 // ── initialWindowRange ──────────────────────────────────────────────────────────────
 
-test('initialWindowRange: forward anchors at the segment start', () => {
-    const f = frame(1, 0, 0, 100, 1000, 0)
-    assert.deepEqual(initialWindowRange(1, f, 300), { wantStart: 100, wantEnd: 400 })
+test('initialWindowRange: forward anchors at 0, the frame\'s own virtual start', () => {
+    const f = frame(1, 0, 0, 100, 1000, 0) // f's real range offset (100) is irrelevant here
+    assert.deepEqual(initialWindowRange(1, f, 300), { wantStart: 0, wantEnd: 300 })
 })
 
-test('initialWindowRange: backward anchors at the segment end', () => {
+test('initialWindowRange: backward anchors at f.length, the frame\'s own virtual end', () => {
     const f = frame(1, 0, 0, 100, 1000, 0)
-    assert.deepEqual(initialWindowRange(-1, f, 300), { wantStart: 800, wantEnd: 1100 })
+    assert.deepEqual(initialWindowRange(-1, f, 300), { wantStart: 700, wantEnd: 1000 })
 })
 
 // ── selectByBudget ───────────────────────────────────────────────────────────────────
@@ -110,11 +115,11 @@ test('computeReachedEnd: a full raw page means more may follow, even if filterin
     assert.equal(computeReachedEnd(frames, 2, frames, 2), false)
 })
 
-// ── wantRangeFor / rangesByDirection ────────────────────────────────────────────────
+// ── wantRangeFor ─────────────────────────────────────────────────────────────────────
 
-test('wantRangeFor: a whole (non-truncated) frame wants its full offset/length', () => {
+test('wantRangeFor: a whole (non-truncated) frame wants its full virtual [0, length)', () => {
     const f = frame(1, 0, 0, 50, 20, 0)
-    assert.deepEqual(wantRangeFor(f, [f], null), { wantStart: 50, wantEnd: 70 })
+    assert.deepEqual(wantRangeFor(f, [f], null), { wantStart: 0, wantEnd: 20 })
 })
 
 test('wantRangeFor: only included[0] can ever be affected by openRange', () => {
@@ -122,34 +127,69 @@ test('wantRangeFor: only included[0] can ever be affected by openRange', () => {
     const f1 = frame(2, 0, 0, 1000, 10, 0)
     const openRange = { wantStart: 0, wantEnd: 300 }
     assert.deepEqual(wantRangeFor(f0, [f0, f1], openRange), openRange)
-    assert.deepEqual(wantRangeFor(f1, [f0, f1], openRange), { wantStart: 1000, wantEnd: 1010 })
-})
-
-test('rangesByDirection: unions per-direction ranges across multiple frames, one entry per direction actually present', () => {
-    const f0 = frame(1, 0, 0, 0, 10, 0)   // direction 0: [0, 10)
-    const f1 = frame(2, 0, 1, 5, 10, 0)   // direction 1: [5, 15)
-    const f2 = frame(3, 0, 0, 20, 10, 0)  // direction 0: [20, 30) — extends direction 0's range
-    const ranges = rangesByDirection([f0, f1, f2], null)
-    assert.deepEqual(ranges, { 0: { from: 0, to: 30 }, 1: { from: 5, to: 15 } })
-})
-
-test('rangesByDirection: an openRange on included[0] contributes its truncated range, not the frame\'s full one', () => {
-    const huge = frame(1, 0, 0, 0, 1000, 0)
-    const openRange = { wantStart: 0, wantEnd: 300 }
-    const ranges = rangesByDirection([huge], openRange)
-    assert.deepEqual(ranges, { 0: { from: 0, to: 300 } })
+    assert.deepEqual(wantRangeFor(f1, [f0, f1], openRange), { wantStart: 0, wantEnd: 10 })
 })
 
 // ── buildFrameWindow ─────────────────────────────────────────────────────────────────
 
-test('buildFrameWindow: carries the segment\'s true offset/length regardless of the loaded sub-range', () => {
+test('buildFrameWindow: segment.offset is always 0 (virtual); real ranges/length carried separately', () => {
     const f = frame(1, 2, 0, 100, 1000, 5000)
     const bytes = new Uint8Array(50)
     const w = buildFrameWindow(f, 100, 150, bytes)
-    assert.deepEqual(w.segment, { stid: 1, id: 2, direction: 0, offset: 100, length: 1000, time: 5000, meta: null })
+    assert.deepEqual(w.segment, {
+        stid: 1, id: 2, direction: 0, offset: 0, length: 1000, time: 5000, meta: null,
+        virtualOffset: undefined, ranges: [{ offset: 100, length: 1000 }],
+    })
     assert.equal(w.loadedStart, 100)
     assert.equal(w.loadedEnd, 150)
     assert.equal(w.bytes, bytes)
+})
+
+test('buildFrameWindow: carries the frame\'s own virtualOffset onto the segment unchanged', () => {
+    const f = { ...frame(1, 2, 0, 100, 1000, 5000), virtualOffset: 250 }
+    const w = buildFrameWindow(f, 100, 150, new Uint8Array(50))
+    assert.equal(w.segment.virtualOffset, 250)
+})
+
+// ── virtualRangeToReal ───────────────────────────────────────────────────────────────
+
+test('virtualRangeToReal: single range, whole window, is one entry identical to a direct real request', () => {
+    const ranges = [{ offset: 100, length: 20 }]
+    assert.deepEqual(virtualRangeToReal(ranges, 0, 0, 20), [{ offset: 100, length: 20, direction: 0 }])
+})
+
+test('virtualRangeToReal: single range, partial window, offsets into that one range', () => {
+    const ranges = [{ offset: 100, length: 20 }]
+    assert.deepEqual(virtualRangeToReal(ranges, 1, 5, 12), [{ offset: 105, length: 7, direction: 1 }])
+})
+
+test('virtualRangeToReal: a window spanning two ranges emits one entry per range', () => {
+    const ranges = [{ offset: 100, length: 10 }, { offset: 500, length: 10 }]
+    // virtual [5, 15) covers the last 5 bytes of range 0 (virtual [0,10)) and the first 5
+    // of range 1 (virtual [10,20)).
+    assert.deepEqual(virtualRangeToReal(ranges, 0, 5, 15), [
+        { offset: 105, length: 5, direction: 0 },
+        { offset: 500, length: 5, direction: 0 },
+    ])
+})
+
+test('virtualRangeToReal: a window fully inside a non-first range skips earlier ranges entirely', () => {
+    const ranges = [{ offset: 100, length: 10 }, { offset: 500, length: 10 }]
+    assert.deepEqual(virtualRangeToReal(ranges, 0, 12, 18), [{ offset: 502, length: 6, direction: 0 }])
+})
+
+test('virtualRangeToReal: three ranges, a window spanning all of them', () => {
+    const ranges = [{ offset: 0, length: 4 }, { offset: 100, length: 4 }, { offset: 200, length: 4 }]
+    assert.deepEqual(virtualRangeToReal(ranges, 1, 0, 12), [
+        { offset: 0, length: 4, direction: 1 },
+        { offset: 100, length: 4, direction: 1 },
+        { offset: 200, length: 4, direction: 1 },
+    ])
+})
+
+test('virtualRangeToReal: an exact boundary window (ends precisely where a range ends) doesn\'t spill into the next', () => {
+    const ranges = [{ offset: 100, length: 10 }, { offset: 500, length: 10 }]
+    assert.deepEqual(virtualRangeToReal(ranges, 0, 0, 10), [{ offset: 100, length: 10, direction: 0 }])
 })
 
 // ── extendRange / mergeExtendedWindow ───────────────────────────────────────────────
@@ -212,9 +252,11 @@ test('excludeAlreadyLoaded: an empty or missing excludeIds is a no-op', () => {
 
 function fakeFrameFillForward(allFrames) {
     return async (handle, entity, { afterStid, resumeWindow, excludeIds, maxBytes, maxSegments }) => {
-        if (resumeWindow && resumeWindow.loadedEnd < resumeWindow.segment.offset + resumeWindow.segment.length) {
+        // segment.offset is always (virtually) 0 here — see buildFrameWindow — so a
+        // resumeWindow's own true end is just segment.length, not offset+length.
+        if (resumeWindow && resumeWindow.loadedEnd < resumeWindow.segment.length) {
             const seg = resumeWindow.segment
-            const loadedEnd = Math.min(seg.offset + seg.length, resumeWindow.loadedEnd + maxBytes)
+            const loadedEnd = Math.min(seg.length, resumeWindow.loadedEnd + maxBytes)
             return { windows: [{ segment: seg, loadedStart: resumeWindow.loadedStart, loadedEnd, bytes: new Uint8Array(loadedEnd - resumeWindow.loadedStart) }], reachedEnd: false }
         }
 
@@ -227,7 +269,7 @@ function fakeFrameFillForward(allFrames) {
         const reachedEnd = computeReachedEnd(frames, requestN, included, rawFrames.length)
         const windows = included.map(f => {
             const { wantStart, wantEnd } = wantRangeFor(f, included, openRange)
-            return { segment: f, loadedStart: wantStart, loadedEnd: wantEnd, bytes: new Uint8Array(wantEnd - wantStart) }
+            return { segment: { ...f, offset: 0 }, loadedStart: wantStart, loadedEnd: wantEnd, bytes: new Uint8Array(wantEnd - wantStart) }
         })
         return { windows, reachedEnd }
     }

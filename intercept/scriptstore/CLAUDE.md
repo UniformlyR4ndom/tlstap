@@ -28,10 +28,23 @@ concern for whatever loads scripts by name, not a storage-level one).
 - `New(dir)` creates `dir` (including any missing parents) if it doesn't already exist.
 
 **`RegisterRoutes(mux, basePath, store, onPut, onDelete)`** wires `GET {basePath}/scripts`,
-`GET/PUT/DELETE {basePath}/scripts/{name}`. `store == nil` (feature disabled for that
+`GET/PUT/DELETE {basePath}/scripts/{name}`. `GET .../{name}?hash=1` returns
+`{"sha256":"<hex>"}` (`Content-Type: application/json`) instead of the raw content —
+`crypto/sha256` over the exact same bytes `Get` would return, matching the "version" a
+framer/dissector run computes over identical content client-side (`framerRun.js`'s
+`sha256Hex`) and dbdump persists as `frames.script_version`/
+`frame_progress.script_version` (see `intercept/dbdump/CLAUDE.md`'s "Framer scripts"
+section). Lets a caller that already knows a script's name learn its current version
+directly — e.g. `tapctl`'s `script-get --hash`/`framer-script-get --hash` (tamper) and
+`script-get --hash`/`dissect-script-get --hash` (dbdump) — without fetching the content
+just to hash it itself, the only alternative before this existed (raw SQLite access to
+`frames.script_version`, or reimplementing the same sha256-over-fetched-content dance a
+browser client does). `store == nil` (feature disabled for that
 caller) makes every route respond `501` rather than silently defaulting to some implicit
-directory — the same convention `tamper`'s `fs-root` and other optional-feature REST
-surfaces in this codebase use. `onPut`/`onDelete` (either may be `nil`) fire with the
+directory — the same convention other optional-feature REST surfaces in this codebase
+use (`core/fs` is the one exception: it doesn't register its routes at all when
+unconfigured, so an unconfigured request there gets a plain `404` instead — see
+`core/CLAUDE.md`). `onPut`/`onDelete` (either may be `nil`) fire with the
 script's name after a successful `PUT`/`DELETE` — this is the one extension point, since
 what a caller wants to happen on a change is never this package's concern: tamper pushes
 a `script-updated` control-channel event from both; a future caller with no live-push

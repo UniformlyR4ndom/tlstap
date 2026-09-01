@@ -116,7 +116,7 @@ function frame(state, chunk) {
                     if (buf[i] !== PREFACE[i]) { matches = false; break }
                 }
                 if (matches) {
-                    frames.push({ offset: bufBaseOffset, length: PREFACE.length, meta: { kind: 'http2-preface' } })
+                    frames.push({ ranges: [{ offset: bufBaseOffset, length: PREFACE.length }], meta: { kind: 'http2-preface' } })
                     pos = PREFACE.length
                 }
                 // else: capture starts mid-connection (the real preface predates it) —
@@ -187,7 +187,7 @@ function frame(state, chunk) {
         // self-delimited by its own explicit length field, unlike (for example) an
         // HTTP/1 response relying on connection close.
 
-        frames.push({ offset: bufBaseOffset + pos, length: HEADER_LEN + length, meta })
+        frames.push({ ranges: [{ offset: bufBaseOffset + pos, length: HEADER_LEN + length }], meta })
         pos += HEADER_LEN + length
     }
 

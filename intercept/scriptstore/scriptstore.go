@@ -7,6 +7,8 @@
 package scriptstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -150,6 +152,19 @@ func RegisterRoutes(mux *http.ServeMux, basePath string, store *Store, onPut, on
 				return
 			}
 			writeErrorResponse(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// ?hash=1 returns the script's sha256 hex digest instead of its content — the
+		// same "version" a framer/dissector run computes over this same content
+		// client-side (framerRun.js's sha256Hex) and dbdump persists as
+		// frames.script_version/frame_progress.script_version — so a caller that already
+		// knows a script's name can learn its current version directly, rather than
+		// fetching the content just to hash it itself.
+		if r.URL.Query().Has("hash") {
+			sum := sha256.Sum256(content)
+			writeJSONResponse(w, struct {
+				Sha256 string `json:"sha256"`
+			}{hex.EncodeToString(sum[:])})
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript")

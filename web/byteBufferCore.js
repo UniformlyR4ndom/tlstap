@@ -6,7 +6,9 @@ import { fmtRelTime } from './format.js'
 // the same reason format.js/transforms/*.js are kept UI-framework-free.
 //
 // A "segment" is either a raw chunk or a framer-script frame — {stid, id, direction,
-// offset, length, time, meta?}, metadata only. A "SegmentWindow" is a segment plus
+// offset, length, time, meta?, virtualOffset?}, metadata only (virtualOffset is
+// frame-mode-only — see buildRows below and web/CLAUDE.md's "Global/local offset" note).
+// A "SegmentWindow" is a segment plus
 // however much of its own byte range is currently loaded: {segment, loadedStart,
 // loadedEnd, bytes}, where bytes covers [loadedStart, loadedEnd) ⊆ [segment.offset,
 // segment.offset + segment.length). For chunks this is always the whole segment; for
@@ -63,11 +65,12 @@ export function buildRows(windows, streamStart) {
         const localBase = loadedStart - segment.offset
         for (let off = 0; off < bytes.length; off += 16) {
             rows.push({
-                type:        'hex',
-                direction:   segment.direction,
-                bytes:       bytes.slice(off, off + 16),
-                offset:      loadedStart + off,
-                localOffset: localBase + off,
+                type:          'hex',
+                direction:     segment.direction,
+                bytes:         bytes.slice(off, off + 16),
+                offset:        loadedStart + off,
+                virtualOffset: segment.virtualOffset != null ? segment.virtualOffset + localBase + off : undefined,
+                localOffset:   localBase + off,
             })
         }
     }

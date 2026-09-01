@@ -1,6 +1,8 @@
 package scriptstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -215,6 +217,22 @@ func TestRegisterRoutesEndToEnd(t *testing.T) {
 	resp = httpDo(t, http.MethodGet, base, nil)
 	if body := string(readBody(t, resp)); !strings.Contains(body, `"foo"`) {
 		t.Fatalf("expected listing to contain foo, got %s", body)
+	}
+
+	// ?hash=1 returns the sha256 hex digest of the same content instead of the content
+	// itself — matches Go's sha256.Sum256 directly, i.e. the same value
+	// dbdump.onFramerScriptPut/framerRun.js's sha256Hex would compute over this content.
+	resp = httpDo(t, http.MethodGet, base+"/foo?hash=1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /scripts/foo?hash=1: expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json for ?hash=1, got %q", ct)
+	}
+	wantSum := sha256.Sum256([]byte("console.log(1)"))
+	wantHash := hex.EncodeToString(wantSum[:])
+	if body := strings.TrimSpace(string(readBody(t, resp))); body != `{"sha256":"`+wantHash+`"}` {
+		t.Fatalf("unexpected ?hash=1 body: %s", body)
 	}
 
 	resp = httpDo(t, http.MethodDelete, base+"/foo", nil)

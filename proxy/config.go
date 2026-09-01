@@ -17,11 +17,37 @@ type ConfigFile struct {
 
 	// Optional REST API server configuration.
 	Api *ApiConfig `json:"api"`
+
+	// Optional core services — utility APIs not tied to any one interceptor. See
+	// doc/design/core-kv-store.md.
+	Core *CoreConfig `json:"core"`
 }
 
 type ApiConfig struct {
 	// TCP address the API server listens on (e.g. "127.0.0.1:9090").
 	Listen string `json:"listen"`
+}
+
+type CoreConfig struct {
+	// Optional core key-value store. Absent disables the feature entirely, same
+	// convention as e.g. an interceptor's scripts-dir.
+	Kv *KvConfig `json:"kv"`
+
+	// Optional core filesystem store. Absent disables the feature entirely, same
+	// convention as Kv above.
+	Fs *FsConfig `json:"fs"`
+}
+
+type KvConfig struct {
+	// Path to the store's own SQLite file (created if it doesn't exist).
+	File string `json:"file"`
+}
+
+type FsConfig struct {
+	// Directory exposed for read/write/list access. Unlike Kv's File, this must already
+	// exist — it exposes a directory the operator chose (e.g. test fixtures), so a
+	// typo'd path fails startup loudly rather than silently creating one.
+	Dir string `json:"dir"`
 }
 
 type ProxyConfig struct {

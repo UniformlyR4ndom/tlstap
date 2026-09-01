@@ -22,6 +22,12 @@ const (
 	bufMaxSize   = 16 * 1024 * 1024 // 16 MB: hard cap; Intercept blocks until buffer is drained
 )
 
+// sqliteBusyTimeoutMs bounds how long a write waits for a lock held by another connection
+// on the same file (see the PRAGMA busy_timeout call in NewDbDumpInterceptor) rather than
+// failing immediately. Not shared with core/kv's own copy of this constant — the two
+// connections don't need matching values to behave correctly, just some reasonable one each.
+const sqliteBusyTimeoutMs = 5000
+
 const (
 	directionC2S = 0 // client -> server direction
 	directionS2C = 1 // server -> client direction
@@ -109,10 +115,10 @@ type pendingStream struct {
 //	sessions(id, start, config)
 //	stream(id, session, src, dst, start, end)
 //	chunks(id, stream, direction, offset, time, data)  PK: (stream, direction, id)
-//	frames(session, stream, direction, script, script_version, id, offset, length, meta, seq)
+//	frames(session, stream, direction, script, script_version, id, ranges, meta, seq, virtual_offset)
 //	  PK: (session, stream, direction, script, script_version, id)
 //	frame_progress(session, stream, script, script_version, processed_offset_c2s,
-//	  processed_offset_s2c, state, closed_c2s, closed_s2c)
+//	  processed_offset_s2c, virtual_length_c2s, virtual_length_s2c, state, closed_c2s, closed_s2c)
 //	  PK: (session, stream, script, script_version)
 //
 // Timestamps are milliseconds since the Unix epoch.
@@ -193,6 +199,13 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// Lets a write wait for a concurrent writer to finish instead of failing immediately —
+	// needed once a second, independent connection (e.g. core/kv's Store) can legitimately
+	// share this same file; see doc/design/core-kv-store.md's "Coexistence" section.
+	if _, err = db.Exec(fmt.Sprintf(`PRAGMA busy_timeout=%d`, sqliteBusyTimeoutMs)); err != nil {
+		return nil, err
+	}
+
 	if _, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS sessions (
 			id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +276,14 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// Backs /byte-ranges' and /byte-stid's offset-predicate queries — neither was
+	// index-backed before this (only the PK and idx_chunks_stid above existed).
+	if _, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_chunks_offset ON chunks (session, stream, direction, offset)
+	`); err != nil {
+		return nil, err
+	}
+
 	// Migrates the pre-combined-mode frame_progress shape (marked by its own now-gone
 	// direction column) by dropping both frames and frame_progress together, rather than
 	// altering either in place — frame data is a purgeable/regenerable cache (the same
@@ -284,6 +305,59 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		}
 	}
 
+	// Migrates the pre-ranges frames shape (marked by its own now-gone offset column) by
+	// dropping both frames and frame_progress together — same reasoning and same
+	// columnExists/DROP TABLE pattern as the frame_progress reshape above: frame data is a
+	// purgeable/regenerable cache, and leaving frame_progress's processed offsets nonzero
+	// while frames resets to empty would desync the two (a script would believe it already
+	// processed bytes it now has no persisted frames for, and never re-fetch them). Safe
+	// even if the migration above already dropped frames on this same run — columnExists
+	// on a now-missing table returns (false, nil), so this becomes a correct no-op rather
+	// than erroring on a second DROP.
+	oldRangesShape, err := columnExists(db, "frames", "offset")
+	if err != nil {
+		return nil, err
+	}
+	if oldRangesShape {
+		if _, err = db.Exec(`DROP TABLE frames`); err != nil {
+			return nil, err
+		}
+		if _, err = db.Exec(`DROP TABLE frame_progress`); err != nil {
+			return nil, err
+		}
+	}
+
+	// Migrates frames lacking the virtual_offset bookkeeping column (added alongside
+	// frame_progress's own matching virtual_length_c2s/virtual_length_s2c columns below) by
+	// dropping both frames and frame_progress together — same reasoning/pattern as the two
+	// migrations above: a frame's virtual_offset is a required, order-dependent per-direction
+	// running total computed incrementally at append time, not a value that can be sensibly
+	// backfilled for already-persisted frames, so leaving old rows un-numbered while newly
+	// appended frames resumed the count from a fresh 0 baseline would desync the two. Checking
+	// for the "ranges" column's presence first (rather than testing virtual_offset's absence
+	// alone) is what keeps this a no-op on a table that doesn't exist yet — columnExists
+	// returns false for a missing table either way, which would otherwise look identical to
+	// "table exists but predates this column." Safe even if either migration above already
+	// dropped frames on this same run, for the same reason those are safe to run back to back.
+	hasRangesShape, err := columnExists(db, "frames", "ranges")
+	if err != nil {
+		return nil, err
+	}
+	if hasRangesShape {
+		hasVirtualOffset, err := columnExists(db, "frames", "virtual_offset")
+		if err != nil {
+			return nil, err
+		}
+		if !hasVirtualOffset {
+			if _, err = db.Exec(`DROP TABLE frames`); err != nil {
+				return nil, err
+			}
+			if _, err = db.Exec(`DROP TABLE frame_progress`); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// The PK's own btree is already ordered (session, stream, direction, script,
 	// script_version, id), which is exactly the per-direction access pattern
 	// listFrames/appendFrames need (equality filter on the first five columns, ordered
@@ -297,8 +371,7 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 			script         TEXT    NOT NULL,
 			script_version TEXT    NOT NULL,
 			id             INTEGER NOT NULL,
-			offset         INTEGER NOT NULL,
-			length         INTEGER NOT NULL,
+			ranges         TEXT    NOT NULL,
 			meta           TEXT,
 			PRIMARY KEY (session, stream, direction, script, script_version, id)
 		)
@@ -339,6 +412,17 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		return nil, err
 	}
 
+	// virtual_offset added the same way, for the per-direction virtual byte offset: the
+	// position a frame would start at if every frame emitted so far on its own direction
+	// (in the same per-direction id/seq order — see appendFrames) were concatenated with
+	// none missing and none overlapping, regardless of the frame's own real byte position.
+	// Unlike stid/time above, this has no real chunk to inherit from — it's computed purely
+	// from prior frames' own ranges, via frame_progress's virtual_length_c2s/
+	// virtual_length_s2c running totals below.
+	if err = ensureColumn(db, "frames", "virtual_offset", "INTEGER"); err != nil {
+		return nil, err
+	}
+
 	// Backs listFramesTimeline's cross-direction query (session/stream/script/version
 	// filter, ordered by stid then id) — the frames table has no direction-less index
 	// otherwise, since every other access pattern here filters by direction too.
@@ -369,6 +453,8 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 			script_version        TEXT    NOT NULL,
 			processed_offset_c2s  INTEGER NOT NULL DEFAULT 0,
 			processed_offset_s2c  INTEGER NOT NULL DEFAULT 0,
+			virtual_length_c2s    INTEGER NOT NULL DEFAULT 0,
+			virtual_length_s2c    INTEGER NOT NULL DEFAULT 0,
 			state                 BLOB,
 			closed_c2s            INTEGER NOT NULL DEFAULT 0,
 			closed_s2c            INTEGER NOT NULL DEFAULT 0,

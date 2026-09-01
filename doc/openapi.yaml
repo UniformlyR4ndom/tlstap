@@ -55,6 +55,19 @@ tags:
       Storage for scripts driving programmatic tamper interception. Execution is
       client-side only (a browser Web Worker via the "Scripts" sub-tab of the Tamper
       view) — these endpoints are just the REST CRUD backing that store.
+  - name: tamper-framer
+    description: >-
+      Storage for tamper's own framer scripts — `frame(state, chunk)` scripts
+      that reassemble live traffic into frames for a second, independently-
+      selected interception script's `onFrame` hook to react to, so that
+      script sees whole logical units instead of raw chunk boundaries. A
+      separate store/namespace from both `scripts` above (tamper's
+      interception scripts) and `framer` below (dbdump's own framer scripts,
+      a different feature) — same name in more than one store is not a
+      collision. Execution is entirely client-side (a browser Web Worker via
+      the "Framer Scripts" sub-tab of the Tamper view); no persisted output,
+      unlike dbdump's equivalent. See doc/design/tamper-framer.md and
+      intercept/tamper/CLAUDE.md's "Script storage" section.
   - name: framer
     description: >-
       Storage for framer scripts (reassemble a stream's raw chunks into logical
@@ -74,9 +87,10 @@ tags:
       for the wider design.
   - name: fs
     description: >-
-      Scoped read/write/list access to one host directory (`fs-root`), for a
-      running script to read fixtures or persist artifacts. See CLAUDE.md's
-      "Filesystem access" section.
+      Scoped read/write/list access to one host directory (`core.fs`), for a
+      running script to read fixtures or persist artifacts. A core service,
+      independent of any interceptor — not tamper-specific; backs `fs.*` on
+      every script runtime (`framer`, `dissector`, `tamper`). See core/CLAUDE.md.
   - name: ui
     description: Embedded web frontend
 
@@ -506,11 +520,180 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
 
+  /api/i/dbdump/byte-ranges:
+    post:
+      tags: [chunks]
+      summary: Fetch arbitrary byte ranges for one stream, both directions in one call
+      description: |
+        A dumb, frame-unaware byte-range fetcher — the groundwork for a later
+        phase letting a single frame span multiple non-contiguous byte ranges
+        (not yet implemented). Given a batch of `(offset, length)` pairs, each
+        tagged with a direction, returns exactly those bytes, each resolved
+        **fully independently — deliberately no deduplication or overlap
+        merging**: two entries may reference identical or overlapping physical
+        bytes, and each is fetched and returned separately.
+
+        `session`/`stream` are URL query parameters rather than part of the
+        body, since the request body must be pure binary (no JSON envelope to
+        carry them in).
+
+        **Request body** (`application/octet-stream`): a flat sequence of
+        16-byte entries, each two big-endian `int64`s — `(offset,
+        signedLength)`. The number of entries is `len(body) / 16`; the body
+        length must be an exact multiple of 16.
+
+        `signedLength`'s **sign encodes direction** — negative means
+        client→server, positive means server→client — rather than a separate
+        direction field. This works because a valid range's length is always
+        non-zero, while `offset` can legitimately be `0` (the very first byte
+        of a stream), so length is the only field whose sign is always
+        available to carry this.
+
+        The **entire request is rejected** (`400`, nothing fetched) if any of
+        the following holds:
+        - the body length is not an exact multiple of 16
+        - any entry's `offset` is negative
+        - any entry's `signedLength` is exactly `0`
+        - any entry's magnitude (`abs(signedLength)`) still has its sign bit
+          set after negation — the only way to detect a two's-complement
+          overflow on the minimum representable `int64`
+        - any entry's magnitude exceeds 128 MB (single-range bound)
+        - the number of entries exceeds 1024 (entry-count bound)
+        - the sum of every entry's magnitude exceeds 128 MB (total-size bound)
+
+        These bounds are deliberately generous relative to normal client
+        usage — they exist to catch malformed/rogue requests, not to
+        constrain ordinary operation.
+
+        An unknown `session`/`stream` is a separate error class (`404`),
+        checked only once the body itself has validated.
+
+        **Response body** (`application/octet-stream`, streamed): for each
+        request entry, in the same order, one response entry — an 8-byte
+        big-endian `int64` length prefix followed by that many bytes.
+
+        **The returned length may be less than the requested magnitude — this
+        is never an error.** It's the only signal that not all of the
+        requested bytes are currently available, whether because a still-live
+        stream hasn't flushed that far yet or because the requested range
+        genuinely extends past the end of a closed stream. A returned length
+        of exactly `0` is a normal, valid outcome. Every entry is resolved
+        independently of every other entry in the same request — a short or
+        zero-length read on one has no effect on any other.
+      operationId: byteRanges
+      parameters:
+        - name: session
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: Session ID
+        - name: stream
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: Stream ID
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Length-prefixed byte ranges, one per request entry, in order
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No stream with the given session/stream id exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/i/dbdump/chunks/timeline:
+    post:
+      tags: [chunks]
+      summary: List raw chunks for a stream across *both* directions, merged by stid
+      description: |
+        The raw-chunk counterpart to `/frames/timeline` — same shape and
+        scan-direction convention (see that endpoint's own description for the
+        full rationale), minus any script key, since chunks have none.
+
+        Unlike `/frames/timeline`, chunk `stid` values are never tied (two
+        different chunks, from either direction, never share a `stid`), so no
+        group-boundary-safe pagination logic is needed here — a plain page cut
+        is always safe.
+
+        Deliberately performs **no server-side budget selection** (unlike the
+        superseded `/segments` this replaces) — this is a plain candidate
+        listing; the caller decides how many of the returned candidates to
+        actually use.
+      operationId: listChunksTimeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, n]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                start:
+                  type: integer
+                  format: int64
+                  description: First stid to return (inclusive) — forward scan
+                beforeStid:
+                  type: integer
+                  format: int64
+                  description: Scan backward for chunks with stid strictly less than this value
+                n:
+                  type: integer
+                  description: Maximum number of chunks to return; 0 or negative means unlimited
+      responses:
+        '200':
+          description: >-
+            Chunks with stid >= start (forward) or stid < beforeStid
+            (backward), always ordered ascending by stid
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Chunk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/i/dbdump/segments:
     get:
       tags: [chunks]
-      summary: Fetch a budgeted run of raw chunks ("segments") in stid order, forward or backward
+      summary: >-
+        Fetch a budgeted run of raw chunks ("segments") in stid order, forward
+        or backward — superseded by `/byte-ranges` + `/chunks/timeline` above
+        (2026-08-25); kept for reference until removed
       description: |
+        **Superseded — `chunkSegments.js`/`frameSegments.js` (`web/`) no
+        longer use this endpoint; kept until removed pending manual browser
+        verification of its replacement.**
+
         Upgrades the connection to WebSocket (`Upgrade: websocket`). Answers
         one request with exactly one response (one metadata text frame
         immediately followed by one binary frame) — unlike `stid-stream`,
@@ -1522,17 +1705,108 @@ paths:
         '501':
           $ref: '#/components/responses/NotImplemented'
 
-  /api/i/tamper/fs/list:
+  /api/i/tamper/framer/scripts:
+    get:
+      tags: [tamper-framer]
+      summary: List stored framer scripts
+      description: |
+        A separate store/namespace from `/api/i/tamper/scripts` above — same
+        name in both is not a collision. Metadata only, no script bodies, so
+        listing stays cheap. Returns `501` if the `tamper` interceptor wasn't
+        configured with `framer-scripts-dir`.
+      operationId: listFramerScripts
+      responses:
+        '200':
+          description: All stored framer scripts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScriptInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/i/tamper/framer/scripts/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_-][A-Za-z0-9_. -]*[A-Za-z0-9_-]$|^[A-Za-z0-9_-]$'
+        description: |
+          Script name, without the `.js` extension. Letters, digits, `_`, `-`,
+          `.`, and spaces only; must not start/end with `.` or a space, and
+          must not be exactly `.` or `..`.
+    get:
+      tags: [tamper-framer]
+      summary: Fetch a framer script's content
+      operationId: getFramerScript
+      responses:
+        '200':
+          description: Raw script source
+          content:
+            application/javascript:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      tags: [tamper-framer]
+      summary: Create or overwrite a framer script
+      description: |
+        Writes the request body verbatim as `<name>.js` (atomically — never
+        observable as a partial write) and pushes a `framer-script-updated`
+        event on the control WebSocket so a connected browser can react
+        without polling.
+      operationId: putFramerScript
+      requestBody:
+        required: true
+        content:
+          application/javascript:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Script written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [tamper-framer]
+      summary: Delete a framer script
+      description: Also pushes a `framer-script-updated` event on the control WebSocket.
+      operationId: deleteFramerScript
+      responses:
+        '204':
+          description: Script deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/core/fs/list:
     get:
       tags: [fs]
-      summary: List fs-root's top-level contents
+      summary: List core.fs's configured root directory
       description: |
-        Equivalent to `GET /fs/list/{path}` with an empty path — lists
-        `fs-root` itself, via the same handler (so the same `400`/`404` failure
-        modes apply, e.g. if `fs-root` is removed or becomes unreadable after
-        startup). One directory level, not recursive (a `dir: true` entry is
-        listed again by requesting that path). Returns `501` if the `tamper`
-        interceptor wasn't configured with `fs-root`.
+        Equivalent to `GET /api/core/fs/list/{path}` with an empty path —
+        lists the configured root itself, via the same handler (so the same
+        `400`/`404` failure modes apply, e.g. if the directory is removed or
+        becomes unreadable after startup). One directory level, not recursive
+        (a `dir: true` entry is listed again by requesting that path). This
+        whole path only exists at all if `core.fs` is configured — otherwise
+        there is no route registered for it (a plain `404`, not `501`).
       operationId: listFsRoot
       responses:
         '200':
@@ -1547,10 +1821,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '501':
-          $ref: '#/components/responses/NotImplemented'
 
-  /api/i/tamper/fs/list/{path}:
+  /api/core/fs/list/{path}:
     parameters:
       - name: path
         in: path
@@ -1558,11 +1830,11 @@ paths:
         schema:
           type: string
         description: >-
-          Path of a subdirectory relative to `fs-root`. May itself contain
-          further `/`-separated segments (each percent-encoded individually
-          by clients, not the path as a whole); resolved and
-          containment-checked server-side — see CLAUDE.md's "Filesystem
-          access" section.
+          Path of a subdirectory relative to core.fs's configured root. May
+          itself contain further `/`-separated segments (each
+          percent-encoded individually by clients, not the path as a whole);
+          resolved and containment-checked server-side — see core/CLAUDE.md's
+          "core/fs" section.
     get:
       tags: [fs]
       summary: List a subdirectory's contents
@@ -1581,10 +1853,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '501':
-          $ref: '#/components/responses/NotImplemented'
 
-  /api/i/tamper/fs/file/{path}:
+  /api/core/fs/file/{path}:
     parameters:
       - name: path
         in: path
@@ -1592,10 +1862,10 @@ paths:
         schema:
           type: string
         description: >-
-          Path of a file relative to `fs-root`. May itself contain further
-          `/`-separated subdirectory segments (each percent-encoded
-          individually by clients); resolved and containment-checked
-          server-side.
+          Path of a file relative to core.fs's configured root. May itself
+          contain further `/`-separated subdirectory segments (each
+          percent-encoded individually by clients); resolved and
+          containment-checked server-side.
     get:
       tags: [fs]
       summary: Read a file's content
@@ -1612,15 +1882,13 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '501':
-          $ref: '#/components/responses/NotImplemented'
     put:
       tags: [fs]
       summary: Create or overwrite a file
       description: >-
         Writes the request body verbatim (atomically — never observable as a
-        partial write). Missing parent directories under `fs-root` are
-        created automatically.
+        partial write). Missing parent directories under the configured root
+        are created automatically.
       operationId: putFsFile
       requestBody:
         required: true
@@ -1634,18 +1902,16 @@ paths:
           description: File written
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          $ref: '#/components/responses/NotImplemented'
     post:
       tags: [fs]
       summary: Append to a file
       description: >-
         Appends the request body verbatim, creating the file (and any missing
-        parent directories under `fs-root`) if it doesn't exist yet. `POST`,
-        not `PUT`, because appending isn't idempotent — repeating the request
-        appends again, unlike `PUT`'s overwrite. Safe under concurrent
-        appends to the same file (opened with `O_APPEND`; see CLAUDE.md's
-        "Filesystem access" section).
+        parent directories under the configured root) if it doesn't exist
+        yet. `POST`, not `PUT`, because appending isn't idempotent —
+        repeating the request appends again, unlike `PUT`'s overwrite. Safe
+        under concurrent appends to the same file (opened with `O_APPEND`;
+        see core/CLAUDE.md's "core/fs" section).
       operationId: appendFsFile
       requestBody:
         required: true
@@ -1659,8 +1925,6 @@ paths:
           description: Content appended
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          $ref: '#/components/responses/NotImplemented'
 
   /ui:
     get:
@@ -1986,21 +2250,34 @@ components:
             to the script; false if framing hasn't started or s2c hasn't
             closed yet
 
+    FrameRange:
+      type: object
+      required: [offset, length]
+      properties:
+        offset:
+          type: integer
+          format: int64
+          description: Byte offset of this range's first byte within the direction stream
+        length:
+          type: integer
+          format: int64
+
     Frame:
       type: object
-      required: [id, offset, length, direction, stid, time, seq]
+      required: [id, ranges, direction, stid, time, seq, virtual_offset]
       properties:
         id:
           type: integer
           format: int64
           description: Sequential id, 0-based, assigned server-side, per direction
-        offset:
-          type: integer
-          format: int64
-          description: Byte offset of the frame's first byte within the direction stream
-        length:
-          type: integer
-          format: int64
+        ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/FrameRange'
+          description: >-
+            Ordered list of byte ranges making up this frame's span within the
+            direction stream. A frame's logical length is the sum of each
+            range's own length; there is no separate stored/derived total.
         meta:
           type: string
           description: >-
@@ -2039,10 +2316,24 @@ components:
             assigned and how it can differ from `stid` order. Unique per
             (session, stream, script, script_version), across both
             directions.
+        virtual_offset:
+          type: integer
+          format: int64
+          description: >-
+            The position this frame would start at if every frame emitted so
+            far *on its own direction* — in per-direction emission order,
+            provably identical to per-direction `id` order — were concatenated
+            with none missing and none overlapping. A plain running total
+            (`sum(ranges[].length)` per frame, not the length of any
+            merged/deduplicated span), independent per direction, and
+            independent of `stid`/real byte offsets: a frame's real position
+            can technically overlap another's or leave a gap, and a script
+            deferring emission of an already-parsed frame can make this order
+            diverge from `stid` order, the same way `seq` already can.
 
     FrameInput:
       type: object
-      required: [offset, length, stid, time]
+      required: [ranges, stid, time]
       properties:
         direction:
           $ref: '#/components/schemas/Direction'
@@ -2051,12 +2342,11 @@ components:
             `/frames/append` batch can mix frames from either direction, so
             each entry carries its own rather than inheriting one from the
             request's key (`FrameTimelineKey` has no `direction` to inherit)
-        offset:
-          type: integer
-          format: int64
-        length:
-          type: integer
-          format: int64
+        ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/FrameRange'
+          description: See Frame's own `ranges` field
         meta:
           type: string
           description: Opaque free-form data to attach to this frame; omit/null for none
@@ -2073,6 +2363,36 @@ components:
           description: >-
             The time of that same completing chunk — see Frame's own `time`
             field
+
+    Chunk:
+      type: object
+      required: [id, direction, stid, time, offset, length]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Sequential id, 0-based, assigned server-side, per direction
+        direction:
+          $ref: '#/components/schemas/Direction'
+        stid:
+          type: integer
+          format: int64
+          description: >-
+            Stream-local, direction-agnostic chunk index — always unique per
+            row (unlike Frame's own `stid`, which can tie), the ordering key
+            `/chunks/timeline` sorts by
+        time:
+          type: integer
+          format: int64
+          description: Capture timestamp in milliseconds since Unix epoch
+        offset:
+          type: integer
+          format: int64
+          description: Byte offset of this chunk's first byte within its direction stream
+        length:
+          type: integer
+          format: int64
+          description: This chunk's own byte count
 
   responses:
 

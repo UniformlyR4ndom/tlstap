@@ -195,35 +195,46 @@ decision, not receive it pre-computed.
 
 ### Chunk-mode adapter
 
-`fillForward`/`fillBackward` map directly onto the `/segments` wire endpoint (see below) —
-metadata and bytes arrive together in one exchange, so every returned `SegmentWindow` is
-already fully loaded; `resumeWindow` is realistically never non-null here (a chunk can't
-exceed `WINDOW_STEP` by enough to matter... actually it can, up to 64KB > 32KB — see wire
-protocol note below on truncation applying to chunks too, not just frames).
+**Updated 2026-08-25 — see "Wire protocol" below.** `fillForward`/`fillBackward` (see
+`web/chunkSegments.js`) list metadata via `/chunks/timeline`, apply `selectByBudget`
+(`frameSegmentsCore.js` — the same function frame mode uses, no second copy of the budget
+discipline) client-side, then fetch each selected chunk's own `(offset, length)` via
+`/byte-ranges`. Every returned `SegmentWindow` is still always fully loaded — a chunk
+row's `data` is written as one complete, immutable blob, so requesting its own declared
+range can never come back short — but `resumeWindow`/`excludeIds` are now genuinely
+unused (dropped from the adapter's destructured params entirely), not just realistically
+unreachable: chunks never tie on `stid`, so there's nothing for either to do.
 
 ### Frame-mode adapter
 
-- Metadata: still a separate, cheap call — `/frames/timeline`, unchanged shape, already
-  bytes-free. Walk the returned array accumulating `length` to find the same
-  `maxBytes`/`maxSegments` cutoff, entirely client-side (no server change needed here;
-  metadata is small regardless of segment count).
-- Bytes: fetched via the *same* `/segments` endpoint chunk-mode uses (this endpoint has
-  no frame-awareness at all — it only ever serves raw chunks). The frame adapter computes
-  the combined offset range needed per direction for the frames it decided to open this
-  round, fetches it via one `/segments` request (batched exactly like today's
-  `frameFetchPage` batches its per-direction `fetchDirectionChunks` calls), then slices
-  each frame's own bytes out of the one returned blob — the same arithmetic
-  `sliceFrameBytes` does today, just against one buffer instead of an array of chunk
-  objects.
-- `resumeWindow` for frame mode is the real case this whole rework exists for: extending
-  a still-partially-loaded giant frame by one more `/segments`-backed byte range each
-  round.
+**Updated 2026-08-25 — see "Wire protocol" below.** Metadata is unchanged: a separate,
+cheap `/frames/timeline` call, bytes-free, walked via `selectByBudget` client-side exactly
+as before. Bytes now come from `/byte-ranges` directly — each frame's own `(offset,
+length)` (or the truncated `openRange` for an oversized first candidate) is requested as
+its own entry, with **no offset→stid resolution and no covering-whole-chunk over-fetch**:
+`sliceFrameBytes`/`fetchDirectionRange`/`getByteStid` are gone from `frameSegments.js`
+entirely, since a byte-range fetch can now name an arbitrary span itself. `resumeWindow`
+extension (`extendResumeWindow`) works the same way, just requesting its extension range
+directly instead of over-fetching covering chunks first.
 - Once `resumeWindow`'s own segment finishes loading, `fillForward`/`fillBackward` requery
   `/frames/timeline` **inclusive** of its stid (not the usual "+1"/exclusive cursor) and
   filter out exactly that one already-loaded `(stid, id)` from the result — this is what
   lets a tied-stid sibling (a second, smaller frame completing on the same raw chunk as a
   first, oversized one) still be found instead of silently skipped; see "Known gaps fixed
   after the fact" below.
+
+**Updated again 2026-08 — `frames.ranges` reshape.** The `/frames*` wire shape now
+carries a frame's span as `ranges: [{offset, length}]` (an ordered list) instead of a
+single `offset`/`length` pair — see `intercept/dbdump/CLAUDE.md`'s schema notes for the
+full rationale/migration. This adapter (and `frameSegmentsCore.js`'s `initialWindowRange`/
+`wantRangeFor`/`buildFrameWindow`/`extendRange`/`selectByBudget`) still consume a
+single-range-shaped frame object this phase, via a temporary decode-layer shim
+(`dbdumpFramerApi.js`'s `decodeFrame`) that derives `offset`/`length` from `ranges` —
+behaviorally identical to before, since every framer script still emits exactly one range
+per frame. Making this adapter's own logic genuinely walk/split across a multi-range
+`ranges` array (the actual point of the reshape — letting a `SegmentWindow`'s loaded
+range be a virtual sub-range into the concatenation of a frame's own ranges) is deferred
+to a later, separate phase.
 
 ## Hook contract
 
@@ -245,62 +256,45 @@ unaffected. Worst-case buffer size under the new caps (~256KB / 16B-per-row ≈ 
 case (100 chunks × 64KB ≈ 400K rows), so no regression expected — if anything, an
 improvement.
 
-## Wire protocol: `/segments`
+## Wire protocol: `/byte-ranges` + `/chunks/timeline` (superseded `/segments`)
 
-Replaces `/stid-stream`'s per-chunk streaming (one text+binary frame pair per chunk, plus
-a `done` signal) with one request → one response pair (one text+binary frame pair for the
-*whole* batch). Renamed from `/stid-stream` since it's no longer streaming and now speaks
-in the unified "segment" vocabulary — plain `/segments`, matching the existing bare-noun
-endpoint naming convention (`/frames`, `/chunklist`, `/streams`), not `/segments-fill`.
+**Updated 2026-08-25.** The original design below (`/segments`, kept for historical
+context) bundled metadata listing and byte fetching into one WebSocket endpoint, with the
+server itself performing budget selection ("checked only between whole chunks") for chunk
+mode specifically — a second, Go-side copy of the exact selection discipline
+`selectByBudget` already implemented in JS for frame mode. It also gave frame mode no way
+to fetch an arbitrary byte span directly: `frameSegments.js` had to resolve a frame's
+`offset` to a covering `stid` range, over-fetch every whole raw chunk spanning it via
+`/segments`, then slice the exact bytes out client-side (`sliceFrameBytes`).
 
-**Request:** exactly one of `afterStid` / `beforeStid` must be present — that's how the
-client indicates scan direction; the server responds `400` if both or neither are given.
-No separate `direction` field (see the adapter contract note above on why that name is
-avoided here).
-```json
-{"session":N, "stream":N, "afterStid":N,  "maxSegments":N, "maxBytes":N}
-{"session":N, "stream":N, "beforeStid":N, "maxSegments":N, "maxBytes":N}
-```
+`/segments` is retired in favor of two REST endpoints that separate these concerns
+cleanly and serve both adapters uniformly:
 
-**Response — one exchange, two frames (not two round trips):**
-1. Text: `{"segments":[{"stid":N,"segmentId":N,"direction":N,"time":N,"offset":N,"length":N}, ...], "reachedEnd":bool}`
-2. Binary: each listed segment's own bytes, concatenated in array order.
+- **`POST /byte-ranges`** — a dumb, frame-unaware byte-range fetcher: given a batch of
+  `(offset, length, direction)` triples for one `(session, stream)`, returns exactly those
+  bytes, each independently (no dedup, no merge — two entries may legitimately reference
+  overlapping or identical physical bytes, resolved separately). A short/zero-length
+  result signals "not currently available" (a still-live stream not yet flushed that far,
+  or the genuine end of a closed one) — never an error. This is what lets `frameSegments.js`
+  drop `sliceFrameBytes`/`fetchDirectionRange`/`getByteStid` entirely: a frame's own
+  `(offset, length)` is requested directly, no stid resolution or over-fetch needed.
+- **`POST /chunks/timeline`** — a plain, budget-free metadata listing for raw chunks,
+  mirroring `/frames/timeline`'s shape exactly (forward via `start`, backward via
+  `beforeStid`, always returned ascending). No `n+1`-lookahead/tied-group logic, unlike
+  `/frames/timeline` — `chunks.stid` is never tied. `chunkSegments.js` now applies
+  `selectByBudget` client-side, the same function frame mode already used, eliminating the
+  server-side "checked only between whole chunks" logic that used to live only in the old
+  `/segments` Go handler.
 
-`length` on each entry is that segment's own byte count, **not cumulative** — the client
-reconstructs each segment's slice from the blob with one linear pass accumulating `length`
-in array order. Backward requests (`beforeStid`) still return the array in ascending
-`stid` order, even though the server selects the set by walking `stid DESC` internally, so
-client-side consumption never special-cases direction.
-
-**Why a bare `stid` cursor is still safe, despite frames' ties.** `/segments` itself never
-returns frames — only raw chunks, whose `stid` is unique by construction, so no tie-break
-concern arises at this endpoint at all. The tie concern only exists for frame *metadata*
-(`/frames/timeline`, untouched by this rework), which already handles it: it guarantees a
-returned page never splits a tied-`stid` group (fetches `n+1` and re-queries the boundary
-`stid` fresh if the natural cutoff would land mid-group — see
-`intercept/dbdump/CLAUDE.md`'s "Cross-direction interleaving"). So "everything after `stid`
-X" is unambiguous there too, even though X's group may have more than one member — a prior
-page either returned all of it or none of it.
-
-**Backend note — real server-side backward support, not client approximation.** Today's
-backward scroll (`handleScrollEnd`'s `-1` branch) approximates "N chunks before X" via
-`start = max(0, prevId - BATCH)` then fetching *forward* from there — a count-based guess
-that only worked because `BATCH` made chunk count and byte count roughly interchangeable.
-That breaks under a real byte budget (a run of maximal 64KB chunks vs. a run of tiny ones
-needs wildly different stid spans for the same `maxBytes`), so `beforeStid` needs the
-server to walk `ORDER BY stid DESC`, accumulate until either cap is hit, then return the
-result re-sorted ascending — a real, symmetric addition to the `/segments` handler, agreed
-as in-scope (this is a new API; new functionality that serves a real purpose is fine).
-
-**`/segments` never truncates a chunk — it only stops *between* whole chunks.** Both
-`maxSegments` and `maxBytes` are checked after adding each whole chunk, so a single
-maximal chunk (up to 64KB) can push a response slightly past a 32KB `maxBytes` budget —
-the same bounded overshoot `fetchDirectionChunks` already accepts today for `toOffset`
-("chunks up to, and possibly slightly past if `toOffset` lands mid-chunk"). This is a
-non-issue precisely because a chunk's size is capped at 64KB; a *frame* has no such bound,
-which is why capping how much of a still-open huge frame to ask for on any given round is
-the frame adapter's job (computing a smaller target byte range itself), not something
-`/segments` needs to support server-side.
+Full wire format (bounds, the sign-encodes-direction trick used to pack `/byte-ranges`'
+binary request without a separate JSON header, error semantics) is documented in
+`intercept/dbdump/CLAUDE.md`'s "POST `/byte-ranges`" and "POST `/chunks/timeline`"
+sections — this doc doesn't duplicate it. The core design constraints this section used to
+argue for (real server-side backward support via `ORDER BY stid DESC`, never truncating a
+single chunk mid-record, a bare `stid` cursor being safe because chunks never tie) all
+still hold under the new endpoints — `/chunks/timeline`'s backward walk and per-item
+integrity work the same way `/segments`' did, just without the byte-budget enforcement
+(now client-side) or the bundled bytes (now a separate `/byte-ranges` call).
 
 ## Migration plan
 
@@ -332,6 +326,13 @@ without touching the working raw-chunk path first:
 5. Delete the old path (`useChunkBuffer.js`'s internals or the whole file depending on
    step 4's outcome, `frameFetchPage`/`frameBuildRows`/`frameGetId`, `sliceFrameBytes`)
    once nothing references it.
+6. **Done (2026-08-25).** Replaced `/segments` with `/byte-ranges` + `/chunks/timeline` —
+   see "Wire protocol" above. Groundwork for a later, separate phase letting a single
+   frame span multiple non-contiguous byte ranges (a frame currently must be one
+   contiguous `[offset, length)` — the new endpoints are shaped to need no further backend
+   change once that lands). `/segments`/`segments.go`/`segments_test.go` and
+   `openSegmentsStream`/`splitSegments` (`api.js`) are removed once manual verification
+   confirms parity with the old path — not yet deleted as of this note.
 
 ## Known gaps fixed after the fact
 

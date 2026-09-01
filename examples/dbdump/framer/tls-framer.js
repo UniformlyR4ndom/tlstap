@@ -51,8 +51,7 @@ function frame(state, chunk) {
         if (buf.length - pos < HEADER_LEN + length) break // record not fully arrived yet
 
         frames.push({
-            offset: bufBaseOffset + pos,
-            length: HEADER_LEN + length,
+            ranges: [{ offset: bufBaseOffset + pos, length: HEADER_LEN + length }],
             meta: {
                 type,
                 typeName: CONTENT_TYPES[type] ?? `unknown(${type})`,

@@ -307,9 +307,15 @@ function ChunkHeader({ row, sizeFormat, pinned, selected, onClick }) {
 }
 
 function HexRow({ row, globalOffset, sel, highlightRange, markedC2S, markedS2C }) {
-    const { bytes, offset, localOffset, direction } = row
+    const { bytes, offset, localOffset, virtualOffset, direction } = row
     const dir      = dirClass(direction)
-    const offStr   = (globalOffset ? offset : localOffset).toString(16).padStart(8, '0')
+    // virtualOffset (frame mode only — see byteBufferCore.js's buildRows) replaces the
+    // real stream offset in the gutter when present; ?? (not ||) since 0 is a valid,
+    // common value (a direction's very first frame). Every byteOff below stays on the
+    // real offset regardless — selection/markers/dissect-highlight are genuine byte
+    // identity, not display, and must keep matching Extract/Search/Markers' own real
+    // per-direction offsets.
+    const offStr   = (globalOffset ? (virtualOffset ?? offset) : localOffset).toString(16).padStart(8, '0')
     const markedSet = direction === DIRNUM_C2S ? markedC2S : markedS2C
 
     // dissectHl: externally-driven (dissector node click), independent of sel (mouse-drag

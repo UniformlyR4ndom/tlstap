@@ -31,11 +31,12 @@ func (i *TamperInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	}
 	scriptstore.RegisterRoutes(mux, basePath, i.scripts, onScriptChange, onScriptChange)
 
-	mux.HandleFunc("GET "+basePath+"/fs/list", i.handleFsList)
-	mux.HandleFunc("GET "+basePath+"/fs/list/{path...}", i.handleFsList)
-	mux.HandleFunc("GET "+basePath+"/fs/file/{path...}", i.handleFsGet)
-	mux.HandleFunc("PUT "+basePath+"/fs/file/{path...}", i.handleFsPut)
-	mux.HandleFunc("POST "+basePath+"/fs/file/{path...}", i.handleFsAppend)
+	// Nested under /framer since RegisterRoutes always registers at {basePath}/scripts —
+	// a distinct basePath is what keeps the two stores' routes from colliding.
+	onFramerScriptChange := func(name string) {
+		i.sendEvent(framerScriptUpdatedMsg{Type: msgFramerScriptUpdated, Name: name})
+	}
+	scriptstore.RegisterRoutes(mux, basePath+"/framer", i.framerScripts, onFramerScriptChange, onFramerScriptChange)
 }
 
 // logFileInfoResponse is the reply to GET .../log-file — static for the interceptor's

@@ -57,8 +57,8 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 
 	err := d.appendFrames(key, frameProgress{}, []frameInput{
-		{Offset: 0, Length: 10, Meta: strPtr("a"), Time: 1000},
-		{Offset: 10, Length: 5, Meta: nil, Time: 1005},
+		{Ranges: []frameRange{{Offset: 0, Length: 10}}, Meta: strPtr("a"), Time: 1000},
+		{Ranges: []frameRange{{Offset: 10, Length: 5}}, Meta: nil, Time: 1005},
 	}, frameProgress{ProcessedOffsetC2S: 15, State: []byte("state1")})
 	if err != nil {
 		t.Fatal(err)
@@ -79,15 +79,15 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("expected 2 frames, got %d", len(frames))
 	}
-	if frames[0].ID != 0 || frames[0].Offset != 0 || frames[0].Length != 10 || frames[0].Meta == nil || *frames[0].Meta != "a" || frames[0].Time != 1000 || frames[0].Seq != 0 {
+	if frames[0].ID != 0 || len(frames[0].Ranges) != 1 || frames[0].Ranges[0].Offset != 0 || frames[0].Ranges[0].Length != 10 || frames[0].Meta == nil || *frames[0].Meta != "a" || frames[0].Time != 1000 || frames[0].Seq != 0 {
 		t.Errorf("unexpected frame 0: %+v", frames[0])
 	}
-	if frames[1].ID != 1 || frames[1].Offset != 10 || frames[1].Length != 5 || frames[1].Meta != nil || frames[1].Time != 1005 || frames[1].Seq != 1 {
+	if frames[1].ID != 1 || len(frames[1].Ranges) != 1 || frames[1].Ranges[0].Offset != 10 || frames[1].Ranges[0].Length != 5 || frames[1].Meta != nil || frames[1].Time != 1005 || frames[1].Seq != 1 {
 		t.Errorf("unexpected frame 1: %+v", frames[1])
 	}
 
 	// A second batch continues ids/seq from where the first left off and advances progress.
-	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 15}, []frameInput{{Offset: 15, Length: 20}}, frameProgress{ProcessedOffsetC2S: 35, State: []byte("state2")}); err != nil {
+	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 15}, []frameInput{{Ranges: []frameRange{{Offset: 15, Length: 20}}}}, frameProgress{ProcessedOffsetC2S: 35, State: []byte("state2")}); err != nil {
 		t.Fatal(err)
 	}
 	p, err = d.getFrameProgress(key)
@@ -101,7 +101,7 @@ func TestAppendFrames_InitialAndIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(frames) != 3 || frames[2].ID != 2 || frames[2].Offset != 15 || frames[2].Seq != 2 {
+	if len(frames) != 3 || frames[2].ID != 2 || frames[2].Ranges[0].Offset != 15 || frames[2].Seq != 2 {
 		t.Fatalf("expected 3 frames with a continuing id/seq, got %+v", frames)
 	}
 }
@@ -115,7 +115,7 @@ func TestFrameProgress_ClosedFlags(t *testing.T) {
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 	other := frameTimelineKey{Session: 1, Stream: 2, Script: "foo", ScriptVersion: "v1"}
 
-	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Offset: 0, Length: 10}}, frameProgress{ProcessedOffsetC2S: 10, State: []byte("state1")}); err != nil {
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Ranges: []frameRange{{Offset: 0, Length: 10}}}}, frameProgress{ProcessedOffsetC2S: 10, State: []byte("state1")}); err != nil {
 		t.Fatal(err)
 	}
 	if p, err := d.getFrameProgress(key); err != nil || p.ClosedC2S || p.ClosedS2C {
@@ -135,7 +135,7 @@ func TestFrameProgress_ClosedFlags(t *testing.T) {
 		t.Fatalf("expected closedC2S=true, closedS2C=false, offset 10, state1 kept, got %+v state=%q", p, p.State)
 	}
 
-	if err := d.appendFrames(other, frameProgress{}, []frameInput{{Offset: 0, Length: 5}}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
+	if err := d.appendFrames(other, frameProgress{}, []frameInput{{Ranges: []frameRange{{Offset: 0, Length: 5}}}}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
 		t.Fatal(err)
 	}
 	if p, err := d.getFrameProgress(other); err != nil || p.ClosedC2S || p.ClosedS2C {
@@ -147,12 +147,12 @@ func TestAppendFrames_ConflictOnStaleOffset(t *testing.T) {
 	d := newTestInterceptor(t)
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 
-	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Offset: 0, Length: 10}}, frameProgress{ProcessedOffsetC2S: 10}); err != nil {
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Ranges: []frameRange{{Offset: 0, Length: 10}}}}, frameProgress{ProcessedOffsetC2S: 10}); err != nil {
 		t.Fatal(err)
 	}
 
 	// expected still claims 0, but the stored value is now 10.
-	err := d.appendFrames(key, frameProgress{}, []frameInput{{Offset: 10, Length: 5}}, frameProgress{ProcessedOffsetC2S: 15})
+	err := d.appendFrames(key, frameProgress{}, []frameInput{{Ranges: []frameRange{{Offset: 10, Length: 5}}}}, frameProgress{ProcessedOffsetC2S: 15})
 	if err != errFrameProgressConflict {
 		t.Fatalf("expected errFrameProgressConflict, got %v", err)
 	}
@@ -187,7 +187,7 @@ func TestListFrames_Paging(t *testing.T) {
 
 	inputs := make([]frameInput, 5)
 	for j := range inputs {
-		inputs[j] = frameInput{Offset: int64(j * 10), Length: 10}
+		inputs[j] = frameInput{Ranges: []frameRange{{Offset: int64(j * 10), Length: 10}}}
 	}
 	if err := d.appendFrames(key, frameProgress{}, inputs, frameProgress{ProcessedOffsetC2S: 50}); err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestListFrames_Paging(t *testing.T) {
 // offset is always 0 throughout, so passing 0/0 for it is always a correct CAS match.
 func appendSimple(t *testing.T, d *DbDumpInterceptor, key frameTimelineKey, dir int, offset, length int64) {
 	t.Helper()
-	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Direction: dir, Offset: offset, Length: length}}, frameProgress{ProcessedOffsetC2S: offset + length}); err != nil {
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Direction: dir, Ranges: []frameRange{{Offset: offset, Length: length}}}}, frameProgress{ProcessedOffsetC2S: offset + length}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -528,8 +528,8 @@ func TestHandleFramesAppendAndList(t *testing.T) {
 	appendReq := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
 		"new_frames": []map[string]any{
-			{"direction": 0, "offset": 0, "length": 10, "meta": "a", "time": 1000},
-			{"direction": 0, "offset": 10, "length": 5, "time": 1005},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 0, "length": 10}}, "meta": "a", "time": 1000},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 10, "length": 5}}, "time": 1005},
 		},
 		"new_processed_offset_c2s": 15,
 	}
@@ -549,12 +549,12 @@ func TestHandleFramesAppendAndList(t *testing.T) {
 	}
 
 	var frames []struct {
-		ID     int64   `json:"id"`
-		Offset int64   `json:"offset"`
-		Length int64   `json:"length"`
-		Meta   *string `json:"meta"`
-		Time   int64   `json:"time"`
-		Seq    int64   `json:"seq"`
+		ID            int64        `json:"id"`
+		Ranges        []frameRange `json:"ranges"`
+		Meta          *string      `json:"meta"`
+		Time          int64        `json:"time"`
+		Seq           int64        `json:"seq"`
+		VirtualOffset int64        `json:"virtual_offset"`
 	}
 	listReq := map[string]any{"session": 1, "stream": 1, "direction": 0, "script": "foo", "script_version": "v1", "start": 0, "n": 0}
 	if status := postJSON(t, base+"/frames", listReq, &frames); status != http.StatusOK {
@@ -563,10 +563,10 @@ func TestHandleFramesAppendAndList(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("expected 2 frames, got %d", len(frames))
 	}
-	if frames[0].ID != 0 || frames[0].Offset != 0 || frames[0].Length != 10 || frames[0].Meta == nil || *frames[0].Meta != "a" || frames[0].Time != 1000 || frames[0].Seq != 0 {
+	if frames[0].ID != 0 || len(frames[0].Ranges) != 1 || frames[0].Ranges[0].Offset != 0 || frames[0].Ranges[0].Length != 10 || frames[0].Meta == nil || *frames[0].Meta != "a" || frames[0].Time != 1000 || frames[0].Seq != 0 || frames[0].VirtualOffset != 0 {
 		t.Errorf("unexpected frame 0: %+v", frames[0])
 	}
-	if frames[1].ID != 1 || frames[1].Offset != 10 || frames[1].Length != 5 || frames[1].Meta != nil || frames[1].Time != 1005 || frames[1].Seq != 1 {
+	if frames[1].ID != 1 || len(frames[1].Ranges) != 1 || frames[1].Ranges[0].Offset != 10 || frames[1].Ranges[0].Length != 5 || frames[1].Meta != nil || frames[1].Time != 1005 || frames[1].Seq != 1 || frames[1].VirtualOffset != 10 {
 		t.Errorf("unexpected frame 1: %+v", frames[1])
 	}
 }
@@ -576,7 +576,7 @@ func TestHandleFramesAppend_ConflictOnStaleOffset(t *testing.T) {
 
 	first := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
-		"new_frames":               []map[string]any{{"offset": 0, "length": 10}},
+		"new_frames":               []map[string]any{{"ranges": []map[string]any{{"offset": 0, "length": 10}}}},
 		"new_processed_offset_c2s": 10,
 	}
 	if status := postJSON(t, base+"/frames/append", first, nil); status != http.StatusNoContent {
@@ -586,7 +586,7 @@ func TestHandleFramesAppend_ConflictOnStaleOffset(t *testing.T) {
 	// Stale expected_processed_offset_c2s (still claims 0).
 	second := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
-		"new_frames":               []map[string]any{{"offset": 10, "length": 5}},
+		"new_frames":               []map[string]any{{"ranges": []map[string]any{{"offset": 10, "length": 5}}}},
 		"new_processed_offset_c2s": 15,
 	}
 	if status := postJSON(t, base+"/frames/append", second, nil); status != http.StatusConflict {
@@ -616,18 +616,18 @@ func seedTimelineFixture(t *testing.T, d *DbDumpInterceptor, key frameTimelineKe
 	// Direction 0: ids 0..3, with ids 1 and 2 tied on stid=12 (both completed on the
 	// same underlying chunk).
 	if err := d.appendFrames(key, frameProgress{}, []frameInput{
-		{Direction: 0, Offset: 0, Length: 10, Stid: 10},
-		{Direction: 0, Offset: 10, Length: 5, Stid: 12},
-		{Direction: 0, Offset: 15, Length: 5, Stid: 12},
-		{Direction: 0, Offset: 20, Length: 5, Stid: 15},
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 10}}, Stid: 10},
+		{Direction: 0, Ranges: []frameRange{{Offset: 10, Length: 5}}, Stid: 12},
+		{Direction: 0, Ranges: []frameRange{{Offset: 15, Length: 5}}, Stid: 12},
+		{Direction: 0, Ranges: []frameRange{{Offset: 20, Length: 5}}, Stid: 15},
 	}, frameProgress{ProcessedOffsetC2S: 25}); err != nil {
 		t.Fatal(err)
 	}
 	// Direction 1: ids 0..1, interleaved with direction 0's stids but never tied with
 	// them (different chunks, so different stids, by construction).
 	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 25}, []frameInput{
-		{Direction: 1, Offset: 0, Length: 8, Stid: 11},
-		{Direction: 1, Offset: 8, Length: 8, Stid: 13},
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 8}}, Stid: 11},
+		{Direction: 1, Ranges: []frameRange{{Offset: 8, Length: 8}}, Stid: 13},
 	}, frameProgress{ProcessedOffsetC2S: 25, ProcessedOffsetS2C: 16}); err != nil {
 		t.Fatal(err)
 	}
@@ -764,8 +764,8 @@ func TestHandleFramesTimeline(t *testing.T) {
 	appendC2S := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
 		"new_frames": []map[string]any{
-			{"direction": 0, "offset": 0, "length": 10, "stid": 10},
-			{"direction": 0, "offset": 10, "length": 5, "stid": 12},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 0, "length": 10}}, "stid": 10},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 10, "length": 5}}, "stid": 12},
 		},
 		"new_processed_offset_c2s": 15,
 	}
@@ -776,7 +776,7 @@ func TestHandleFramesTimeline(t *testing.T) {
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
 		"expected_processed_offset_c2s": 15,
 		"new_frames": []map[string]any{
-			{"direction": 1, "offset": 0, "length": 8, "stid": 11},
+			{"direction": 1, "ranges": []map[string]any{{"offset": 0, "length": 8}}, "stid": 11},
 		},
 		"new_processed_offset_c2s": 15,
 		"new_processed_offset_s2c": 8,
@@ -786,12 +786,11 @@ func TestHandleFramesTimeline(t *testing.T) {
 	}
 
 	var timeline []struct {
-		ID        int64   `json:"id"`
-		Offset    int64   `json:"offset"`
-		Length    int64   `json:"length"`
-		Meta      *string `json:"meta"`
-		Direction int     `json:"direction"`
-		Stid      int64   `json:"stid"`
+		ID        int64        `json:"id"`
+		Ranges    []frameRange `json:"ranges"`
+		Meta      *string      `json:"meta"`
+		Direction int          `json:"direction"`
+		Stid      int64        `json:"stid"`
 	}
 	req := map[string]any{"session": 1, "stream": 1, "script": "foo", "script_version": "v1", "start": 0, "n": 0}
 	if status := postJSON(t, base+"/frames/timeline", req, &timeline); status != http.StatusOK {
@@ -820,8 +819,8 @@ func TestHandleFramesTimeline_Backward(t *testing.T) {
 	appendC2S := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
 		"new_frames": []map[string]any{
-			{"direction": 0, "offset": 0, "length": 10, "stid": 10},
-			{"direction": 0, "offset": 10, "length": 5, "stid": 12},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 0, "length": 10}}, "stid": 10},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 10, "length": 5}}, "stid": 12},
 		},
 		"new_processed_offset_c2s": 15,
 	}
@@ -864,9 +863,9 @@ func TestAppendFrames_SeqAssignment(t *testing.T) {
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 
 	if err := d.appendFrames(key, frameProgress{}, []frameInput{
-		{Direction: 0, Offset: 0, Length: 5},
-		{Direction: 1, Offset: 0, Length: 5},
-		{Direction: 0, Offset: 5, Length: 5},
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}},
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 5}}},
+		{Direction: 0, Ranges: []frameRange{{Offset: 5, Length: 5}}},
 	}, frameProgress{ProcessedOffsetC2S: 10, ProcessedOffsetS2C: 5}); err != nil {
 		t.Fatal(err)
 	}
@@ -894,10 +893,10 @@ func TestAppendFrames_SeqContinuesAcrossCalls(t *testing.T) {
 	d := newTestInterceptor(t)
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 
-	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Direction: 0, Offset: 0, Length: 5}}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}}}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 5}, []frameInput{{Direction: 1, Offset: 0, Length: 5}}, frameProgress{ProcessedOffsetC2S: 5, ProcessedOffsetS2C: 5}); err != nil {
+	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 5}, []frameInput{{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 5}}}}, frameProgress{ProcessedOffsetC2S: 5, ProcessedOffsetS2C: 5}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -907,6 +906,103 @@ func TestAppendFrames_SeqContinuesAcrossCalls(t *testing.T) {
 	}
 	if len(frames) != 2 || frames[0].Seq != 0 || frames[1].Seq != 1 {
 		t.Fatalf("expected seq [0, 1] across the two calls, got %+v", frames)
+	}
+}
+
+// TestAppendFrames_VirtualOffsetAssignment confirms virtual_offset is a running total
+// scoped independently per direction: it starts at 0 for each direction's first frame and
+// advances by that frame's own byte length (sum of its ranges), regardless of how the two
+// directions' frames are interleaved in the batch.
+func TestAppendFrames_VirtualOffsetAssignment(t *testing.T) {
+	d := newTestInterceptor(t)
+	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
+
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}},
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 7}}},
+		{Direction: 0, Ranges: []frameRange{{Offset: 5, Length: 3}}},
+		{Direction: 1, Ranges: []frameRange{{Offset: 7, Length: 2}}},
+	}, frameProgress{ProcessedOffsetC2S: 8, ProcessedOffsetS2C: 9}); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := d.listFramesBySeq(key, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 4 {
+		t.Fatalf("expected 4 frames, got %+v", frames)
+	}
+	wantVirtualOffset := []int64{0, 0, 5, 7} // dir0: 0, 5; dir1: 0, 7 — independent counters
+	for j := range frames {
+		if frames[j].VirtualOffset != wantVirtualOffset[j] {
+			t.Errorf("frame %d (direction=%d): expected virtual_offset=%d, got %d", j, frames[j].Direction, wantVirtualOffset[j], frames[j].VirtualOffset)
+		}
+	}
+}
+
+// TestAppendFrames_VirtualOffsetContinuesAcrossCalls confirms each direction's running
+// total keeps advancing across separate appendFrames calls, the same way id already does.
+func TestAppendFrames_VirtualOffsetContinuesAcrossCalls(t *testing.T) {
+	d := newTestInterceptor(t)
+	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
+
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}}}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 5}, []frameInput{
+		{Direction: 0, Ranges: []frameRange{{Offset: 5, Length: 4}}},
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 3}}},
+	}, frameProgress{ProcessedOffsetC2S: 9, ProcessedOffsetS2C: 3}); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := d.listFramesBySeq(key, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("expected 3 frames, got %+v", frames)
+	}
+	// dir0's second frame (across the two calls) continues from 5; dir1's first frame,
+	// appended in the same second call, starts fresh at 0 — unaffected by dir0's total.
+	wantVirtualOffset := []int64{0, 5, 0}
+	for j := range frames {
+		if frames[j].VirtualOffset != wantVirtualOffset[j] {
+			t.Errorf("frame %d (direction=%d): expected virtual_offset=%d, got %d", j, frames[j].Direction, wantVirtualOffset[j], frames[j].VirtualOffset)
+		}
+	}
+}
+
+// TestAppendFrames_VirtualOffsetSumsMultipleRanges confirms a frame's contribution to the
+// running total is the plain sum of its own ranges' lengths, not the length of their
+// merged/deduplicated span — matching /byte-ranges' and selectByBudget's own no-dedup
+// treatment of overlapping ranges elsewhere in this codebase. Uses two overlapping ranges
+// (the second starts before the first ends) specifically to rule out a union-based
+// computation, which would produce a smaller total than a plain sum here.
+func TestAppendFrames_VirtualOffsetSumsMultipleRanges(t *testing.T) {
+	d := newTestInterceptor(t)
+	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
+
+	if err := d.appendFrames(key, frameProgress{}, []frameInput{
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 4}, {Offset: 2, Length: 6}}}, // sum=10, union would be 8
+		{Direction: 0, Ranges: []frameRange{{Offset: 8, Length: 1}}},
+	}, frameProgress{ProcessedOffsetC2S: 9}); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := d.listFramesBySeq(key, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("expected 2 frames, got %+v", frames)
+	}
+	if frames[0].VirtualOffset != 0 {
+		t.Errorf("expected first frame's virtual_offset=0, got %d", frames[0].VirtualOffset)
+	}
+	if frames[1].VirtualOffset != 10 {
+		t.Errorf("expected second frame's virtual_offset=10 (sum of the first frame's ranges, not their 8-byte union), got %d", frames[1].VirtualOffset)
 	}
 }
 
@@ -926,13 +1022,13 @@ func TestListFramesBySeq_OrderCanDifferFromStid(t *testing.T) {
 	// deliberately the reverse of their stid order, to make sure seq isn't secretly
 	// derived from stid.
 	if err := d.appendFrames(key, frameProgress{}, []frameInput{
-		{Direction: 0, Offset: 0, Length: 5, Stid: 1},
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}, Stid: 1},
 	}, frameProgress{ProcessedOffsetC2S: 5}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.appendFrames(key, frameProgress{ProcessedOffsetC2S: 5}, []frameInput{
-		{Direction: 1, Offset: 0, Length: 5, Stid: 20}, // the response, emitted first
-		{Direction: 0, Offset: 5, Length: 5, Stid: 5},  // the held-back request, emitted second
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 5}}, Stid: 20}, // the response, emitted first
+		{Direction: 0, Ranges: []frameRange{{Offset: 5, Length: 5}}, Stid: 5},  // the held-back request, emitted second
 	}, frameProgress{ProcessedOffsetC2S: 10, ProcessedOffsetS2C: 5}); err != nil {
 		t.Fatal(err)
 	}
@@ -959,9 +1055,9 @@ func TestListFramesBySeqBackward(t *testing.T) {
 	key := frameTimelineKey{Session: 1, Stream: 1, Script: "foo", ScriptVersion: "v1"}
 
 	if err := d.appendFrames(key, frameProgress{}, []frameInput{
-		{Direction: 0, Offset: 0, Length: 5},
-		{Direction: 1, Offset: 0, Length: 5},
-		{Direction: 0, Offset: 5, Length: 5},
+		{Direction: 0, Ranges: []frameRange{{Offset: 0, Length: 5}}},
+		{Direction: 1, Ranges: []frameRange{{Offset: 0, Length: 5}}},
+		{Direction: 0, Ranges: []frameRange{{Offset: 5, Length: 5}}},
 	}, frameProgress{ProcessedOffsetC2S: 10, ProcessedOffsetS2C: 5}); err != nil {
 		t.Fatal(err)
 	}
@@ -997,8 +1093,8 @@ func TestHandleFramesBySeq_HTTP(t *testing.T) {
 	appendReq := map[string]any{
 		"session": 1, "stream": 1, "script": "foo", "script_version": "v1",
 		"new_frames": []map[string]any{
-			{"direction": 0, "offset": 0, "length": 5},
-			{"direction": 1, "offset": 0, "length": 5},
+			{"direction": 0, "ranges": []map[string]any{{"offset": 0, "length": 5}}},
+			{"direction": 1, "ranges": []map[string]any{{"offset": 0, "length": 5}}},
 		},
 		"new_processed_offset_c2s": 5,
 		"new_processed_offset_s2c": 5,

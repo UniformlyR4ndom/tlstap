@@ -94,7 +94,7 @@ function jsonBytesReviver(_key, value) {
 }
 
 // Exported for direct round-trip testing (dbdumpFramerApi.test.js) — every other export
-// here needs a real fetch(), these four are the pure part.
+// here needs a real fetch(), these four (plus decodeFrame below) are the pure part.
 export function encodeMeta(value) {
     return value === undefined || value === null ? null : JSON.stringify(value, jsonBytesReplacer)
 }
@@ -128,8 +128,16 @@ export async function getFrameProgress(key) {
     }
 }
 
-function decodeFrame(f) {
-    return { id: f.id, offset: f.offset, length: f.length, meta: decodeMeta(f.meta), direction: f.direction, stid: f.stid, time: f.time, seq: f.seq }
+// length is a permanent, always-well-defined field (sum(ranges[].length)), not a shim —
+// unlike an offset, a total length needs no arbitrary "pick one range" convention to stay
+// meaningful regardless of range count, so frameSegmentsCore.js's budget/sizing math
+// (selectByBudget) reads it directly rather than recomputing it from ranges itself.
+// virtualOffset (frames.virtual_offset) is likewise a genuine, permanent field, passed
+// through as-is. Exported for direct testing (dbdumpFramerApi.test.js), same convention
+// as encodeMeta/decodeMeta/encodeState/decodeState above.
+export function decodeFrame(f) {
+    const length = f.ranges.reduce((sum, r) => sum + r.length, 0)
+    return { id: f.id, ranges: f.ranges, length, virtualOffset: f.virtual_offset, meta: decodeMeta(f.meta), direction: f.direction, stid: f.stid, time: f.time, seq: f.seq }
 }
 
 // Returns frames for key with id >= start, ordered by id. n <= 0 means unlimited.
@@ -194,7 +202,7 @@ export async function appendFrames(key, expectedProcessedOffset, frames, newProc
             ...timelineKeyBody(key),
             expected_processed_offset_c2s: expectedProcessedOffset.c2s,
             expected_processed_offset_s2c: expectedProcessedOffset.s2c,
-            new_frames: frames.map(f => ({ direction: f.direction, offset: f.offset, length: f.length, meta: encodeMeta(f.meta), stid: f.stid, time: f.time })),
+            new_frames: frames.map(f => ({ direction: f.direction, ranges: f.ranges, meta: encodeMeta(f.meta), stid: f.stid, time: f.time })),
             new_processed_offset_c2s: newProcessedOffset.c2s,
             new_processed_offset_s2c: newProcessedOffset.s2c,
             new_state: encodeState(newState),

@@ -6,8 +6,8 @@ function wsUrl(path) {
 }
 
 // Opens the single tamper control connection. handlers: { onOpen, onClose, onError,
-// onStreamCreated, onStreamTerminated, onHeld, onStreamList, onScriptUpdated }, all
-// optional.
+// onStreamCreated, onStreamTerminated, onHeld, onStreamList, onScriptUpdated,
+// onFramerScriptUpdated }, all optional.
 //
 // Returns { setAutoIntercept(enabled), setMode(conn, intercepting), listStreams(),
 // release(conn, direction, opts, editedBytes?), dropConnection(conn, direction),
@@ -88,6 +88,9 @@ export function openTamperControl(handlers = {}) {
                 break
             case 'script-updated':
                 handlers.onScriptUpdated?.(msg.name)
+                break
+            case 'framer-script-updated':
+                handlers.onFramerScriptUpdated?.(msg.name)
                 break
         }
     }
@@ -237,43 +240,4 @@ export async function putScript(name, content) {
 
 export async function deleteScript(name) {
     await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
-}
-
-// ── Filesystem REST API ─────────────────────────────────────────────────────────────
-// Content is a raw body (arbitrary binary), not JSON/base64-wrapped. path is always
-// slash-separated, even for a nested subdirectory — segments are percent-encoded
-// individually (not the path as a whole) so slashes survive as separators, matching how
-// the server parses the path.
-
-function encodeFsPath(path) {
-    return path.split('/').filter(s => s !== '').map(encodeURIComponent).join('/')
-}
-
-export async function listFs(path = '') {
-    const enc = encodeFsPath(path)
-    const res = await checkOk(await fetch(`${BASE}/fs/list${enc ? '/' + enc : ''}`))
-    return res.json()
-}
-
-export async function readFs(path) {
-    const res = await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`))
-    return new Uint8Array(await res.arrayBuffer())
-}
-
-export async function writeFs(path, bytes) {
-    await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: bytes,
-    }))
-}
-
-// POST, not PUT: appending isn't idempotent (repeat = appended twice), unlike PUT
-// above. Creates the file (and missing parent directories) if it doesn't exist yet.
-export async function appendFs(path, bytes) {
-    await checkOk(await fetch(`${BASE}/fs/file/${encodeFsPath(path)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: bytes,
-    }))
 }

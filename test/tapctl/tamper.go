@@ -42,14 +42,14 @@ func tamperMain(args []string) {
 		cmdTamperScriptPut(args[1:])
 	case "script-delete":
 		cmdTamperScriptDelete(args[1:])
-	case "fs-list":
-		cmdTamperFsList(args[1:])
-	case "fs-get":
-		cmdTamperFsGet(args[1:])
-	case "fs-put":
-		cmdTamperFsPut(args[1:])
-	case "fs-append":
-		cmdTamperFsAppend(args[1:])
+	case "framer-script-list":
+		cmdTamperFramerScriptList(args[1:])
+	case "framer-script-get":
+		cmdTamperFramerScriptGet(args[1:])
+	case "framer-script-put":
+		cmdTamperFramerScriptPut(args[1:])
+	case "framer-script-delete":
+		cmdTamperFramerScriptDelete(args[1:])
 	case "log-file":
 		cmdTamperLogFile(args[1:])
 	case "-h", "--help", "help":
@@ -75,13 +75,13 @@ Usage:
   tapctl tamper set-auto-intercept --enabled=true|false [--api URL]
   tapctl tamper script-log --level log|error --text TEXT [--api URL]
   tapctl tamper script-list [--api URL]
-  tapctl tamper script-get --name NAME [--api URL]
+  tapctl tamper script-get --name NAME [--hash] [--api URL]
   tapctl tamper script-put --name NAME (--file PATH | --file -) [--api URL]
   tapctl tamper script-delete --name NAME [--api URL]
-  tapctl tamper fs-list [--path PATH] [--api URL]
-  tapctl tamper fs-get --path PATH [--api URL]
-  tapctl tamper fs-put --path PATH (--file PATH2 | --file -) [--api URL]
-  tapctl tamper fs-append --path PATH (--file PATH2 | --file -) [--api URL]
+  tapctl tamper framer-script-list [--api URL]
+  tapctl tamper framer-script-get --name NAME [--hash] [--api URL]
+  tapctl tamper framer-script-put --name NAME (--file PATH | --file -) [--api URL]
+  tapctl tamper framer-script-delete --name NAME [--api URL]
   tapctl tamper log-file [--api URL]
 
 release combines an optional edit with an optional release, mirroring the server's
@@ -91,24 +91,23 @@ positive count to also release that many chunks of the post-edit buffer. --edit/
 via peek) with the given data; --bounds defaults to "0" (the whole edit as one chunk).
 
 script-get prints the raw script source to stdout (not JSON-wrapped), so it's directly
-pipeable, e.g. "tapctl tamper script-get --name foo > foo.js". script-put reads from
---file (a path, or - for stdin), mirroring release's --edit convention. Both act on the
-tamper interceptor's scripts-dir store; see CLAUDE.md's "Script storage" section.
+pipeable, e.g. "tapctl tamper script-get --name foo > foo.js" — or, with --hash, prints
+{"sha256":"..."} instead: the same "version" a framer/dissector run computes over this
+same content (framerRun.js's sha256Hex; dbdump persists it as frames.script_version),
+so a caller that already knows a script's name can learn its current version without a
+separate hash step. script-put reads from --file (a path, or - for stdin), mirroring
+release's --edit convention. Both act on the tamper interceptor's scripts-dir store; see
+CLAUDE.md's "Script storage" section.
+
+framer-script-list/-get/-put/-delete are the same four commands (including -get's --hash)
+against tamper's separate framer-scripts-dir store (frame(state, chunk) scripts,
+reassembling live traffic into frames for a selected interception script's onFrame hook)
+— a distinct store/namespace from scripts-dir above, same name in both is not a collision.
 
 script-log pushes one already-formatted log line for optional server-side persistence
 (see the tamper interceptor's log-file config arg); it never gets a reply on success
 (fire-and-forget, unlike every other control command), so tapctl doesn't wait for one —
 it validates --level itself and exits immediately after sending.
-
-fs-list/fs-get/fs-put act on the tamper interceptor's fs-root store; see CLAUDE.md's
-"Filesystem access" section. --path is slash-separated for subdirectories (e.g.
-"sub/dir/file.bin"); fs-list's --path defaults to "" (fs-root itself). fs-get prints raw
-file bytes to stdout, same pipeable convention as script-get, except content here is
-arbitrary binary, not always printable text. There is no fs-delete: the server exposes
-no DELETE endpoint for fs-root. fs-append (--file PATH|-, same as fs-put) appends
-instead of overwriting, creating the file (and missing parent directories) if it
-doesn't exist yet; safe under concurrent appends to the same file from elsewhere (see
-fs.go's Append).
 
 log-file reports whether the interceptor was configured with log-file (see script-log
 above) and the log's display filename; static for the server's whole run.
@@ -515,15 +514,24 @@ func cmdTamperScriptGet(args []string) {
 	fs := flag.NewFlagSet("tamper script-get", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
 	name := fs.String("name", "", "script name, without .js (required)")
+	hash := fs.Bool("hash", false, "print the script's sha256 hex digest instead of its content")
 	fs.Parse(args)
 
 	if *name == "" {
 		fail("--name is required")
 	}
 
-	data, err := httpGet(*api, "/api/i/tamper/scripts/"+url.PathEscape(*name))
+	path := "/api/i/tamper/scripts/" + url.PathEscape(*name)
+	if *hash {
+		path += "?hash=1"
+	}
+	data, err := httpGet(*api, path)
 	if err != nil {
 		fail("%v", err)
+	}
+	if *hash {
+		printRawJSON(data) // {"sha256": "..."} — JSON, unlike the raw-content path below
+		return
 	}
 	// Raw script source, not JSON — printed verbatim (no trailing newline added) so
 	// this is directly pipeable to a file, matching the REST endpoint's own raw-text
@@ -582,75 +590,58 @@ func cmdTamperScriptDelete(args []string) {
 	}{"ok"})
 }
 
-// --- fs-root access (REST; see intercept/tamper/fs.go) ---
+// --- framer scripts (REST CRUD; see intercept/tamper/api.go's second RegisterRoutes call) ---
 
-// encodeFsPath percent-encodes each slash-separated segment of path individually (not
-// the path as a whole), so literal slashes survive as separators through to the
-// server's {path...} wildcard route instead of being escaped into %2F — mirroring
-// web/tamperApi.js's encodeFsPath. Empty segments (leading/trailing/doubled slashes)
-// are dropped; the server's own path.Clean-based resolution would collapse them anyway.
-func encodeFsPath(path string) string {
-	var b strings.Builder
-	first := true
-	for _, seg := range strings.Split(path, "/") {
-		if seg == "" {
-			continue
-		}
-		if !first {
-			b.WriteByte('/')
-		}
-		b.WriteString(url.PathEscape(seg))
-		first = false
-	}
-	return b.String()
-}
-
-func cmdTamperFsList(args []string) {
-	fs := flag.NewFlagSet("tamper fs-list", flag.ExitOnError)
+func cmdTamperFramerScriptList(args []string) {
+	fs := flag.NewFlagSet("tamper framer-script-list", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
-	path := fs.String("path", "", "subdirectory relative to fs-root (default: fs-root itself)")
 	fs.Parse(args)
 
-	endpoint := "/api/i/tamper/fs/list"
-	if enc := encodeFsPath(*path); enc != "" {
-		endpoint += "/" + enc
-	}
-
-	data, err := httpGet(*api, endpoint)
+	data, err := httpGet(*api, "/api/i/tamper/framer/scripts")
 	if err != nil {
 		fail("%v", err)
 	}
 	printRawJSON(data)
 }
 
-func cmdTamperFsGet(args []string) {
-	fs := flag.NewFlagSet("tamper fs-get", flag.ExitOnError)
+func cmdTamperFramerScriptGet(args []string) {
+	fs := flag.NewFlagSet("tamper framer-script-get", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
-	path := fs.String("path", "", "file path relative to fs-root (required)")
+	name := fs.String("name", "", "framer script name, without .js (required)")
+	hash := fs.Bool("hash", false, "print the script's sha256 hex digest instead of its content")
 	fs.Parse(args)
 
-	if *path == "" {
-		fail("--path is required")
+	if *name == "" {
+		fail("--name is required")
 	}
 
-	data, err := httpGet(*api, "/api/i/tamper/fs/file/"+encodeFsPath(*path))
+	path := "/api/i/tamper/framer/scripts/" + url.PathEscape(*name)
+	if *hash {
+		path += "?hash=1"
+	}
+	data, err := httpGet(*api, path)
 	if err != nil {
 		fail("%v", err)
 	}
-	// Raw file bytes — arbitrary binary, not necessarily printable — written verbatim
-	// to stdout, same pipeable convention as script-get.
+	if *hash {
+		printRawJSON(data) // {"sha256": "..."} — JSON, unlike the raw-content path below
+		return
+	}
+	// Raw script source, not JSON — printed verbatim (no trailing newline added) so
+	// this is directly pipeable to a file, matching the REST endpoint's own raw-text
+	// convention rather than tapctl's usual "print JSON to stdout".
 	os.Stdout.Write(data)
 }
 
-func cmdTamperFsPut(args []string) {
-	fs := flag.NewFlagSet("tamper fs-put", flag.ExitOnError)
+func cmdTamperFramerScriptPut(args []string) {
+	fs := flag.NewFlagSet("tamper framer-script-put", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
-	path := fs.String("path", "", "file path relative to fs-root (required)")
-	file := fs.String("file", "", "path to file content, or - for stdin (required)")
+	name := fs.String("name", "", "framer script name, without .js (required)")
+	file := fs.String("file", "", "path to script source, or - for stdin (required)")
 	fs.Parse(args)
 
-	if *path == "" {
-		fail("--path is required")
+	if *name == "" {
+		fail("--name is required")
 	}
 	if *file == "" {
 		fail("--file is required (path, or - for stdin)")
@@ -667,7 +658,7 @@ func cmdTamperFsPut(args []string) {
 		fail("read --file: %v", err)
 	}
 
-	if _, err := httpPutRaw(*api, "/api/i/tamper/fs/file/"+encodeFsPath(*path), content, "application/octet-stream"); err != nil {
+	if _, err := httpPutRaw(*api, "/api/i/tamper/framer/scripts/"+url.PathEscape(*name), content, "application/javascript"); err != nil {
 		fail("%v", err)
 	}
 	printJSON(struct {
@@ -675,32 +666,17 @@ func cmdTamperFsPut(args []string) {
 	}{"ok"})
 }
 
-func cmdTamperFsAppend(args []string) {
-	fs := flag.NewFlagSet("tamper fs-append", flag.ExitOnError)
+func cmdTamperFramerScriptDelete(args []string) {
+	fs := flag.NewFlagSet("tamper framer-script-delete", flag.ExitOnError)
 	api := fs.String("api", defaultAPI, "API server root")
-	path := fs.String("path", "", "file path relative to fs-root (required)")
-	file := fs.String("file", "", "path to content to append, or - for stdin (required)")
+	name := fs.String("name", "", "framer script name, without .js (required)")
 	fs.Parse(args)
 
-	if *path == "" {
-		fail("--path is required")
-	}
-	if *file == "" {
-		fail("--file is required (path, or - for stdin)")
+	if *name == "" {
+		fail("--name is required")
 	}
 
-	var content []byte
-	var err error
-	if *file == "-" {
-		content, err = io.ReadAll(os.Stdin)
-	} else {
-		content, err = os.ReadFile(*file)
-	}
-	if err != nil {
-		fail("read --file: %v", err)
-	}
-
-	if _, err := httpPostRawBody(*api, "/api/i/tamper/fs/file/"+encodeFsPath(*path), content, "application/octet-stream"); err != nil {
+	if _, err := httpDelete(*api, "/api/i/tamper/framer/scripts/"+url.PathEscape(*name)); err != nil {
 		fail("%v", err)
 	}
 	printJSON(struct {

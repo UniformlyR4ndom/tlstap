@@ -40,8 +40,7 @@ function frame(state, chunk) {
 
         framer.log("emitting frame at offset: " + bufBaseOffset + pos + HEADER_LEN)
         frames.push({
-            offset: bufBaseOffset + pos + HEADER_LEN,
-            length,
+            ranges: [{ offset: bufBaseOffset + pos + HEADER_LEN, length }],
             meta: { declaredLength: length },
         })
         pos += HEADER_LEN + length

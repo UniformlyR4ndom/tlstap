@@ -2,33 +2,35 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { fillForward, fillBackward } from './chunkSegments.js'
 
-// A fake connection handle — fillForward/fillBackward only ever call these two methods,
-// so this sidesteps openConnection()'s real openSegmentsStream() (browser-only, needs a
-// live WebSocket/location) entirely, keeping this test plain-Node-runnable like every
-// other web/*.test.js file.
-function fakeHandle(response) {
+// A fake handle — fillForward/fillBackward only ever call these three methods, so this
+// sidesteps api.js's real listChunksTimeline/listChunksTimelineBackward/fetchByteRanges
+// (browser-only, needs a live fetch()) entirely, keeping this test plain-Node-runnable
+// like every other web/*.test.js file.
+function fakeHandle({ chunks, bytesFor }) {
     const calls = []
     return {
-        fetchForward(session, stream, afterStid, maxSegments, maxBytes) {
-            calls.push({ dir: 'forward', session, stream, afterStid, maxSegments, maxBytes })
-            return Promise.resolve(response)
+        listChunksTimeline(session, stream, start, n) {
+            calls.push({ dir: 'forward', session, stream, start, n })
+            return Promise.resolve(chunks)
         },
-        fetchBackward(session, stream, beforeStid, maxSegments, maxBytes) {
-            calls.push({ dir: 'backward', session, stream, beforeStid, maxSegments, maxBytes })
-            return Promise.resolve(response)
+        listChunksTimelineBackward(session, stream, beforeStid, n) {
+            calls.push({ dir: 'backward', session, stream, beforeStid, n })
+            return Promise.resolve(chunks)
+        },
+        fetchByteRanges(session, stream, ranges) {
+            calls.push({ dir: 'bytes', session, stream, ranges })
+            return Promise.resolve(ranges.map(bytesFor))
         },
         calls,
     }
 }
 
-test('fillForward maps segments to fully-loaded SegmentWindows and passes request fields through', async () => {
+test('fillForward maps chunks to fully-loaded SegmentWindows and passes request fields through', async () => {
+    const chunk = { id: 2, direction: 1, stid: 5, time: 999, offset: 30, length: 3 }
     const data = new Uint8Array([1, 2, 3])
-    const handle = fakeHandle({
-        segments: [{ stid: 5, segmentId: 2, direction: 1, time: 999, offset: 30, length: 3, data }],
-        reachedEnd: true,
-    })
+    const handle = fakeHandle({ chunks: [chunk], bytesFor: () => data })
     const entity = { session: 7, id: 3 }
-    const result = await fillForward(handle, entity, { afterStid: 4, resumeWindow: null, maxBytes: 100, maxSegments: 10 })
+    const result = await fillForward(handle, entity, { afterStid: 4, maxBytes: 100, maxSegments: 10 })
 
     assert.equal(result.reachedEnd, true)
     assert.equal(result.windows.length, 1)
@@ -38,33 +40,55 @@ test('fillForward maps segments to fully-loaded SegmentWindows and passes reques
     assert.equal(w.loadedEnd, 33)
     assert.equal(w.bytes, data) // same array, no copy
 
-    assert.deepEqual(handle.calls[0], { dir: 'forward', session: 7, stream: 3, afterStid: 4, maxSegments: 10, maxBytes: 100 })
+    // afterStid+1 = 5 is the inclusive `start` /chunks/timeline expects.
+    assert.deepEqual(handle.calls[0], { dir: 'forward', session: 7, stream: 3, start: 5, n: 11 })
+    assert.deepEqual(handle.calls[1], { dir: 'bytes', session: 7, stream: 3, ranges: [{ offset: 30, direction: 1, length: 3 }] })
 })
 
-test('fillBackward mirrors fillForward, mapping beforeStid through', async () => {
-    const handle = fakeHandle({ segments: [], reachedEnd: false })
+test('fillBackward mirrors fillForward, mapping beforeStid through unchanged', async () => {
+    const handle = fakeHandle({ chunks: [], bytesFor: () => new Uint8Array(0) })
     const entity = { session: 1, id: 1 }
     const result = await fillBackward(handle, entity, { beforeStid: 20, maxBytes: 50, maxSegments: 5 })
 
-    assert.deepEqual(result, { windows: [], reachedEnd: false })
-    assert.deepEqual(handle.calls[0], { dir: 'backward', session: 1, stream: 1, beforeStid: 20, maxSegments: 5, maxBytes: 50 })
+    // Zero candidates, strictly fewer than the requestN lookahead -> genuinely reached end.
+    assert.deepEqual(result, { windows: [], reachedEnd: true })
+    assert.deepEqual(handle.calls[0], { dir: 'backward', session: 1, stream: 1, beforeStid: 20, n: 6 })
 })
 
-test('a window built from a segment is always fully loaded', async () => {
+test('a window built from a chunk is always fully loaded', async () => {
+    const chunk = { id: 1, direction: 0, stid: 1, time: 0, offset: 0, length: 64 }
     const data = new Uint8Array(64)
-    const handle = fakeHandle({
-        segments: [{ stid: 1, segmentId: 0, direction: 0, time: 0, offset: 0, length: 64, data }],
-        reachedEnd: true,
-    })
+    const handle = fakeHandle({ chunks: [chunk], bytesFor: () => data })
     const { windows } = await fillForward(handle, { session: 1, id: 1 }, { afterStid: -1, maxBytes: 1000, maxSegments: 10 })
     const w = windows[0]
     assert.equal(w.loadedEnd, w.segment.offset + w.segment.length, 'isWindowFull() must hold for every chunk-mode window')
 })
 
-test('multiple segments in one response map in order', async () => {
-    const s0 = { stid: 1, segmentId: 0, direction: 0, time: 0, offset: 0, length: 2, data: new Uint8Array([1, 2]) }
-    const s1 = { stid: 2, segmentId: 0, direction: 1, time: 0, offset: 0, length: 2, data: new Uint8Array([3, 4]) }
-    const handle = fakeHandle({ segments: [s0, s1], reachedEnd: false })
+test('multiple chunks in one response map in order', async () => {
+    const c0 = { id: 0, direction: 0, stid: 1, time: 0, offset: 0, length: 2 }
+    const c1 = { id: 0, direction: 1, stid: 2, time: 0, offset: 0, length: 2 }
+    const handle = fakeHandle({ chunks: [c0, c1], bytesFor: r => new Uint8Array(r.length) })
     const { windows } = await fillForward(handle, { session: 1, id: 1 }, { afterStid: -1, maxBytes: 1000, maxSegments: 10 })
     assert.deepEqual(windows.map(w => w.segment.stid), [1, 2])
+})
+
+test('an oversized single chunk is still included and fetched whole, not truncated to maxBytes', async () => {
+    const chunk = { id: 0, direction: 0, stid: 1, time: 0, offset: 0, length: 1000 }
+    const data = new Uint8Array(1000)
+    const handle = fakeHandle({ chunks: [chunk], bytesFor: () => data })
+    const { windows } = await fillForward(handle, { session: 1, id: 1 }, { afterStid: -1, maxBytes: 300, maxSegments: 10 })
+
+    assert.equal(windows.length, 1)
+    assert.equal(windows[0].loadedEnd - windows[0].loadedStart, 1000, 'fetched whole — chunk mode has no partial-load concept')
+    assert.deepEqual(handle.calls[1].ranges, [{ offset: 0, direction: 0, length: 1000 }])
+})
+
+test('resumeWindow/excludeIds passed by fillToTarget are accepted but ignored', async () => {
+    const chunk = { id: 0, direction: 0, stid: 1, time: 0, offset: 0, length: 4 }
+    const handle = fakeHandle({ chunks: [chunk], bytesFor: r => new Uint8Array(r.length) })
+    // Should not throw despite the extra, unused fields.
+    const result = await fillForward(handle, { session: 1, id: 1 }, {
+        afterStid: -1, maxBytes: 1000, maxSegments: 10, resumeWindow: { some: 'stale' }, excludeIds: [0, 1],
+    })
+    assert.equal(result.windows.length, 1)
 })

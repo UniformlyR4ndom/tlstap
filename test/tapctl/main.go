@@ -5,7 +5,7 @@
 // CLAUDE.md's "tamper Interceptor" section for why that's true even for tamper's
 // hold/resolve workflow).
 //
-// Usage: tapctl <group> <command> [flags]; groups: tamper, dbdump.
+// Usage: tapctl <group> <command> [flags]; groups: tamper, dbdump, core.
 package main
 
 import (
@@ -34,6 +34,8 @@ func main() {
 		tamperMain(os.Args[2:])
 	case "dbdump":
 		dbdumpMain(os.Args[2:])
+	case "core":
+		coreMain(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -49,8 +51,10 @@ func usage() {
 Usage:
   tapctl tamper <command> [flags]
   tapctl dbdump <command> [flags]
+  tapctl core <command> [flags]
 
-Run "tapctl tamper help" or "tapctl dbdump help" for that group's commands.
+Run "tapctl tamper help", "tapctl dbdump help", or "tapctl core help" for that group's
+commands.
 
 --api defaults to `+defaultAPI+` and is treated as the API server root (canonical
 /api/i/<name>/... paths are used, i.e. single-proxy usage) in every command.
@@ -196,7 +200,7 @@ func httpPostRaw(apiBase, path string, reqBody any) (*http.Response, error) {
 
 // httpSendRaw sends a request with a raw (non-JSON) body via the given method and
 // returns the raw response body — used by REST endpoints whose request content isn't
-// JSON, e.g. tamper's script/fs-root stores.
+// JSON, e.g. tamper's script store and core's fs store.
 func httpSendRaw(method, apiBase, path string, body []byte, contentType string) ([]byte, error) {
 	req, err := http.NewRequest(method, strings.TrimSuffix(apiBase, "/")+path, bytes.NewReader(body))
 	if err != nil {
@@ -222,7 +226,7 @@ func httpPutRaw(apiBase, path string, body []byte, contentType string) ([]byte, 
 
 // httpPostRawBody sends a POST with a raw (non-JSON) body — see httpSendRaw. Distinct
 // from httpPostJSON/httpPostRaw above, which both send a JSON-encoded request body
-// (dbdump's REST convention); this one is for tamper's fs-root append, which — like
+// (dbdump's REST convention); this one is for core's fs-append, which — like
 // scripts/fs PUT — transfers content as a raw body, not JSON.
 func httpPostRawBody(apiBase, path string, body []byte, contentType string) ([]byte, error) {
 	return httpSendRaw(http.MethodPost, apiBase, path, body, contentType)

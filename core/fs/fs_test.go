@@ -1,8 +1,7 @@
-package tamper
+package fs
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,9 +9,9 @@ import (
 	"testing"
 )
 
-func TestFsStore_Resolve(t *testing.T) {
+func TestStore_Resolve(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,9 +44,9 @@ func TestFsStore_Resolve(t *testing.T) {
 	}
 }
 
-func TestFsStore_ResolveNeverEscapesRoot(t *testing.T) {
+func TestStore_ResolveNeverEscapesRoot(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,9 +74,9 @@ func TestFsStore_ResolveNeverEscapesRoot(t *testing.T) {
 	}
 }
 
-func TestFsStore_NewRequiresExistingDir(t *testing.T) {
-	if _, err := newFsStore(filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatal("expected error for a non-existent fs-root")
+func TestStore_NewRequiresExistingDir(t *testing.T) {
+	if _, err := New(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("expected error for a non-existent root")
 	}
 
 	dir := t.TempDir()
@@ -85,14 +84,14 @@ func TestFsStore_NewRequiresExistingDir(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newFsStore(file); err == nil {
-		t.Fatal("expected error when fs-root points at a file, not a directory")
+	if _, err := New(file); err == nil {
+		t.Fatal("expected error when root points at a file, not a directory")
 	}
 }
 
-func TestFsStore_PutGetList(t *testing.T) {
+func TestStore_PutGetList(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,9 +156,9 @@ func TestFsStore_PutGetList(t *testing.T) {
 	}
 }
 
-func TestFsStore_GetMissing(t *testing.T) {
+func TestStore_GetMissing(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,9 +170,9 @@ func TestFsStore_GetMissing(t *testing.T) {
 	}
 }
 
-func TestFsStore_Put_AtomicNoTempFileLeftBehind(t *testing.T) {
+func TestStore_Put_AtomicNoTempFileLeftBehind(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,9 +189,9 @@ func TestFsStore_Put_AtomicNoTempFileLeftBehind(t *testing.T) {
 	}
 }
 
-func TestFsStore_Append(t *testing.T) {
+func TestStore_Append(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,12 +228,12 @@ func TestFsStore_Append(t *testing.T) {
 	}
 }
 
-// TestFsStore_Append_ConcurrentSafe exercises the actual reason Append opens the file
-// with O_APPEND instead of being implemented as a client-side Get+concatenate+Put: many
+// TestStore_Append_ConcurrentSafe exercises the actual reason Append opens the file with
+// O_APPEND instead of being implemented as a client-side Get+concatenate+Put: many
 // concurrent appends must not lose or interleave-corrupt any writer's data.
-func TestFsStore_Append_ConcurrentSafe(t *testing.T) {
+func TestStore_Append_ConcurrentSafe(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newFsStore(dir)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,94 +270,5 @@ func TestFsStore_Append_ConcurrentSafe(t *testing.T) {
 			t.Fatalf("duplicate line (torn/repeated write?): %q", line)
 		}
 		seen[line] = true
-	}
-}
-
-// TestFsAPI_EndToEnd exercises the REST handlers over real HTTP. Traversal attempts
-// aren't tested here beyond a normal one: net/http's ServeMux itself cleans/redirects
-// literal ".." segments in the URL path before they ever reach our handler, so that
-// guard is only reachable (and only meaningfully tested) at the fsStore.resolve level
-// above.
-func TestFsAPI_EndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	_, wsURL := newTestServerWithConfig(t, TamperConfig{FsRoot: dir})
-	base := "http" + strings.TrimPrefix(wsURL, "ws") + "/api/i/tamper/fs"
-
-	resp := httpDo(t, http.MethodGet, base+"/list", nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /fs/list: expected 200, got %d", resp.StatusCode)
-	}
-	if body := strings.TrimSpace(string(readBody(t, resp))); body != "[]" {
-		t.Fatalf("expected empty list, got %s", body)
-	}
-
-	resp = httpDo(t, http.MethodPut, base+"/file/sub/foo.bin", strings.NewReader("hello"))
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PUT /fs/file/sub/foo.bin: expected 204, got %d", resp.StatusCode)
-	}
-
-	resp = httpDo(t, http.MethodGet, base+"/file/sub/foo.bin", nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /fs/file/sub/foo.bin: expected 200, got %d", resp.StatusCode)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
-		t.Errorf("expected Content-Type application/octet-stream, got %q", ct)
-	}
-	if body := string(readBody(t, resp)); body != "hello" {
-		t.Fatalf("unexpected content: %s", body)
-	}
-
-	resp = httpDo(t, http.MethodGet, base+"/list/sub", nil)
-	if body := string(readBody(t, resp)); !strings.Contains(body, `"foo.bin"`) {
-		t.Fatalf("expected listing of sub to contain foo.bin, got %s", body)
-	}
-
-	resp = httpDo(t, http.MethodGet, base+"/file/nope.bin", nil)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET missing file: expected 404, got %d", resp.StatusCode)
-	}
-
-	resp = httpDo(t, http.MethodGet, base+"/list/nope", nil)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET missing dir listing: expected 404, got %d", resp.StatusCode)
-	}
-
-	// POST appends rather than overwriting, and creates the file if it doesn't exist.
-	resp = httpDo(t, http.MethodPost, base+"/file/sub/log.txt", strings.NewReader("line 1\n"))
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("POST /fs/file/sub/log.txt (create): expected 204, got %d", resp.StatusCode)
-	}
-	resp = httpDo(t, http.MethodPost, base+"/file/sub/log.txt", strings.NewReader("line 2\n"))
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("POST /fs/file/sub/log.txt (append): expected 204, got %d", resp.StatusCode)
-	}
-	resp = httpDo(t, http.MethodGet, base+"/file/sub/log.txt", nil)
-	if body := string(readBody(t, resp)); body != "line 1\nline 2\n" {
-		t.Fatalf("unexpected appended content: %q", body)
-	}
-}
-
-func TestFsAPI_DisabledWithoutFsRoot(t *testing.T) {
-	_, wsURL := newTestServerWithConfig(t, TamperConfig{})
-	base := "http" + strings.TrimPrefix(wsURL, "ws") + "/api/i/tamper/fs"
-
-	resp := httpDo(t, http.MethodGet, base+"/list", nil)
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("expected 501 when fs-root isn't configured, got %d", resp.StatusCode)
-	}
-
-	resp = httpDo(t, http.MethodGet, base+"/file/foo", nil)
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("expected 501 when fs-root isn't configured, got %d", resp.StatusCode)
-	}
-
-	resp = httpDo(t, http.MethodPut, base+"/file/foo", strings.NewReader("x"))
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("expected 501 when fs-root isn't configured, got %d", resp.StatusCode)
-	}
-
-	resp = httpDo(t, http.MethodPost, base+"/file/foo", strings.NewReader("x"))
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("expected 501 when fs-root isn't configured, got %d", resp.StatusCode)
 	}
 }

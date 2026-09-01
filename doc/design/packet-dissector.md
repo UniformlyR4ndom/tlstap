@@ -16,7 +16,7 @@ collapsible tree of field nodes, clicking a node highlights its bytes in the hex
 ## Relationship to the framer stage
 
 The framer stage (built first) reassembles a stream's raw chunks into logical frames —
-`{offset, length, direction, kind}` — and persists that index server-side so `HexDump`
+`{ranges: [{offset, length}], direction, kind}` — and persists that index server-side so `HexDump`
 can render a stream partitioned by frame instead of by raw TCP chunk. The dissector is a
 second, independent layer on top: given one frame's bytes (plus its `kind`/metadata),
 produce a field tree. It has no involvement in framing itself and no persistence of its

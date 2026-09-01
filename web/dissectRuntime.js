@@ -5,16 +5,20 @@
 // "post bytes+frame in, get a result back", per doc/design/packet-dissector.md's
 // "Execution model".
 //
-// Script contract: a plain top-level function dissect(bytes, frame), returning
-// FieldNode[] — top-level siblings, not one wrapping root (see the design doc's "Field
-// node schema"). frame is {offset, length, direction, kind, ...}, the same shape a
-// framer script tags its frames with. No dissect function defined, one that throws, or
-// one that doesn't return an array all reject runDissector's returned promise.
+// Script contract: a plain top-level function dissect(bytes, frame), sync or async —
+// always awaited (so a script that needs dissector.fs.*/kv.* below can just await them
+// inline), returning FieldNode[] — top-level siblings, not one wrapping root (see the
+// design doc's "Field node schema"). frame is {offset, length, direction, kind, ...}, the
+// same shape a framer script tags its frames with. No dissect function defined, one that
+// throws, or one that doesn't return an array all reject runDissector's returned promise.
 //
 // A global `dissector` object exposes the same transform framework framer/tamper scripts
 // get, under dissector.transform.*/encode.*/decode.*/number.* (mirroring framer.*'s
 // shape and always-synchronous convention — see frameRuntime.js's own header comment for
-// why). Named `dissector`, not `dissect`, so it can't collide with the script's own
+// why), plus dissector.fs.*/kv.* (coreApiClient.js) — real network calls, so unlike the
+// transform surface above these always return a Promise and must be awaited; see
+// core/CLAUDE.md for core.fs/core.kv themselves and coreApiClient.js's own header for the
+// method list. Named `dissector`, not `dissect`, so it can't collide with the script's own
 // top-level `function dissect(...)` declaration. Lets a script that needs to, say,
 // decompress a sub-payload before reporting it as a node's `content` do so
 // (dissector.transform.compression.zlibDecompress(bytes)) and base64-encode the result
@@ -27,6 +31,12 @@ import { buildTransformApiSource, buildNumberApiSource, HEX_DEFAULTS, BASE64_DEF
 // wouldn't resolve.
 const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
 const FORMAT_URL = new URL('./format.js', import.meta.url).href
+const CORE_API_URL = new URL('./coreApiClient.js', import.meta.url).href
+
+// Absolute origin, for the same relative-URL-resolution reason as the module URLs above —
+// baked into BOOTSTRAP as string literals and handed to createFsApi/createKvApi.
+const FS_BASE_URL = new URL('/api/core/fs', location.href).href
+const KV_BASE_URL = new URL('/api/core/kv', location.href).href
 
 // dissector.transform.<category>'s function bodies call OPERATIONS directly — always
 // plain sync, since runScript never calls dissect() before modulesReady has resolved.
@@ -54,9 +64,10 @@ const BOOTSTRAP = `
     const BASE64_DEFAULTS = ${JSON.stringify(BASE64_DEFAULTS)}
 
     const modulesReady = (async () => {
-        const [transformsMod, formatMod] = await Promise.all([
+        const [transformsMod, formatMod, coreApiMod] = await Promise.all([
             import(${JSON.stringify(TRANSFORMS_URL)}),
             import(${JSON.stringify(FORMAT_URL)}),
+            import(${JSON.stringify(CORE_API_URL)}),
         ])
         await transformsMod.warmupWhirlpool()
         OPERATIONS = transformsMod.OPERATIONS
@@ -76,6 +87,8 @@ const BOOTSTRAP = `
                 hexdump: (text) => FORMAT.parseHexdump(text),
             },
             number: ${DISSECTOR_NUMBER_API_SOURCE},
+            fs: coreApiMod.createFsApi(${JSON.stringify(FS_BASE_URL)}),
+            kv: coreApiMod.createKvApi(${JSON.stringify(KV_BASE_URL)}),
         }
     })()
 
@@ -84,7 +97,7 @@ const BOOTSTRAP = `
             throw new Error('dissector script must define a top-level function named "dissect"')
         }
         await modulesReady
-        const nodes = dissect(bytes, frame)
+        const nodes = await dissect(bytes, frame)
         if (!Array.isArray(nodes)) {
             throw new Error('dissector script\\'s "dissect" function must return an array of field nodes')
         }

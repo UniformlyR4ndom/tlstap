@@ -65,8 +65,7 @@ function frame(state, chunk) {
         if (buf.length - pos < totalFrameSize) break // frame not fully arrived yet
 
         frames.push({
-            offset: bufBaseOffset + pos,
-            length: totalFrameSize,
+            ranges: [{ offset: bufBaseOffset + pos, length: totalFrameSize }],
             meta: { declaredLength: LENGTH_SIZE === 8 ? Number(rawLength) : rawLength },
         })
         pos += totalFrameSize

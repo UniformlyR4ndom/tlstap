@@ -93,7 +93,10 @@ export async function catchUpFramer(sessionId, streamId, scriptName, scriptSourc
     if (chunks.length === 0) return // shouldn't happen given the checks above, but nothing to do either way
 
     // Tags each frame with the stid and time of whichever raw chunk (in ITS OWN
-    // direction's sequence) contains its last byte — stid is the true-wire-order key
+    // direction's sequence) contains its last byte — i.e. the chunk containing
+    // max(range.offset + range.length) across the frame's own ranges array, since a
+    // frame's ranges are all within one direction and offset is monotonic with arrival
+    // time there. stid is the true-wire-order key
     // listFramesTimeline sorts by; time is a frame's only timestamp, since frames aren't
     // captured, they're computed. This is deliberately independent of the order frame()
     // actually returned the frame in (that's what frames.seq is for instead, assigned
@@ -119,7 +122,8 @@ export async function catchUpFramer(sessionId, streamId, scriptName, scriptSourc
     let finalState = state
     await runFramer(scriptName, scriptSource, state, processedOffset, chunks, async batch => {
         const framesWithStid = batch.frames.map(f => {
-            const c = chunkAtOffset(dirToStr(f.direction), f.offset + f.length - 1)
+            const maxByteOffset = Math.max(...f.ranges.map(r => r.offset + r.length - 1))
+            const c = chunkAtOffset(dirToStr(f.direction), maxByteOffset)
             return { ...f, stid: c.stid, time: c.time }
         })
         await appendFrames(key, expectedOffset, framesWithStid, batch.processedOffset, batch.state, { c2s: false, s2c: false })

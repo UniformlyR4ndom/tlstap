@@ -21,9 +21,13 @@ A running script registers handlers for `onConnect`/`onReceive`/`onClose`, decid
 held chunk whether to forward it (unmodified or edited), drop it, or pause for an
 operator decision, can call any Transform-panel operation (hashing, encoding,
 compression, encryption, checksums, MAC) on the bytes it holds, can read/write a scoped
-area of the host filesystem (state otherwise doesn't survive a restart — see
+area of the host filesystem or a general-purpose key-value store (state otherwise
+doesn't survive a restart — see
 ["Custom state across invocations"](#27-custom-state-across-invocations)), and can log
-output, in-browser and optionally server-side.
+output, in-browser and optionally server-side. A separately-selected, separately-stored
+*framer* script can reassemble raw chunks into logical frames first, so the
+interception script reacts to whole units via `onFrame` instead — see
+["Framer scripts"](#4-framer-scripts).
 
 **Trust model:** a script runs with the same privileges as any other code on the page —
 no sandboxing beyond the Worker boundary (no DOM/page access, full access to whatever
@@ -43,18 +47,29 @@ everything were one file. Each Blob ends with its own `//# sourceURL=...` so
 DevTools/stack traces name the actual failing file. It's a classic (non-module) Worker,
 since `importScripts()` requires one.
 
+If a framer script is also selected (§4), `start()` takes two extra arguments and builds
+a *third* Blob for it — loaded first, and deliberately **not** IIFE-wrapped (its `frame`
+function must resolve as a bare global, unlike the interception script's side-effecting
+`tamper.register(...)` call). Whether a framer is active is decided per dispatch, purely
+by `typeof frame === 'function'` — no separate flag crosses into the Worker.
+
 ### 2.2 The `tamper` object and the RPC bridge
 
-`BOOTSTRAP` defines `self.tamper` synchronously. Most methods
-(`peek`/`release`/`dropConnection`/`setIntercept`/`listStreams`, all of `fs.*`) are thin
-`postMessage`-based RPC wrappers: the Worker has no direct network access from a Blob
-URL, so a call posts to the main thread, which performs the real operation (via handlers
-mirroring `tamperApi.js`) and posts back the result. `fs.*`'s transport is a plain REST
-fetch rather than the control WebSocket, routed through the same bridge for the same
-reason.
+`BOOTSTRAP` defines `self.tamper` synchronously. `peek`/`release`/`dropConnection`/
+`setIntercept`/`listStreams` are thin `postMessage`-based RPC wrappers: each is a
+live-connection-scoped operation that needs state the main thread already tracks (the
+control WebSocket, stream metadata), so a call posts to the main thread, which performs
+the real operation (via handlers mirroring `tamperApi.js`) and posts back the result.
 
 Direction is `'c2s'`/`'s2c'` everywhere in this API; translation to/from the wire
 protocol's numeric `0`/`1` happens only at this bridge.
+
+`fs.*`/`kv.*` (§3.3) don't go through this bridge at all — they're a plain `fetch()`
+straight from inside the Worker (`coreApiClient.js`), since neither is scoped to a
+connection or needs anything the main thread tracks. This is possible despite the Worker
+having no page origin of its own to resolve a relative URL against, because the base URL
+(`/api/core/fs` or `/api/core/kv`) is computed as an *absolute* URL on the main thread
+and baked into `BOOTSTRAP`'s own source before the Worker is even built.
 
 ### 2.3 Events in, and per-connection ordering
 
@@ -127,8 +142,8 @@ tamper.register('onReceive', ctx => { perStream.get(ctx.conn).count++ })
 tamper.register('onClose', c => perStream.delete(c.conn))
 ```
 
-This state is memory-only — gone on Stop/Restart/error/disconnect; `tamper.fs.*` (§3.3)
-is for anything that needs to survive that. `count` above counts `onReceive`
+This state is memory-only — gone on Stop/Restart/error/disconnect; `tamper.fs.*`/
+`tamper.kv.*` (§3.3) are for anything that needs to survive that. `count` above counts `onReceive`
 *dispatches*, not physical TCP reads (see §2.3's coalescing) — a lower bound on chunk
 arrivals under load, not an exact count.
 
@@ -159,15 +174,20 @@ tamper.register(name, handler)
 tamper.register('onConnect', conn => tamper.log('connected', conn.src))
 ```
 
-`name` is one of `'onConnect'`, `'onReceive'`, `'onClose'` — anything else reports an
-error and is ignored. A hook may be registered more than once; all handlers run, awaited
-in registration order.
+`name` is one of `'onConnect'`, `'onReceive'`, `'onFrame'`, `'onClose'` — anything else
+reports an error and is ignored. A hook may be registered more than once; all handlers
+run, awaited in registration order.
 
 | Hook | Fires | Handler signature |
 |---|---|---|
 | `onConnect` | A new connection is established | `(conn) => ...` |
-| `onReceive` | A chunk was newly held on an intercepted stream, either direction | `(ctx) => ...` |
+| `onReceive` | A chunk was newly held on an intercepted stream, either direction — only when no framer script is selected for this run (see §4) | `(ctx) => ...` |
+| `onFrame` | A framer script resolved a complete frame — only when one *is* selected for this run (see §4); fires in place of `onReceive`, not alongside it | `(ctx, frame) => ...` |
 | `onClose` | A connection terminated | `(conn) => ...` |
+
+A script may register both `onReceive` and `onFrame` — whichever applies to a given run
+is the one that actually fires, so the same script works whether or not a framer is
+selected alongside it.
 
 `conn` (for `onConnect`/`onClose`): `{ conn, src, dst }` — `conn` is the numeric
 connection id (stable for the connection's lifetime, never reused within one proxy run),
@@ -217,11 +237,17 @@ tamper.log('handshake complete', conn.src)
 Most scripts won't need `tamper.peek`/`tamper.release` directly — `ctx` (§3.4) wraps
 them with a friendlier, buffer-local API for reacting inside `onReceive`.
 
-### 3.3 Filesystem access
+### 3.3 Filesystem and key-value access
 
-Only usable if the interceptor was configured with `fs-root` — otherwise every call
-rejects (mirroring the REST API's `501`). Paths are always slash-separated, relative to
-`fs-root`; `''` refers to the root itself.
+Both are usable from `framer.*`/`dissector.*` too (see those scripting APIs), with the
+identical method shapes below — a script author doesn't need different syntax per
+runtime.
+
+**Filesystem.** Only usable if the server's `core.fs` service is configured (a separate
+config section from `tamper` itself — not one of `tamper`'s own settings) — otherwise
+every call rejects, mirroring the REST API's error response. Paths are always
+slash-separated, relative to `core.fs`'s configured root directory; `''` refers to the
+root itself.
 
 ```js
 tamper.fs.listFiles(path)          // -> Promise<Array<{ name, dir, size }>>, one directory level
@@ -240,6 +266,36 @@ await tamper.fs.appendFile('audit.log', new TextEncoder().encode('line\n'))
 `appendFile` is a genuine server-side append (not read-modify-write) — safe to call
 concurrently from different connections' independently-scheduled `onReceive` handlers
 without losing data.
+
+**Key-value store.** Only usable if the server's `core.kv` service is configured
+(likewise a separate config section, its own SQLite file). Unlike `fs.*`, there's no
+path/directory structure — just opaque string keys, useful for sharing a small value
+across streams/scripts/interceptors (e.g. a crypto key derived on one connection, needed
+to decrypt traffic on another).
+
+```js
+tamper.kv.write(key, value)   // -> Promise<void>; value is JSON-serialized
+await tamper.kv.write('session-key', { alg: 'aes-256-gcm', key: hexKey })
+
+tamper.kv.read(key)           // -> Promise; JSON-parses the stored value
+const { key: hexKey } = await tamper.kv.read('session-key')
+
+tamper.kv.writeBytes(key, bytes)  // -> Promise<void>; raw bytes, no JSON encoding
+await tamper.kv.writeBytes('raw-blob', someBytes)
+
+tamper.kv.readBytes(key)          // -> Promise<Uint8Array>
+const blob = await tamper.kv.readBytes('raw-blob')
+
+tamper.kv.list(prefix)        // -> Promise<string[]>; prefix optional, omitted = all keys
+const keys = await tamper.kv.list('session-')
+
+tamper.kv.delete(key)         // -> Promise<void>; idempotent, no error if already absent
+await tamper.kv.delete('session-key')
+```
+
+`read`/`readBytes` reject (a thrown `Error`, same as every other call in this section)
+if `key` doesn't exist — there's no "missing key" sentinel return value, so a script
+reading an optional key should `try`/`catch` or `list` first to check.
 
 ### 3.4 `ctx` (passed to `onReceive`)
 
@@ -342,9 +398,135 @@ Unlike `tamper.transform.*`, `hex`/`base64` return a plain string, not `Uint8Arr
 they aren't chainable pipeline steps; `hexdump` has no Transform-panel equivalent at
 all. Same synchronous-after-startup behavior as `tamper.transform.*` (§3.5).
 
-## 4. Examples
+## 4. Framer scripts
 
-### 4.1 Pass-through digest logger
+### 4.1 What a framer script does
+
+A framer script reassembles a stream's raw chunks into logical frames — an HTTP/1
+message, a length-prefixed record, a TLS record — so an interception script can react to
+whole units via `onFrame` instead of reimplementing that reassembly itself inside
+`onReceive`. It's a second, separately-authored and separately-stored script, run
+composed with (wrapping) whichever interception script is actually driving
+forward/edit/drop decisions — not a replacement for one.
+
+This mirrors dbdump's own framer feature (Analysis tab, "Framer" control) closely enough
+that a script can often be copied between the two with little or no change, but the two
+are otherwise unrelated: dbdump's framer is a read-only, offline analysis aid over
+already-captured, immutable bytes; a tamper framer script operates on live, in-flight,
+editable traffic, and has its own separate script store (`GET`/`PUT`/`DELETE
+/api/i/tamper/framer/scripts/<name>` — the "Framer Scripts" sub-tab's CRUD editor, not
+the "Scripts" sub-tab used for interception scripts). See
+[`doc/design/tamper-framer.md`](../design/tamper-framer.md) for the full design rationale.
+
+### 4.2 Selecting a framer alongside an interception script
+
+The Scripts sub-tab's toolbar has a **framer** dropdown next to **Run**/**Stop** —
+`(none)` (the default; `onReceive` fires as normal) or one of the scripts stored in the
+Framer Scripts sub-tab. The dropdown is disabled while a script is running: composition
+is fixed for the run's whole lifetime, same as the interception script itself — **Stop**
+first to pick a different framer (or none).
+
+### 4.3 The `frame(state, chunk)` contract
+
+A framer script defines one top-level function, looked up by name (no registration
+call, unlike `tamper.register`):
+
+```js
+function frame(state, chunk) {
+    // chunk: { direction, data: Uint8Array, closed? }
+    // returns { frames: [{ length, meta? }, ...], state } — or nothing, meaning
+    // "no new frames, state unchanged"
+}
+```
+
+- **Combined mode**: one script instance/`state` per connection, fed both directions'
+  chunks — `direction` (`'c2s'`/`'s2c'`) varies call to call. A script correlating the
+  two directions (e.g. an HTTP/1 response's length depending on its request's method)
+  keeps its own per-direction sub-state inside the one shared `state`
+  (`state.c2s`/`state.s2c`), the same pattern this codebase's example dbdump framers use.
+- **`chunk.data` is only the genuinely new bytes** since `frame()` was last called for
+  this direction — never the whole accumulated buffer. Carrying forward an incomplete
+  tail across calls is the script's own job via `state`, exactly like dbdump's framer
+  scripts already do (a `carry` byte array kept in `state`, prepended to `chunk.data` at
+  the top of the next call).
+- **One call may resolve several frames at once** — `frames` is an array precisely so a
+  script's own internal loop (draining its buffered state as far as it currently can)
+  doesn't need the platform to call `frame()` again just to find a second already-decided
+  frame. Each entry `{length, meta?}` consumes exactly that many bytes from the front of
+  whatever's currently buffered (starting right after the previous entry's own bytes) —
+  unlike dbdump's framer, there's no `offset` field, since nothing is persisted to
+  address by absolute offset.
+- **The framer only ever sees original incoming bytes** — an interception script's edit
+  to a frame doesn't feed back into the framer's own decisions for the next one. If an
+  edit changes something framing depends on (e.g. rewriting a length-prefix field),
+  keeping downstream framing consistent is the interception script's own responsibility.
+- `chunk.closed = true` (with empty `data`) is the last call for a direction, once that
+  direction's connection has closed — see §4.5.
+
+### 4.4 `onFrame(ctx, frame)`
+
+Fires once per frame a selected framer script resolves, in place of `onReceive` (§3.1).
+`ctx` is the *same* object shape `onReceive` gets (§3.4) — `get`/`set`/`append`/
+`release`/`drop`/`pause`/`log` — scoped to just this one frame's bytes rather than the
+whole held buffer; `release(n)`/`drop(n)`'s prefix-based semantics apply to the frame,
+not the connection's raw stream.
+
+```js
+tamper.register('onFrame', async (ctx, frame) => {
+    // frame: { direction, data: Uint8Array, meta, final }
+    tamper.log(frame.direction, frame.meta, ctx.get().length, 'bytes')
+    await ctx.release()  // forward this frame's bytes unedited
+})
+```
+
+`frame.meta` is whatever the framer script's own `{length, meta}` entry carried —
+opaque, script-defined (e.g. decoded header fields), `null` if the framer didn't set one.
+`frame.final` is `true` only for a frame produced during close handling (§4.5); `false`
+for every normal, live frame.
+
+Same auto-commit rule as `onReceive` (§3.4): a handler that mutates `ctx` but returns
+without an explicit `release`/`drop`/`pause` has that mutation auto-committed as an
+edit-only hold. If a framer is selected but the interception script registers no
+`onFrame` handler at all — or a handler runs but never touches `ctx` — there's nothing
+to auto-commit, so the frame simply stays held (same as an `onReceive` with no
+registered handler) until the hold-timeout releases it.
+
+### 4.5 Connection close and the synthetic final frame
+
+Once a direction's connection closes, its framer gets one last `frame(state, {direction,
+data: new Uint8Array(0), closed: true})` call — empty `data`, since by this point the
+framer's own `state` already has everything it needs (mirrors dbdump's identical
+convention) — to flush anything whose length was implicit in the connection closing
+(e.g. an HTTP/1 response with neither `Content-Length` nor chunked encoding).
+
+Whatever bytes that call still doesn't resolve into a frame are exposed to the
+interception script as **one final synthetic frame** — `meta: null`, `final: true` —
+rather than silently bypassing `onFrame`. Every frame produced during close handling
+(both what the `closed: true` call itself resolves, and this synthetic leftover) has
+`final: true`; there's no live server-side buffer left to act on by this point, so
+`ctx.release()`/`drop()`/`pause()` on a close-triggered frame are safe no-ops (they
+never throw) — `get()`/`set()`/`append()`/`log()` all still behave normally, purely
+locally.
+
+### 4.6 `framer.*`
+
+The framer script's own global, parallel to `tamper.*` (§3.2/§3.5/§3.6) but scoped to
+what a pure reassembly function needs — no `register`/`peek`/`release`/live-connection
+primitives, since a framer script has no hooks and no direct network access of its own:
+
+```js
+framer.transform.<category>.<function>(bytes, params)  // same as tamper.transform.*, §3.5
+framer.encode.*  / framer.decode.*                      // same as tamper.encode.*/decode.*, §3.6
+framer.number.decode<Type>(bytes) / encode<Type>(value)  // real numbers/bigints, not decimal text
+framer.fs.*  / framer.kv.*                                // same as tamper.fs.*/kv.*, §3.3
+framer.log(...args)                                        // prints to the same Scripts sub-tab
+                                                             // log panel as tamper.log/ctx.log,
+                                                             // prefixed [framer] to tell them apart
+```
+
+## 5. Examples
+
+### 5.1 Pass-through digest logger
 
 The bundled starter script (`examples/tamper/scripts/hash-logger.js`, `scripts-dir` in
 this repo's `config.json`): logs a SHA256 digest of every chunk in either direction,
@@ -373,7 +555,7 @@ The `bytes.length === 0` guard matters under load: per §2.3's `onReceive` coale
 trailing dispatch can find the buffer already drained by an earlier one — without the
 guard you'd see occasional harmless but noisy `SHA256(<data> 0 bytes): e3b0c442...` lines.
 
-### 4.2 Find-and-replace on the fly
+### 5.2 Find-and-replace on the fly
 
 Rewrites an HTTP response header on the way back to the client:
 
@@ -389,7 +571,7 @@ tamper.register('onReceive', async (ctx) => {
 })
 ```
 
-### 4.3 Pause client requests for manual review
+### 5.3 Pause client requests for manual review
 
 Holds every client→server chunk, logs a preview, then hands off to an operator via
 `ctx.pause()`:
@@ -406,9 +588,10 @@ tamper.register('onReceive', async (ctx) => {
 })
 ```
 
-### 4.4 Durable per-session audit log
+### 5.4 Durable per-session audit log
 
-Appends a one-line summary of every chunk to a file under `fs-root`, demonstrating state
+Appends a one-line summary of every chunk to a file under `core.fs`'s configured root,
+demonstrating state
 that survives a script Stop/Restart (unlike the in-memory `Map` pattern in §2.7):
 
 ```js
@@ -420,7 +603,7 @@ tamper.register('onReceive', async (ctx) => {
 })
 ```
 
-### 4.5 Transparent gzip inspection
+### 5.5 Transparent gzip inspection
 
 Auto-decompresses a gzip-framed response body for logging, without altering what's
 actually forwarded:
@@ -440,5 +623,27 @@ tamper.register('onReceive', async (ctx) => {
         }
     }
     await ctx.release()
+})
+```
+
+### 5.6 Sharing a derived key across connections via `kv`
+
+Stashes a value derived on one connection (e.g. a session key parsed out of a handshake)
+in `core.kv` under a key namespaced by the client's address, so a *different*
+connection — potentially handled by a different interceptor, script, or even the
+`framer`/`dissector` scripting APIs — can look it up later:
+
+```js
+tamper.register('onReceive', async (ctx) => {
+    const bytes = ctx.get()
+    if (ctx.direction === 'c2s' && looksLikeHandshake(bytes)) {
+        const derivedKey = deriveKeyFrom(bytes) // however this connection's protocol works
+        await tamper.kv.write(`session-key:${ctx.conn}`, { key: [...derivedKey] })
+    }
+    await ctx.release()
+})
+
+tamper.register('onClose', async (c) => {
+    await tamper.kv.delete(`session-key:${c.conn}`) // don't leak state past the connection
 })
 ```

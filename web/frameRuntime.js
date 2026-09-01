@@ -5,19 +5,20 @@
 // function over bytes already in hand, so the only back-and-forth is a batch/ack cycle —
 // the caller awaits each batch's persistence before the Worker computes the next one.
 //
-// Script contract: a plain top-level function frame(state, chunk). chunk is
-// {offset, length, direction, data} — one raw chunk, in true chronological (stid) order
-// across *both* directions, so chunk.direction ('c2s'/'s2c') now varies call to call
+// Script contract: a plain top-level function frame(state, chunk), sync or async — always
+// awaited (so a script that needs framer.fs.*/kv.* below can just await them inline).
+// chunk is {offset, length, direction, data} — one raw chunk, in true chronological (stid)
+// order across *both* directions, so chunk.direction ('c2s'/'s2c') now varies call to call
 // within one run rather than being fixed for it; a script correlating the two keeps
 // per-direction sub-state (e.g. state.c2s/state.s2c) itself. state and the returned
 // {frames, state} are plain JSON-serializable values, never bytes/base64. Each returned
-// frame is {offset, length, meta?} — direction is not part of that shape; runScript below
+// frame is {ranges: [{offset, length}], meta?} — direction is not part of that shape; runScript below
 // tags each with whichever chunk's frame() call produced it. No frame function defined,
 // or one that throws, rejects runFramer's returned promise.
 //
 // A global `framer` object exposes the same transform framework tamper scripts get, under
 // framer.transform.*/encode.*/decode.*/number.* (mirroring tamper.*'s shape, sans the
-// `tamper` prefix). Unlike tamper's version, this is always plain synchronous — never a
+// `tamper` prefix). Unlike tamper's version, these are always plain synchronous — never a
 // Promise — because runScript (unlike tamper's live event dispatch) only starts once
 // explicitly told to via the 'run' message, so it can simply await the module import
 // finishing first; a framer script's own top level, outside frame(), has no such
@@ -29,6 +30,10 @@
 // per-direction dynamic table state doesn't fit dissector scripts (which carry no
 // cross-frame state at all), so it's exposed to framer scripts only. See
 // hpackDecode.js's own header comment for the table-threading contract.
+// framer.fs.*/framer.kv.* (coreApiClient.js) — the odd ones out the other way: real
+// network calls, so unlike every surface above these always return a Promise and must be
+// awaited. See core/CLAUDE.md for core.fs/core.kv themselves and coreApiClient.js's own
+// header for the method list.
 
 import { buildTransformApiSource, buildNumberApiSource, HEX_DEFAULTS, BASE64_DEFAULTS } from './transformWorkerApi.js'
 
@@ -41,6 +46,12 @@ const BATCH_BYTES = 2 * 1024 * 1024 // ...or this many bytes processed, whicheve
 const TRANSFORMS_URL = new URL('./transforms.js', import.meta.url).href
 const FORMAT_URL = new URL('./format.js', import.meta.url).href
 const HPACK_URL = new URL('./hpackDecode.js', import.meta.url).href
+const CORE_API_URL = new URL('./coreApiClient.js', import.meta.url).href
+
+// Absolute origin, for the same relative-URL-resolution reason as the module URLs above —
+// baked into BOOTSTRAP as string literals and handed to createFsApi/createKvApi.
+const FS_BASE_URL = new URL('/api/core/fs', location.href).href
+const KV_BASE_URL = new URL('/api/core/kv', location.href).href
 
 // framer.transform.<category>'s function bodies call OPERATIONS directly — always plain
 // sync, since runScript never calls frame() before modulesReady has resolved.
@@ -76,10 +87,11 @@ const BOOTSTRAP = `
     let hpackMod = null
 
     const modulesReady = (async () => {
-        const [transformsMod, formatMod, hpackModule] = await Promise.all([
+        const [transformsMod, formatMod, hpackModule, coreApiMod] = await Promise.all([
             import(${JSON.stringify(TRANSFORMS_URL)}),
             import(${JSON.stringify(FORMAT_URL)}),
             import(${JSON.stringify(HPACK_URL)}),
+            import(${JSON.stringify(CORE_API_URL)}),
         ])
         await transformsMod.warmupWhirlpool()
         OPERATIONS = transformsMod.OPERATIONS
@@ -108,6 +120,8 @@ const BOOTSTRAP = `
             // buffer) is the script's job — this function carries no state of its own.
             hpack: { decode: (bytes, table) => hpackMod.decodeHeaderBlock(bytes, table) },
             log: (...args) => postMessage({ kind: 'log', args, direction: currentDirection }),
+            fs: coreApiMod.createFsApi(${JSON.stringify(FS_BASE_URL)}),
+            kv: coreApiMod.createKvApi(${JSON.stringify(KV_BASE_URL)}),
         }
     })()
 
@@ -140,10 +154,10 @@ const BOOTSTRAP = `
             // tagging below and framer.log's own postMessage (via currentDirection).
             const dirNum = chunk.direction === 'c2s' ? 0 : 1
             currentDirection = dirNum
-            const result = frame(state, chunk) || {}
+            const result = (await frame(state, chunk)) || {}
             if ('state' in result) state = result.state
-            // direction isn't part of a script's own {offset, length, meta?} return
-            // shape — tagged here from whichever chunk produced it.
+            // direction isn't part of a script's own {ranges: [{offset, length}], meta?}
+            // return shape — tagged here from whichever chunk produced it.
             for (const f of result.frames || []) pending.push({ ...f, direction: dirNum })
             pendingBytes += chunk.length
             processedOffset = { ...processedOffset, [chunk.direction]: chunk.offset + chunk.length }

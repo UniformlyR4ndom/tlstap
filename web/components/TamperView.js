@@ -6,7 +6,9 @@ import TamperStreamsList from './TamperStreamsList.js'
 import TamperQueueList from './TamperQueueList.js'
 import TamperDetailPanel from './TamperDetailPanel.js'
 import TamperScriptsPanel from './TamperScriptsPanel.js'
-import { openTamperControl, peekBuffer, getLogFileInfo, listFs, readFs, writeFs, appendFs } from '../tamperApi.js'
+import TamperFramerScriptsPanel from './TamperFramerScriptsPanel.js'
+import { openTamperControl, peekBuffer, getLogFileInfo } from '../tamperApi.js'
+import { listFramerScripts, getFramerScript } from '../tamperFramerApi.js'
 import { createScriptRuntime } from '../scriptRuntime.js'
 import { useResizableLayout } from '../useResizableLayout.js'
 import { fmtLogArgs } from '../format.js'
@@ -26,10 +28,16 @@ export default function TamperView() {
     const [selectedKey,   setSelectedKey]   = useState(null)
     const [autoIntercept, setAutoIntercept] = useState(false)
     const [detailHeight,  handleDetailResize] = useResizableLayout('tamperDetailHeight', { sign: -1, min: 120, max: () => Math.floor(window.innerHeight * 0.7) })
-    const [subTab,        setSubTab]        = useState('intercept') // 'intercept' | 'scripts'
+    const [subTab,        setSubTab]        = useState('intercept') // 'intercept' | 'scripts' | 'framer-scripts'
     const [runningScript, setRunningScript] = useState(null)
     const [scriptLog,     setScriptLog]     = useState([])
     const [scriptsRefreshSignal, setScriptsRefreshSignal] = useState(0)
+    // Framer selection is plain, non-persisted state: unlike dbdump's per-stream
+    // framerPrefs.js, there's only one "current" choice here (one script run at a time),
+    // not one per stream.
+    const [framerScripts, setFramerScripts] = useState([])
+    const [framerScriptsRefreshSignal, setFramerScriptsRefreshSignal] = useState(0)
+    const [framerSelected, setFramerSelected] = useState('')
     // logFileInfo: whether the server persists the script log to a file (static for the
     // server's run, fetched once on mount). bypassBrowserLog: skip the browser's own
     // in-memory copy, offered only while a log file is active. Both are read inside onLog
@@ -68,12 +76,6 @@ export default function TamperView() {
             listStreams: () => controlRef.current
                 ? controlRef.current.listStreams().then(res => res.streams)
                 : Promise.reject(new Error('not connected')),
-            // fs-root access is a plain REST call, independent of the control connection's
-            // lifecycle — no controlRef guard needed here, unlike every handler above.
-            fsList: (path) => listFs(path),
-            fsRead: (path) => readFs(path),
-            fsWrite: (path, bytes) => writeFs(path, bytes),
-            fsAppend: (path, bytes) => appendFs(path, bytes),
             // prefix (ctx.log only) is a ready-made connection-summary + timestamp line,
             // rendered above the args rather than joined into them so it stays visually
             // distinct even when args is empty (a bare ctx.log() still logs something
@@ -139,6 +141,10 @@ export default function TamperView() {
             },
             onStreamList: setStreams,
             onScriptUpdated: () => setScriptsRefreshSignal(v => v + 1),
+            onFramerScriptUpdated: () => {
+                setFramerScriptsRefreshSignal(v => v + 1)
+                listFramerScripts().then(setFramerScripts).catch(() => {})
+            },
         })
         controlRef.current = control
     }
@@ -156,6 +162,13 @@ export default function TamperView() {
     // WebSocket) since log-file config never changes for the server's lifetime.
     useEffect(() => {
         getLogFileInfo().then(setLogFileInfo).catch(() => {})
+    }, [])
+
+    // Also independent of the control connection's own lifecycle (a REST GET) — kept
+    // fresh afterward via the control connection's "framer-script-updated" push event
+    // instead (onFramerScriptUpdated below), same as the interception scripts list.
+    useEffect(() => {
+        listFramerScripts().then(setFramerScripts).catch(() => {})
     }, [])
 
     // One entry per (conn, direction) with something held — a summary (chunks/length),
@@ -210,6 +223,23 @@ export default function TamperView() {
             .then(res => { resync(); scriptRuntimeRef.current.continuePause(conn); return res })
     }
 
+    // Composes the selected framer script (if any) with the interception script being
+    // run: fetches the framer's current source first (mirroring TrafficView.js's own
+    // handleRunFramer), so a failed fetch is reported the same way a script error is
+    // (the log panel) rather than silently starting framer-less.
+    async function handleRunScript(name, source) {
+        if (!framerSelected) {
+            scriptRuntimeRef.current.start(name, source)
+            return
+        }
+        try {
+            const framerSource = await getFramerScript(framerSelected)
+            scriptRuntimeRef.current.start(name, source, framerSelected, framerSource)
+        } catch (e) {
+            setScriptLog(log => [...log, { level: 'error', text: `Framer "${framerSelected}" failed to load: ${e.message}` }].slice(-LOG_LIMIT))
+        }
+    }
+
     const selectedEntry = selectedKey
         ? queue.find(e => e.conn === selectedKey.conn && e.direction === selectedKey.direction)
         : null
@@ -236,6 +266,7 @@ export default function TamperView() {
             <div class="tamper-subtabs">
                 <div class=${'top-tab' + (subTab === 'intercept' ? ' active' : '')} onclick=${() => setSubTab('intercept')}>Intercept</div>
                 <div class=${'top-tab' + (subTab === 'scripts'   ? ' active' : '')} onclick=${() => setSubTab('scripts')}>Scripts${runningScript ? ' ●' : ''}</div>
+                <div class=${'top-tab' + (subTab === 'framer-scripts' ? ' active' : '')} onclick=${() => setSubTab('framer-scripts')}>Framer Scripts</div>
             </div>
             ${subTab === 'intercept' && html`
                 <div class="tamper-body">
@@ -257,7 +288,7 @@ export default function TamperView() {
                 <${TamperScriptsPanel}
                     connected=${connected}
                     running=${runningScript}
-                    onRun=${(name, source) => scriptRuntimeRef.current.start(name, source)}
+                    onRun=${handleRunScript}
                     onStop=${() => scriptRuntimeRef.current.stop()}
                     logLines=${scriptLog}
                     onClearLog=${() => setScriptLog([])}
@@ -265,7 +296,13 @@ export default function TamperView() {
                     logFile=${logFileInfo}
                     bypassBrowserLog=${bypassBrowserLog}
                     onBypassBrowserLogChange=${setBypassBrowserLog}
+                    framerScripts=${framerScripts}
+                    framerSelected=${framerSelected}
+                    onFramerSelectedChange=${setFramerSelected}
                 />
+            `}
+            ${subTab === 'framer-scripts' && html`
+                <${TamperFramerScriptsPanel} refreshSignal=${framerScriptsRefreshSignal} />
             `}
         </div>
     `

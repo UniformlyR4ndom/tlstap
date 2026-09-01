@@ -53,11 +53,12 @@ type TamperConfig struct {
 	// every request with 501, rather than silently defaulting to some implicit directory.
 	ScriptsDir string `json:"scripts-dir"`
 
-	// Directory scripts get read/write/list access to via REST. Empty disables the
-	// feature entirely, same as ScriptsDir. Unlike ScriptsDir, this must already exist:
-	// it exposes a directory the operator chose (e.g. test fixtures), so a typo'd path
-	// fails interceptor construction loudly rather than silently creating one.
-	FsRoot string `json:"fs-root"`
+	// Directory framer scripts (frame(state, chunk), reassembling live traffic into
+	// frames for a selected interception script's onFrame hook) are stored in and served
+	// from. A separate scriptstore/directory from ScriptsDir above and from dbdump's own
+	// framer scripts-dir. Empty disables the feature entirely, same convention as
+	// ScriptsDir.
+	FramerScriptsDir string `json:"framer-scripts-dir"`
 
 	// Path a connected control client's script log (tamper.log/ctx.log calls) is
 	// persisted to, in addition to the browser's own in-memory log panel. Empty disables
@@ -128,7 +129,7 @@ type TamperInterceptor struct {
 	holdUntilConnected bool
 	logger             *logging.Logger
 	scripts            *scriptstore.Store // nil if ScriptsDir wasn't configured
-	fsRoot             *fsStore           // nil if FsRoot wasn't configured
+	framerScripts      *scriptstore.Store // nil if FramerScriptsDir wasn't configured
 
 	mu               sync.Mutex
 	control          *websocket.Conn
@@ -146,11 +147,12 @@ type TamperInterceptor struct {
 	logFileMu   sync.Mutex
 }
 
-// NewTamperInterceptor creates the interceptor and, if config.ScriptsDir is set, the
-// scripts directory (returning an error if it can't be created). This has to happen here
-// rather than in Init: RegisterRoutes is called synchronously while building the proxy,
-// before Init runs asynchronously in the proxy's own start goroutine, so the scripts REST
-// handlers must find i.scripts already usable the moment they're registered.
+// NewTamperInterceptor creates the interceptor and, for each of ScriptsDir/
+// FramerScriptsDir that's set, its scripts directory (returning an error if it can't be
+// created). This has to happen here rather than in Init: RegisterRoutes is called
+// synchronously while building the proxy, before Init runs asynchronously in the proxy's
+// own start goroutine, so the scripts REST handlers must find i.scripts/i.framerScripts
+// already usable the moment they're registered.
 func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*TamperInterceptor, error) {
 	var holdTimeout time.Duration
 	if config.HoldTimeoutMs > 0 {
@@ -166,10 +168,10 @@ func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*Tamper
 		}
 	}
 
-	var fsRoot *fsStore
-	if config.FsRoot != "" {
+	var framerScripts *scriptstore.Store
+	if config.FramerScriptsDir != "" {
 		var err error
-		fsRoot, err = newFsStore(config.FsRoot)
+		framerScripts, err = scriptstore.New(config.FramerScriptsDir)
 		if err != nil {
 			return nil, err
 		}
@@ -180,7 +182,7 @@ func NewTamperInterceptor(config *TamperConfig, logger *logging.Logger) (*Tamper
 		holdUntilConnected: config.HoldUntilConnected,
 		logger:             logger,
 		scripts:            scripts,
-		fsRoot:             fsRoot,
+		framerScripts:      framerScripts,
 		streams:            make(map[uint32]*streamState),
 		logFilePath:        config.LogFile,
 	}, nil

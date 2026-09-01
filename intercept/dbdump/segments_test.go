@@ -1,3 +1,5 @@
+// TODO: remove this file alongside segments.go — see that file's own TODO comment.
+
 package dbdump
 
 import (

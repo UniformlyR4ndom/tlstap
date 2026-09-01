@@ -28,13 +28,13 @@ tapctl tamper set-mode --conn N --intercepting=true|false [--api URL]
 tapctl tamper set-auto-intercept --enabled=true|false [--api URL]
 tapctl tamper script-log --level log|error --text TEXT [--api URL]
 tapctl tamper script-list [--api URL]
-tapctl tamper script-get --name NAME [--api URL]
+tapctl tamper script-get --name NAME [--hash] [--api URL]
 tapctl tamper script-put --name NAME (--file PATH | --file -) [--api URL]
 tapctl tamper script-delete --name NAME [--api URL]
-tapctl tamper fs-list [--path PATH] [--api URL]
-tapctl tamper fs-get --path PATH [--api URL]
-tapctl tamper fs-put --path PATH (--file PATH2 | --file -) [--api URL]
-tapctl tamper fs-append --path PATH (--file PATH2 | --file -) [--api URL]
+tapctl tamper framer-script-list [--api URL]
+tapctl tamper framer-script-get --name NAME [--hash] [--api URL]
+tapctl tamper framer-script-put --name NAME (--file PATH | --file -) [--api URL]
+tapctl tamper framer-script-delete --name NAME [--api URL]
 tapctl tamper log-file [--api URL]
 ```
 
@@ -83,25 +83,16 @@ tapctl tamper log-file [--api URL]
   "Script storage" section): `script-get` prints the raw script source (not
   JSON-wrapped) so it's directly pipeable; `script-put` reads from `--file PATH|-`,
   mirroring `release`'s `--edit` convention.
-- `fs-list`/`fs-get`/`fs-put`/`fs-append` — same flat-verb, plain-REST-wrapper shape as the
-  `script-*` commands, over `fs.go`'s endpoints (see `intercept/tamper/CLAUDE.md`'s
-  "Filesystem access" section). `--path` is slash-separated for subdirectories, percent-encoded
-  per-segment (`encodeFsPath`, mirroring `web/tamperApi.js`'s helper of the same name)
-  so literal slashes survive as separators rather than becoming `%2F`. `fs-list`'s
-  `--path` defaults to `""` (list `fs-root` itself). `fs-get` prints raw file bytes to
-  stdout, same pipeable convention as `script-get` — except fs content is arbitrary
-  binary, not always printable text, unlike a script. There is no `fs-delete`: the
-  server exposes no `DELETE` endpoint for `fs-root`. A `--path` containing literal `..`
-  segments never reaches `fs.go`'s own containment check at all when sent over real
-  HTTP — Go's `ServeMux` cleans and 301-redirects such paths before routing, and
-  `http.Client` follows that by resending as `GET` (dropping a `PUT`'s body), so a
-  traversal attempt via `tapctl` just silently no-ops rather than writing anywhere;
-  `fs.go`'s own `resolve()` containment logic is unit-tested directly in `fs_test.go`
-  instead, same reasoning `scripts_test.go` documents for script names. `fs-append`
-  uses `httpPostRawBody` (`POST`, not `PUT`), mirroring `fs.go`'s `handleFsAppend`
-  non-idempotent-verb reasoning — everything else here is `GET`/`PUT`. It's a real
-  server-side append (`fs.go`'s `Append`, opened with `O_APPEND`), safe under concurrent
-  appends to the same file from elsewhere, not a client-side read-modify-write.
+- **`script-get --hash`** requests `?hash=1` (`intercept/scriptstore/CLAUDE.md`) and
+  prints `{"sha256":"..."}` instead of the content — the same "version" value
+  `frames.script_version`/`frame_progress.script_version` use, so a script's current
+  version can be learned directly instead of fetching content just to hash it (or
+  falling back to raw SQLite access, the only alternative before this existed).
+- `framer-script-list`/`framer-script-get`/`framer-script-put`/`framer-script-delete` —
+  the same four flat commands (including `-get`'s `--hash`), against the tamper
+  interceptor's separate `framer-scripts-dir` store (see `intercept/tamper/CLAUDE.md`'s
+  "Script storage" section) rather than `scripts-dir`; same name in both stores is not a
+  collision.
 - `log-file` — plain GET wrapper over `handleLogFileInfo` (see `intercept/tamper/CLAUDE.md`'s
   note under "Script storage" REST endpoints): reports whether the interceptor was
   configured with `log-file` and, if so, its display filename. Static for the server's
@@ -151,16 +142,14 @@ cat ./my-filter.js | tapctl tamper script-put --name my-filter --file -
 tapctl tamper script-get --name my-filter > my-filter.js
 tapctl tamper script-delete --name my-filter
 
-# fs-root: list the root, push a fixture into a subdirectory (auto-created), read
-# it back, list that subdirectory.
-tapctl tamper fs-list
-tapctl tamper fs-put --path fixtures/response.json --file ./response.json
-tapctl tamper fs-get --path fixtures/response.json > response.json
-tapctl tamper fs-list --path fixtures
+# Learn a script's current version (sha256 hex) without fetching its content.
+tapctl tamper script-get --name my-filter --hash
 
-# Append instead of overwrite — creates the file on first use.
-echo "run started" | tapctl tamper fs-append --path notes.log --file -
-echo "run finished" | tapctl tamper fs-append --path notes.log --file -
+# Framer script storage: same four verbs (+ -get --hash), separate store.
+tapctl tamper framer-script-list
+tapctl tamper framer-script-put --name length-prefix --file ./length-prefix-framer.js
+tapctl tamper framer-script-get --name length-prefix > length-prefix-framer.js
+tapctl tamper framer-script-delete --name length-prefix
 
 # Check whether server-side script-log persistence is configured, and where.
 tapctl tamper log-file
@@ -177,10 +166,21 @@ tapctl dbdump latest [--session N] [--stream N] [--api URL]
 tapctl dbdump chunk --session N --stream N --direction N --chunks 0,1,2 [--api URL]
 tapctl dbdump chunk-stid --session N --stream N --direction N --id N [--api URL]
 tapctl dbdump byte-stid --session N --stream N --direction N --offset N [--api URL]
-tapctl dbdump search --session N --pattern STR [--stream N] [--start N] [--end N]
+tapctl dbdump search --pattern STR [--session N [--stream N]] [--start N] [--end N]
                       [--pattern-encoding text|base64|regex] [--direction N] [--contiguous] [--api URL]
 tapctl dbdump stid-stream --session N --stream N [--start N] [--n 50] [--api URL]
 tapctl dbdump sgid-stream --session N [--start N] [--n 50] [--api URL]
+tapctl dbdump frame-progress --session N --stream N --script NAME --script-version HASH [--api URL]
+tapctl dbdump frames-timeline --session N --stream N --script NAME --script-version HASH
+                               [--start N | --before-stid N] [--n 50] [--api URL]
+tapctl dbdump script-list [--api URL]
+tapctl dbdump script-get --name NAME [--hash] [--api URL]
+tapctl dbdump script-put --name NAME (--file PATH | --file -) [--api URL]
+tapctl dbdump script-delete --name NAME [--api URL]
+tapctl dbdump dissect-script-list [--api URL]
+tapctl dbdump dissect-script-get --name NAME [--hash] [--api URL]
+tapctl dbdump dissect-script-put --name NAME (--file PATH | --file -) [--api URL]
+tapctl dbdump dissect-script-delete --name NAME [--api URL]
 ```
 
 `stid-stream`/`sgid-stream` default `--n` to 50 (the web frontend's own `BATCH`
@@ -193,6 +193,53 @@ Thin wrappers over the REST/WS endpoints documented in full under the root `CLAU
 chunk-metadata-then-binary-frame pairs) are each collected into a single
 `{"chunks":[...]}` JSON object with each chunk's bytes as a `data_base64` field — the
 same convention `tamper peek` uses, for consistency across the tool.
+
+- **`search`'s `--session` is optional — client-side-only fan-out, no backend change**:
+  `/search-text` itself stays single-session server-side (`searchTextRequest.Session` is
+  still a plain non-optional `int64` there); omitting `--session` instead fetches
+  `sessions` and calls `search-text` once per session, merging the results and tagging
+  each hit with a `session` field the raw per-session response doesn't have on its own
+  (a match is always implicit in that single-session request today). A search failing
+  partway through one session's call fails the whole command immediately (`fail`,
+  identifying which session) rather than returning partial results, same as every other
+  `tapctl` command's error handling. **`--stream` requires `--session`**: a stream id is
+  only unique *within* a session, so a bare `--stream` without `--session` would
+  silently apply that numeric id to a different actual stream in each session searched
+  — rejected client-side rather than allowed to produce a misleading merged result.
+  Given `--session`, output is passed through unchanged (`printRawJSON`, no `session`
+  field added, since it's a single already-known session); omitted, output is freshly
+  built (`printJSON`) with `session` added to each match, `[]` rather than `null` when
+  nothing/no sessions exist.
+- `frame-progress`/`frames-timeline` — both key on `(session, stream, script,
+  script_version)`, mirroring `intercept/dbdump/frames.go`'s own `frameTimelineKeyRequest`
+  exactly, including its one wire-format wart: `frames-timeline`'s `--before-stid` maps
+  to a `beforeStid` JSON field (camelCase), unlike every snake_case field around it — a
+  real inconsistency in the protocol itself, reproduced faithfully rather than smoothed
+  over client-side. `script_version` is the exact hash a framer run was persisted
+  under — get it via `script-get --hash` above rather than fetching+hashing content
+  yourself. `frame-progress` reports bookkeeping only (each direction's processed byte
+  offset, the framer's opaque `state`, each direction's close-signal status) — no frame
+  content — useful for checking whether/how-far a stream has actually been framed with
+  this exact script/version before pulling `frames-timeline`'s real data.
+  `frames-timeline` returns the persisted frames themselves (byte ranges, script-attached
+  `meta`, direction, `stid`, `time`) merged across both directions in chronological
+  order (see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section for the schema) —
+  this is the one that answers "what did the framer/dissector actually see", e.g. a
+  parsed HTTP message's header/body byte boundaries straight from `meta`, no manual
+  byte-scanning needed. Defaults to forward pagination from `--start` (`0` unless
+  given); `--before-stid` paginates backward instead — exactly one of the two, the same
+  rule the server enforces, checked client-side here too for a clearer error than the
+  server's own 400. `--n` defaults to 50, same reasoning as `stid-stream`/`sgid-stream`
+  above.
+- `script-list`/`script-get`/`script-put`/`script-delete` — the same flat-verb shape as
+  `tamper script-*` above (including `-get`'s `--hash`), but against dbdump's own
+  framer-script store (`scripts-dir`; see `intercept/dbdump/CLAUDE.md`'s "Framer
+  scripts" section) rather than tamper's.
+- `dissect-script-list`/`dissect-script-get`/`dissect-script-put`/`dissect-script-delete`
+  — the same four commands again, against dbdump's separate `dissect-scripts-dir` store
+  (see `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section) — a distinct
+  namespace from `scripts-dir` above, same as tamper's `scripts-dir`/
+  `framer-scripts-dir` split.
 
 ### Usage examples
 
@@ -224,7 +271,101 @@ tapctl dbdump search --session 1 --pattern "GET /login"
 tapctl dbdump search --session 1 --stream 0 --direction 1 \
     --pattern "^HTTP/1\.[01] [0-9]{3}" --pattern-encoding regex
 
+# Same pattern, but across every session — don't already know which one has it.
+# Each hit comes back tagged with its own "session" field.
+tapctl dbdump search --pattern "GET /login"
+
 # Pull the next batch of chunks off a stream/session, in order.
 tapctl dbdump stid-stream --session 1 --stream 0 --start 0 --n 50
 tapctl dbdump sgid-stream --session 1 --start 0 --n 0   # 0 = unlimited
+
+# Learn the framer script's current version, then check progress and pull its frames.
+V=$(tapctl dbdump script-get --name http1-framer --hash | python3 -c 'import json,sys;print(json.load(sys.stdin)["sha256"])')
+tapctl dbdump frame-progress --session 1 --stream 0 --script http1-framer --script-version "$V"
+tapctl dbdump frames-timeline --session 1 --stream 0 --script http1-framer --script-version "$V"
+
+# Framer script storage: list, fetch a script's content and its current version.
+tapctl dbdump script-list
+tapctl dbdump script-get --name http1-framer > http1-framer.js
+tapctl dbdump script-get --name http1-framer --hash
+
+# Dissect script storage: same four verbs, separate store.
+tapctl dbdump dissect-script-list
+tapctl dbdump dissect-script-get --name http1-dissector --hash
+```
+
+## `tapctl core`
+
+```
+tapctl core fs-list [--path PATH] [--api URL]
+tapctl core fs-get --path PATH [--api URL]
+tapctl core fs-put --path PATH (--file PATH2 | --file -) [--api URL]
+tapctl core fs-append --path PATH (--file PATH2 | --file -) [--api URL]
+tapctl core kv-list [--prefix PREFIX] [--api URL]
+tapctl core kv-read --key KEY [--api URL]
+tapctl core kv-write --key KEY (--file PATH | --file -) [--api URL]
+tapctl core kv-delete --key KEY [--api URL]
+```
+
+`--api` defaults to `http://127.0.0.1:9090`, same as every other group — core services
+have no per-proxy variant to begin with (they aren't tied to a proxy at all), so
+`/api/core/...` is simply *the* path, not a canonical alias for something else.
+
+Drives `core/fs` and `core/kv` — see `core/CLAUDE.md`'s "`core/fs`"/"`core/kv`" sections
+for the REST APIs these wrap. Either group of commands 404s (not a `tapctl`-side error —
+the server itself doesn't register the routes) if that core service isn't configured.
+
+- `fs-list`/`fs-get`/`fs-put`/`fs-append` — flat-verb, plain-REST-wrapper shape, over
+  `core/fs`'s endpoints (see `core/CLAUDE.md`'s "core/fs" section). `--path` is
+  slash-separated for subdirectories, percent-encoded per-segment (`encodeFsPath`,
+  mirroring `web/coreApiClient.js`'s `encodeSegments` helper) so literal slashes survive
+  as separators rather than becoming `%2F`. `fs-list`'s `--path` defaults to `""` (list the
+  configured root itself). `fs-get` prints raw file bytes to stdout, same pipeable
+  convention as `tamper script-get` — except fs content is arbitrary binary, not always
+  printable text, unlike a script. There is no `fs-delete`: the server exposes no
+  `DELETE` endpoint. A `--path` containing literal `..` segments never reaches
+  `core/fs`'s own containment check at all when sent over real HTTP — Go's `ServeMux`
+  cleans and 301-redirects such paths before routing, and `http.Client` follows that by
+  resending as `GET` (dropping a `PUT`'s body), so a traversal attempt via `tapctl` just
+  silently no-ops rather than writing anywhere; `core/fs`'s own `resolve()` containment
+  logic is unit-tested directly in `core/fs/fs_test.go` instead, same reasoning
+  `scripts_test.go` documents for script names. `fs-append` uses `httpPostRawBody`
+  (`POST`, not `PUT`), mirroring `core/fs`'s `handleAppend` non-idempotent-verb
+  reasoning — everything else here is `GET`/`PUT`. It's a real server-side append
+  (`core/fs`'s `Append`, opened with `O_APPEND`), safe under concurrent appends to the
+  same file from elsewhere, not a client-side read-modify-write.
+- `kv-list`/`kv-read`/`kv-write`/`kv-delete` — same flat-verb shape, over `core/kv`'s
+  endpoints (see `core/CLAUDE.md`'s "core/kv" section) — a general-purpose key-value
+  store independent of `core/fs` above, e.g. for a value a script stashed via
+  `tamper.kv.*`/`framer.kv.*`/`dissector.kv.*` (a crypto key exchanged on one
+  connection, shared across streams/scripts). **Key/prefix travel in the query string,
+  not a JSON body or path segment** — the one place `tapctl` departs from its usual
+  per-endpoint shape, because the REST API itself does (`core/kv/api.go` reserves the
+  request/response body purely for value bytes). `kv-list`'s `--prefix` defaults to
+  `""` (every key) — same byte-range-scan semantics as `core/kv`'s own `List`, not
+  `LIKE`. `kv-read` prints the raw value to stdout, same pipeable convention as
+  `fs-get`, or fails with "key not found" (`404`) if absent. `kv-write` reads from
+  `--file` (a path, or `-` for stdin), same convention as `fs-put`/`fs-append` — a
+  plain upsert (`core/kv`'s own semantics: last-writer-wins, no separate create/update).
+  `kv-delete` is idempotent regardless of prior existence, matching the REST endpoint.
+
+### Usage examples
+
+```sh
+# List the configured root, push a fixture into a subdirectory (auto-created), read
+# it back, list that subdirectory.
+tapctl core fs-list
+tapctl core fs-put --path fixtures/response.json --file ./response.json
+tapctl core fs-get --path fixtures/response.json > response.json
+tapctl core fs-list --path fixtures
+
+# Append instead of overwrite — creates the file on first use.
+echo "run started" | tapctl core fs-append --path notes.log --file -
+echo "run finished" | tapctl core fs-append --path notes.log --file -
+
+# kv: write a value, list keys under a prefix, read one back, delete it.
+echo -n "hello" | tapctl core kv-write --key demo:key1 --file -
+tapctl core kv-list --prefix demo:
+tapctl core kv-read --key demo:key1
+tapctl core kv-delete --key demo:key1
 ```

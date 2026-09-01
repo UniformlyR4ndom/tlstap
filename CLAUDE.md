@@ -55,6 +55,11 @@ consolidating:
 
 ```
 cli/cli.go          ← parses config.json, wires everything together, starts proxies
+  core.go           ← CoreService interface — utility services not tied to any interceptor
+core/               ← core services (not tied to any interceptor/proxy); see core/CLAUDE.md
+  kv/               ← general-purpose key-value store REST API; doc/design/core-kv-store.md
+  fs/               ← scoped host-directory read/write/list REST API, used by every
+                      script runtime's fs.* (see core/CLAUDE.md)
 proxy/              ← core proxy logic
   proxy.go          ← Proxy struct, Start(), mode dispatch, ALPN negotiation
   conn_handler.go   ← ConnHandler: per-connection forwarding, intercept pipeline
@@ -82,14 +87,14 @@ intercept/          ← built-in interceptor implementations
     search.go       ← /search-text handler; literal and regex search across chunks
     frames.go       ← frames/frame_progress storage layer for a client-run framer script
   scriptstore/      ← shared name→content *.js store + REST CRUD handlers; used by tamper's
-                      control scripts and dbdump's framer scripts
+                      control scripts, tamper's own framer scripts, and dbdump's framer scripts
   tamper/           ← live hold/edit/drop/forward of traffic; control + watch WebSocket API
     tamper.go       ← interceptor lifecycle, hold/resolve logic, direction detection
     api.go          ← WebSocket handlers (control: commands/acks/events; watch: mirror + peek);
-                      also wires scriptstore.RegisterRoutes for /scripts
+                      also wires scriptstore.RegisterRoutes for /scripts and, nested under
+                      /framer, a second instance for framer scripts
     protocol.go     ← wire message types for both WebSockets
     buffer.go       ← heldBuffer: per-(stream,direction) growing buffer + chunk bounds
-    fs.go           ← fs-root: scoped REST read/write/list of one host directory, for scripts
 web/                ← embedded web frontend (Preact + htm, no build step)
   server.go         ← //go:embed; exports FS (embedded into binary). The embed directive
                       is an explicit filename whitelist, not a glob — a new top-level
@@ -99,7 +104,8 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   index.html        ← HTML shell, importmap, all CSS (dark theme)
   main.js           ← mounts App into #root
   api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
-  tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, fs-root)
+  tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, log-file)
+  coreApiClient.js  ← direct-fetch fs.*/kv.* clients (createFsApi/createKvApi), dynamically imported inside each script runtime's own Worker; backs fs.*/kv.* uniformly across all three runtimes (framer/dissector/tamper) — see web/CLAUDE.md
   dbdumpFramerApi.js ← REST wrappers for /api/i/dbdump/* framer-script CRUD + frame-progress/frames/frames-append (see "Framer scripts" in web/CLAUDE.md)
   frameRuntime.js   ← Worker bootstrap that runs a framer script's frame() function over pre-fetched chunks (no RPC bridge, unlike scriptRuntime.js — see web/CLAUDE.md)
   hpackDecode.js    ← decode-only HPACK (RFC 7541); exposed to framer scripts only, as framer.hpack.decode(bytes, table) — see "Framer scripts" in web/CLAUDE.md
@@ -289,7 +295,22 @@ Three strategies (configured on the server side):
 | `bridge` | `BridgeInterceptor` | `connect` (endpoint); streams data to a TCP server using a custom binary framing protocol |
 | `droptls` | `DropTlsInterceptor` | none; aborts on `ConnectionUpgraded` to attempt TLS downgrade |
 | `dbdump` | `DbDumpInterceptor` | `file` (path), `truncate` (bool), `scripts-dir` (string, optional — storage for user-authored framer scripts; see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section), `dissect-scripts-dir` (string, optional — separate storage for user-authored dissector scripts, own namespace from `scripts-dir`; see `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section); logs all traffic to SQLite; exposes REST API |
-| `tamper` | `TamperInterceptor` | `hold-timeout-ms` (int, `<=0` = infinite), `hold-until-connected` (bool), `scripts-dir` (string, optional), `fs-root` (string, optional — grants scripts scoped read/write/list access to this host directory via REST; see `intercept/tamper/CLAUDE.md`'s "Filesystem access" section), `log-file` (string, optional — persists a running script's `tamper.log`/`ctx.log` output server-side, always appended to; see `intercept/tamper/CLAUDE.md`'s "Script storage" section and `web/CLAUDE.md`'s "Scripted interception" section); lets a connected control client actively pause, inspect, edit, drop, or forward live chunks, or just live-watch them; exposes a WebSocket API |
+| `tamper` | `TamperInterceptor` | `hold-timeout-ms` (int, `<=0` = infinite), `hold-until-connected` (bool), `scripts-dir` (string, optional), `framer-scripts-dir` (string, optional — separate storage for user-authored framer scripts that reassemble live traffic into frames for a selected interception script's `onFrame` hook, own namespace from `scripts-dir`; see `intercept/tamper/CLAUDE.md`'s "Script storage" section), `log-file` (string, optional — persists a running script's `tamper.log`/`ctx.log` output server-side, always appended to; see `intercept/tamper/CLAUDE.md`'s "Script storage" section and `web/CLAUDE.md`'s "Scripted interception" section); lets a connected control client actively pause, inspect, edit, drop, or forward live chunks, or just live-watch them; exposes a WebSocket API. Scripts also get filesystem/key-value access via `tamper.fs.*`/`tamper.kv.*` — backed by the `core.fs`/`core.kv` services below, not this interceptor. |
+
+## Core Services
+
+Utility services independent of any interceptor or proxy — see `core/CLAUDE.md` for full
+implementation details. Configured under a top-level `core` key in `config.json`;
+absence of a service's own key disables it entirely (same convention as an interceptor's
+`scripts-dir`). Each is wired directly in `cli.go` (`CoreService` interface, `cli/core.go`)
+right alongside `/ui/`'s own registration, not discovered from any proxy's interceptor
+list, and reachable at `/api/core/<name>/...` regardless of which proxies/interceptors
+are configured.
+
+| Config key | Package | Config args |
+|---|---|---|
+| `core.kv` | `core/kv` | `file` (path to its own SQLite file, created if missing); general-purpose opaque key-value store, e.g. for sharing a small value (a crypto key exchanged on one connection) across streams/scripts/interceptors. REST API at `/api/core/kv` — see `doc/design/core-kv-store.md`. Script-facing wrapper: `kv.*` on all three script runtimes (`framer`/`dissector`/`tamper`) — see `web/CLAUDE.md`. |
+| `core.fs` | `core/fs` | `dir` (path, must already exist); scoped read/write/list access to one host directory. REST API at `/api/core/fs` — usable from any script/tool that can reach the API server, not tamper-specific. Script-facing wrapper: `fs.*` on all three script runtimes (`framer`/`dissector`/`tamper`), uniformly via a direct Worker `fetch()`; see `web/CLAUDE.md`. |
 
 ## REST API
 
@@ -319,11 +340,12 @@ in `intercept/dbdump/CLAUDE.md`**, loaded automatically when working in that dir
 
 Lets a connected control client actively pause, inspect, edit, drop, or forward
 individual chunks of live traffic, or just live-watch it without holding anything up;
-also exposes script-storage (`scripts-dir`) and filesystem-access (`fs-root`) REST APIs
-for the programmatic scripting alternative documented in `web/CLAUDE.md`.
-**Full backend implementation reference — wire protocol, `heldBuffer`, script/fs-root
-storage — lives in `intercept/tamper/CLAUDE.md`**, loaded automatically when working in
-that directory.
+also exposes a script-storage (`scripts-dir`) REST API for the programmatic scripting
+alternative documented in `web/CLAUDE.md` (filesystem/key-value access for scripts,
+`tamper.fs.*`/`tamper.kv.*`, is backed by the `core.fs`/`core.kv` services instead — see
+"Core Services" above and `core/CLAUDE.md`). **Full backend implementation reference — wire protocol,
+`heldBuffer`, script storage — lives in `intercept/tamper/CLAUDE.md`**, loaded
+automatically when working in that directory.
 
 ## Testing interceptor APIs (`test/tapctl/`)
 
@@ -374,160 +396,104 @@ when working in that directory.
 
 ## TODO
 
-Known gaps and deferred work, collected here so they aren't rediscovered from scratch.
+Known gaps and deferred work.
 
-- **HTTP/1 and HTTP/2 example framer/dissector pairs — kept as two independent pairs
-  (user call, 2026-08-10), even though `chunk.tls?.alpn` (see the "Route TLS info" item
-  below) would now make a single ALPN-branching framer possible.**
-  `examples/dbdump/framer/http2-framer.js` — **done**: splits a stream into HTTP/2
-  frames (RFC 9113 §4.1's fixed 9-byte header), detects/emits the client's one-time
-  connection preface (§3.4, c2s only), and reassembles HEADERS/PUSH_PROMISE/CONTINUATION
-  field blocks (§6.2/§6.6/§6.10 — including their PADDED/PRIORITY payload layouts) into
-  complete HPACK blocks decoded via `framer.hpack.decode`, attached as `meta.headers` on
-  whichever frame carries `END_HEADERS` (forced to be the *last* frame of a sequence, not
-  the first — see the script's own comment: earlier frames may already be persisted by
-  the time a later CONTINUATION completes the block). A malformed/desynced HPACK block
-  (e.g. a capture starting mid-connection, missing dynamic-table state the real peer
-  already had) is logged and latches header-decoding off for the rest of that direction
-  rather than aborting framing entirely — framing itself never depends on HPACK
-  succeeding. Verified via a throwaway Node smoke test (single-chunk, split-across-calls,
-  HEADERS+CONTINUATION reassembly, PADDED/PRIORITY stripping, PUSH_PROMISE, an atomicity
-  violation throwing, and the HPACK-failure latch) — not committed to the repo, matching
-  this codebase's no-automated-tests-for-example-scripts precedent — **and confirmed
-  working against a real captured HTTP/2 stream in a browser (2026-08-10)**.
-
-  `examples/dbdump/dissect/http2-dissector.js` — **done**: the frame-header breakdown
-  (Length/Type/Flags/Stream Identifier) plus, deliberately going further than
-  `tls-dissector.js`'s own "just the shared header" scope, a full structural payload
-  breakdown for *every* defined frame type (RFC 9113 §6.1–§6.9 — Pad Length/Priority/
-  Promised-Stream-ID/Padding layouts for HEADERS/PUSH_PROMISE/DATA, repeating SETTINGS
-  entries, RST_STREAM/GOAWAY error-code name lookup, WINDOW_UPDATE's increment, PING's
-  opaque data), each turning out to be small and fixed once actually checked against the
-  RFC — not the deep, effortful lift "shallow scope" was meant to guard against.
-  Decoded headers (`frame.meta.headers`, when the framer succeeded) render as
-  `content`-only children of the Field Block Fragment node — no byte range to highlight,
-  since a reassembled block can span multiple frames — everything else uses real
-  offset/length for hex-view highlighting. Verified via a throwaway Node smoke test
-  (preface, HEADERS-with-decoded-headers, PADDED+PRIORITY layout, SETTINGS with multiple/
-  unknown entries, RST_STREAM/GOAWAY error codes, the truncated-header and
-  still-loading-payload fallbacks) — same not-committed convention as the framer's own
-  test — **and confirmed working in a real browser (2026-08-10)**: field tree renders,
-  click-to-highlight works.
-
-  Its prerequisite, **combined-mode framer execution — done (2026-08-11)**: framer
-  scripts now run once per `(stream, script)` rather than once per direction, one
-  shared-state instance processing both directions' chunks merged into one chronological
-  (`stid`-ordered) sequence — a breaking change to the framer contract (`chunk.direction`
-  now varies call to call within a run) and to `frame_progress`'s schema (one row per
-  key, not one per direction — old-shaped rows are dropped, not migrated, on first
-  startup after the upgrade). See
-  [`doc/design/framer-cross-direction-correlation.md`](doc/design/framer-cross-direction-correlation.md)
-  for the full design, `intercept/dbdump/CLAUDE.md`'s and `web/CLAUDE.md`'s "Framer
-  scripts" sections for the backend/frontend mechanics (including the new `frames.seq`
-  emission-order column/`/frames/by-seq` endpoint — an addition beyond that design doc's
-  original scope, for a script that holds a frame back and reveals it alongside a later
-  correlated one — not yet used by any script, see below). All four existing example
-  framer scripts migrated to the new two-sub-state shape (`state.c2s`/`state.s2c`) with
-  no behavior change. Verified via Go unit tests, a throwaway Node smoke test (not
-  committed), and confirmed working end-to-end in a real browser: `length-prefix-framer.js`
-  run against a real two-way ~18.6MB/direction capture, producing correct frames
-  (including a multi-megabyte one) and a clean close.
-
-  The HTTP/1 framer/dissector pair this unblocked is **done too (2026-08-11/12)**: full
-  RFC 9112 §6.3 body-length handling, including the three cases needing the *other*
-  direction's stream (HEAD responses, `101` upgrade, `CONNECT` tunnels) that combined
-  mode exists for. Full design in `doc/design/http1-framer.md` (message-length rules,
-  `meta` shape, state machine, error handling, and a "Known limitations" section — notably
-  that a `frames.seq`-based reorder would *not* fix `Expect: 100-continue`'s
-  response-before-request display order, and why). Verified via a throwaway Node smoke
-  test (39 checks) and a real browser session against real HTTP/1.1 traffic (a local
-  origin plus, through the TLS proxy, httpbin.org for broader variety — POST/PUT/DELETE
-  bodies, redirects, gzip, cookies, Basic auth, `Expect: 100-continue`); that last case
-  surfaced and got a real bug fixed — a `1xx` interim response was incorrectly consuming
-  a `pendingMethods` queue slot meant for its request's actual final response.
-- **Signal connection close to framer scripts — done.** A framer script's final
-  `frame(state, chunk)` call for a direction may now carry `chunk.closed = true` (empty
-  `data`) once that direction's connection has closed, letting a script flush a body
-  whose length is implicit in connection close (RFC 9112 §6.3 case 7 — the HTTP/1 framer
-  above needs this). See `intercept/dbdump/CLAUDE.md`'s "Connection-close signal" note
-  (schema/persistence) and `web/CLAUDE.md`'s "Framer scripts" section (`catchUpFramer`'s
-  orchestration) for the full mechanism. Not yet verified in an actual browser — only
-  Go-side unit tests (`frames_test.go`) and the `web/` test suite have run against it.
-- **Route TLS info (SNI, ALPN, TLS version, cipher suite ID) to framer scripts —
-  done.** A framer script's `chunk.tls` is now `null` for a plain-mode proxy or a
-  not-yet-upgraded `detecttls` connection, else `{sni, alpn, version, cipherSuite}` from
-  the stream's *downstream* (client-facing) TLS handshake specifically — the proxy's
-  separate upstream handshake isn't exposed, since it can legitimately negotiate
-  differently without ALPN/SNI passthrough. See `proxy/interceptor.go`'s `ConnInfo.TLS`/
-  `TLSInfo`, `intercept/dbdump/CLAUDE.md`'s "TLS info capture" note (schema/persistence),
-  and `web/CLAUDE.md`'s "Framer scripts" section (`catchUpFramer`'s `tlsInfo` param) for
-  the full mechanism. Not yet verified against a real TLS proxy run in a browser — only
-  `proxy`/`intercept/dbdump` Go unit tests and the `web/` test suite have run against it.
-- **Decode-only HPACK (RFC 7541) for framer scripts — done.** `framer.hpack.decode(bytes,
-  table)` (`web/hpackDecode.js`) turns one complete, already-reassembled HEADERS/
-  CONTINUATION header block into `{headers, table}`; the dynamic table threads through
-  the calling script's own persisted `state`, the same way a byte-carry buffer already
-  does. Not wired into any interceptor or `dissector.*` — see `web/CLAUDE.md`'s "Framer
-  scripts" section for why dissector scripts specifically can't host this (no cross-frame
-  state to build a real dynamic table from) and the full contract. An existing library
-  (`hpack.js`/indutny) was considered and ruled out: unmaintained ~10 years, built on
-  Node's `Buffer`, and a streaming API mismatched to this codebase's one-shot call shape —
-  see git history of this design conversation if that need resurfaces. Unit-tested
-  (`hpackDecode.test.js`) against RFC 7541 Appendix C's official worked examples (fetched
-  from the RFC text directly, not transcribed from memory, after an initial attempt via a
-  lossy summarizing fetch produced a subtly wrong vector that didn't match its own
-  internal byte-count accounting — caught before it was used) plus structural checks on
-  the Huffman table (Kraft's-inequality completeness, prefix-freedom). Now actually used
-  by `http2-framer.js` above and confirmed decoding real captured traffic correctly
-  (after one deploy pitfall — see the Architecture tree's `server.go` note on
-  `//go:embed` being a filename whitelist, not a glob).
 - **`doc/openapi.yaml`'s `{path}` parameters don't survive standard OpenAPI tooling.**
-  `/api/i/tamper/fs/list/{path}` and `/fs/file/{path}` document `path` as a single
-  `in: path` string, but the real route is a `{path...}` wildcard that can embed
-  `/`-separated segments — standard tooling (Swagger UI, most codegen) percent-encodes
-  `/` in a path parameter, so it can't actually drive a nested path through these
-  operations as written. Needs a parameter-modeling redesign (e.g. prose-only
-  documentation for the parameter, or a vendor extension), not a safe drive-by edit.
-- **Packet dissector stage — done, both stages of the "Packet Dissector" feature now
-  feature-complete for v1.** `doc/design/packet-dissector.md` covers both: framer (done
-  2026-08-05 — see `intercept/dbdump/CLAUDE.md`'s "Framer scripts" section) and dissector
-  (done 2026-08-09 — script store, Worker execution, REST wrappers, and the
-  `TrafficView.js` side panel with click-to-select-frame/click-to-highlight-node — see
-  `intercept/dbdump/CLAUDE.md`'s "Dissector scripts" section and `web/CLAUDE.md`'s section
-  of the same name). Both confirmed working end-to-end in a real browser — framer
-  2026-08-05 against `tls-framer.js`, dissector 2026-08-10 against `http2-dissector.js`
-  (field tree render + click-to-highlight); no automated UI testing exists in this repo,
-  so this remains the only verification either stage gets.
-- **Byte-budgeted segment buffer — `TrafficView.js` fully migrated, `CombinedView.js`
-  still pending (deliberately deferred).** `doc/design/hexview-segment-buffer.md` has the
-  full migration plan; all of `TrafficView.js` (raw and frame mode) now runs on
-  `useByteBuffer.js` (see `web/CLAUDE.md`'s "Byte-budgeted segment buffer" section);
-  `CombinedView.js` is unchanged, still on `useChunkBuffer.js` — its migration is about
-  consistency, not fixing a bug (it never shows huge segments), so it's left open until
-  asked for rather than done proactively.
-- **Frame view has no explicit "no frames found" empty state.** A successful Run with
-  zero resulting frames (stale `frame_progress`, or a script that legitimately finds
-  nothing for that stream) renders silently blank in `TrafficView.js`, indistinguishable
-  from "still loading." Low-risk, small; do it if asked, not proactively.
+  `/api/core/fs/list/{path}` and `/api/core/fs/file/{path}` document `path` as a single
+  `in: path` string, but the real route is a `{path...}` wildcard — standard tooling
+  percent-encodes `/` in a path parameter, so it can't drive a nested path through these
+  operations as written. Needs a parameter-modeling redesign, not a drive-by edit.
+- **`CombinedView.js` still on `useChunkBuffer.js`**, not migrated to the byte-budgeted
+  `useByteBuffer.js` (`TrafficView.js` is fully migrated, both raw and frame mode).
+  Consistency only, not a bug fix — deferred until asked for.
+- **Frame view has no "no frames found" empty state.** A successful Run with zero
+  resulting frames renders silently blank in `TrafficView.js`, indistinguishable from
+  "still loading."
 - **Framer return protocol could avoid enumerating `{offset, length}` per frame.** A
-  script currently returns a `frames` array explicitly, one entry per frame, each call.
-  An alternative: the script just reports "the current frame ends at position N" (an
-  incremental watermark), and the platform derives each frame's `[start, end)` from
-  successive watermarks itself — fewer round-tripped fields per frame, closer to the
-  "pure function over bytes" framer already aims for. A genuine protocol redesign, not a
-  drive-by fix — needs its own scoping pass before starting.
-- **`isWindowFull` (`web/byteBufferCore.js`) can't tell a backward-opened huge frame is
-  still incomplete.** It only checks the *end* boundary (`loadedEnd >= segment.offset +
-  segment.length`); a window opened while scrolling backward into a huge frame has
-  `loadedEnd` pinned to the segment's true end from its very first partial load (see
-  `initialWindowRange`'s backward case in `web/CLAUDE.md`'s "Byte-budgeted segment
-  buffer"), so it reads as "full" immediately even while its front is still unloaded.
-  Practical effect: `extendResumeWindow` for backward is unreachable once that window's
-  boundary is revisited, so scrolling further up into a huge frame silently stops growing
-  its loaded range instead of continuing to load its front. Needs a real
-  backward-completeness check (e.g. tracking `loadedStart <= segment.offset` separately)
-  plus a test exercising backward extension of an oversized segment across multiple
-  quanta, which nothing currently does.
+  watermark-based alternative — script reports "current frame ends at N", platform
+  derives each frame's span from successive watermarks — would need its own scoping pass.
+- **`isWindowFull` (`web/byteBufferCore.js`) only checks the *end* boundary.** A window
+  opened scrolling backward into a huge frame has `loadedEnd` pinned to the segment's
+  true end from its first partial load, so it reads as "full" immediately even while its
+  front is unloaded — `extendResumeWindow` for backward becomes unreachable once that
+  boundary is revisited. Needs a real backward-completeness check (e.g. tracking
+  `loadedStart <= segment.offset` separately) plus a test.
+- **`/segments` retirement not yet browser-verified.** `/byte-ranges` + `/chunks/timeline`
+  replace it (implemented, unit-tested — see `intercept/dbdump/CLAUDE.md`), but the old
+  path (`intercept/dbdump/segments.go`/`segments_test.go`, the `/segments` route,
+  `web/api.js`'s `openSegmentsStream`/`splitSegments`) is only dead-code-marked
+  (`// TODO: remove`), not deleted, pending a manual check: forward/backward scroll,
+  jump-to, a huge frame's incremental load, live-tailing, both raw-chunk and frame mode.
+- **Tamper framer scripts implemented, not browser-verified.** Live/editable counterpart
+  to dbdump's framer — see `doc/design/tamper-framer.md`, `intercept/tamper/CLAUDE.md`'s
+  "Script storage" section, `web/CLAUDE.md`'s "Tamper framer scripts" section. Go-tested
+  (`intercept/tamper/framer_scripts_test.go`) and smoke-tested (throwaway, not
+  committed); needs a real framer+interception script pair run against live traffic
+  (multi-chunk frame carry, edit/drop/forward, truncated-close case) in a browser.
+- **`chunk.tls` routing to framer scripts not browser-verified against a real TLS
+  proxy.** `chunk.tls` is `{sni, alpn, version, cipherSuite}` from the stream's
+  downstream handshake (`null` for plain/not-yet-upgraded `detecttls`) — see
+  `proxy/interceptor.go`'s `ConnInfo.TLS`, `intercept/dbdump/CLAUDE.md`'s "TLS info
+  capture" note. Go- and `web/`-test-suite-tested only so far.
+- **WebSocket-over-HTTP/2 (RFC 8441 Extended CONNECT) — not started, lower priority.**
+  `http1-framer.js`'s WS support only covers the HTTP/1.1 Upgrade bootstrap; HTTP/2 has
+  no `Upgrade` mechanism (RFC 9113 §8.6) and instead uses Extended CONNECT — a client
+  sends `:method: CONNECT` + `:protocol: websocket` on a stream, gated by
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL: 1`, after which that stream's `DATA` frames carry
+  raw WS frame bytes (a **per-stream** tunnel, not per-connection). `http2-framer.js`
+  currently has no awareness of this — its `DATA` frames just get framed as opaque
+  binary. If built: `advanceWebSocket`/`wsFrameMeta` (`http1-framer.js`) are already
+  transport-agnostic and directly reusable; the new work is per-stream tracking of which
+  streams are WS tunnels (mirroring `http1-framer.js`'s `pendingMethods` tracking) and
+  routing a tunnel stream's `DATA` payloads into that parser. Lower priority since a
+  plain `new WebSocket(url)` still overwhelmingly bootstraps via HTTP/1.1 in practice.
+- **`tapctl dbdump` still has no coverage for `/byte-ranges`/`/chunks/timeline`.**
+  Originally filed 2026-09-01 covering the whole frame/byte-range gap (`/frames`,
+  `/frames/timeline`, `/frames/by-seq`, `/byte-ranges`, `/chunks/timeline` — see
+  `intercept/dbdump/CLAUDE.md` — had no `tapctl` command at all, only the older per-chunk
+  surface: `chunk`, `chunklist`, `stid-stream`, ...), surfaced by a session comparing
+  raw-SQLite vs. `tapctl` vs. direct REST calls as ways for Claude to inspect recorded
+  traffic: for anything involving framer/dissector output — a large and growing share of
+  real investigative questions — the only options were reading `dump.sqlite`'s `frames`
+  table directly (requires knowing the schema up front, no discovery mechanism) or raw
+  `curl` against the REST endpoints (requires reading Go source for the exact request
+  shape, since JSON field naming is an inconsistent mix of `snake_case`/camelCase across
+  structs; a malformed request silently returns `[]` instead of an error, so a wrong
+  guess reads as "no data" rather than "bad request").
+  **Done, same session:** `tapctl dbdump script-*`/`dissect-script-*` (dbdump had no
+  script-store CRUD at all before, only tamper did) plus a `--hash` flag on every
+  `*script-get` command across both interceptors, backed by a new `?hash=1` query param
+  on `scriptstore`'s shared GET handler (`intercept/scriptstore/CLAUDE.md`) — returns
+  `{"sha256":"..."}`, the exact `frames.script_version` value, instead of the content;
+  this was the prerequisite for `frame-progress`/`frames-timeline` (also done, same
+  session — the `beforeStid`-vs-snake_case wire inconsistency noted above was
+  reproduced faithfully rather than smoothed over, per `test/tapctl/CLAUDE.md`'s note)
+  to be usable standalone rather than just wrapped-but-unusable, since both require an
+  exact `script_version` the caller must already know.
+  **Still open:** `byte-ranges`/`chunks-timeline` — lower priority than the above was,
+  since `chunk`/`chunklist`/`stid-stream` already give reasonable raw-byte access; revisit
+  only if a real investigation actually needs them (e.g. `byte-ranges`' arbitrary-span
+  fetch, unlike `chunk`'s whole-chunk-only granularity).
+- **`tapctl core` had no `core/kv` coverage at all — done 2026-09-01.** Only `core/fs`
+  had commands (`fs-*`); `core/kv` (see `core/CLAUDE.md`) had none, despite the two
+  being documented as equally-standing core services. Added `kv-list`/`kv-read`/
+  `kv-write`/`kv-delete` (`test/tapctl/CLAUDE.md`'s "`tapctl core`" section) — CLI-only,
+  no backend change needed, since the REST API already fully existed. Verified live:
+  full write/list-with-prefix/read/delete/read-after-delete/idempotent-delete round trip
+  against a real `core.kv` store, plus the unconfigured-service `404` case.
+- **`tapctl dbdump search`'s mandatory `--session` — done 2026-09-01.** `search-text`
+  itself still requires a session server-side (`searchTextRequest.Session` is
+  non-optional there, unchanged) — before this, the only option without already knowing
+  which session holds a stream was enumerating `sessions` and looping `search` per
+  session by hand (done live, same session, to locate a stream by a header value it
+  contained). Fixed client-side only, no backend change (`test/tapctl/CLAUDE.md`'s
+  `search` bullet): `--session` is now optional and, when omitted, fans out across every
+  session from `sessions`, tagging each hit with a `session` field the raw per-session
+  response doesn't carry on its own. `--stream` now requires `--session` (a stream id is
+  only unique within a session, so a bare `--stream` in fan-out mode would silently hit a
+  different actual stream per session) — verified live: the guard rejects that
+  combination, single-session output is byte-for-byte unchanged, and the fan-out finds
+  the same match across sessions as the earlier by-hand loop did, correctly tagged.
 
 ## Dependencies
 

@@ -73,6 +73,7 @@ const COMPLETIONS = { tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE
 export default function TamperScriptsPanel({
     connected, running, onRun, onStop, logLines, onClearLog, refreshSignal,
     logFile, bypassBrowserLog, onBypassBrowserLogChange,
+    framerScripts, framerSelected, onFramerSelectedChange,
 }) {
     // Handle sits before the log panel (above it), so a negative deltaY (dragging up)
     // grows it.
@@ -99,9 +100,23 @@ export default function TamperScriptsPanel({
                 refreshSignal=${refreshSignal}
                 listWidthKey="scriptsListWidth"
                 rowDecoration=${name => running === name && html`<span class="tamper-script-running-dot">●</span>`}
-                controls=${(name, source) => running === name
-                    ? html`<button class="btn" onclick=${onStop}>■ Stop</button>`
-                    : html`<button class="btn" disabled=${!connected} onclick=${() => onRun(name, source)}>▶ Run</button>`}
+                controls=${(name, source) => html`
+                    <span class="framer-controls">
+                        <span class="meta-label">framer</span>
+                        <select
+                            class="goto-select"
+                            value=${framerSelected}
+                            disabled=${!!running}
+                            onchange=${e => onFramerSelectedChange(e.target.value)}
+                        >
+                            <option value="">(none)</option>
+                            ${framerScripts.map(s => html`<option value=${s.name}>${s.name}</option>`)}
+                        </select>
+                    </span>
+                    ${running === name
+                        ? html`<button class="btn" onclick=${onStop}>■ Stop</button>`
+                        : html`<button class="btn" disabled=${!connected} onclick=${() => onRun(name, source)}>▶ Run</button>`}
+                `}
             />
             <${ResizeHandle} orientation="h" onResize=${handleLogResize} />
             <div class="tamper-scripts-log" style=${`height: ${logHeight}px`}>

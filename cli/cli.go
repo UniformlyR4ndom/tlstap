@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	corefs "tlstap/core/fs"
+	corekv "tlstap/core/kv"
 	"tlstap/intercept/bridge"
 	"tlstap/intercept/dbdump"
 	"tlstap/intercept/drop"
@@ -90,6 +92,23 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	apiMux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ui/", http.StatusFound)
 	})
+
+	// Core services: like /ui/ above, registered directly here rather than discovered
+	// from a proxy's interceptor list, since they aren't tied to any one proxy or
+	// interceptor chain. See doc/design/core-kv-store.md.
+	var coreServices []CoreService
+	if configFile.Core != nil && configFile.Core.Kv != nil {
+		kvStore, err := corekv.New(configFile.Core.Kv.File)
+		checkFatal(&mainLogger, err)
+		kvStore.RegisterRoutes(apiMux, "/api/core/kv")
+		coreServices = append(coreServices, kvStore)
+	}
+	if configFile.Core != nil && configFile.Core.Fs != nil {
+		fsStore, err := corefs.New(configFile.Core.Fs.Dir)
+		checkFatal(&mainLogger, err)
+		fsStore.RegisterRoutes(apiMux, "/api/core/fs")
+		coreServices = append(coreServices, fsStore)
+	}
 
 	var allProxies []*proxy.Proxy
 
@@ -182,15 +201,15 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	<-sigCh
 	mainLogger.Info("Shutdown signal received, shutting down gracefully...")
 
-	shutdown(allProxies, apiServer, sigCh, &mainLogger)
+	shutdown(allProxies, coreServices, apiServer, sigCh, &mainLogger)
 }
 
 // shutdown runs the graceful-shutdown sequence: stop accepting new work everywhere (close
 // every proxy's listener, start the API server's Shutdown), let both drain concurrently
-// bounded by their own timeouts, then finalize every interceptor. A second SIGINT/SIGTERM
-// arriving on sigCh at any point during this forces an immediate os.Exit(1) instead of
-// waiting for the sequence to finish on its own.
-func shutdown(proxies []*proxy.Proxy, apiServer *http.Server, sigCh <-chan os.Signal, logger *logging.Logger) {
+// bounded by their own timeouts, then finalize every interceptor and core service. A
+// second SIGINT/SIGTERM arriving on sigCh at any point during this forces an immediate
+// os.Exit(1) instead of waiting for the sequence to finish on its own.
+func shutdown(proxies []*proxy.Proxy, coreServices []CoreService, apiServer *http.Server, sigCh <-chan os.Signal, logger *logging.Logger) {
 	go func() {
 		<-sigCh
 		logger.Warn("Second shutdown signal received, forcing immediate exit.")
@@ -231,12 +250,18 @@ func shutdown(proxies []*proxy.Proxy, apiServer *http.Server, sigCh <-chan os.Si
 	finalizeDone := make(chan struct{})
 	go func() {
 		var wg sync.WaitGroup
-		wg.Add(len(proxies))
+		wg.Add(len(proxies) + len(coreServices))
 		for _, p := range proxies {
 			go func(p *proxy.Proxy) {
 				defer wg.Done()
 				p.Finalize()
 			}(p)
+		}
+		for _, cs := range coreServices {
+			go func(cs CoreService) {
+				defer wg.Done()
+				cs.Finalize()
+			}(cs)
 		}
 		wg.Wait()
 		close(finalizeDone)
@@ -244,9 +269,9 @@ func shutdown(proxies []*proxy.Proxy, apiServer *http.Server, sigCh <-chan os.Si
 
 	select {
 	case <-finalizeDone:
-		logger.Info("All interceptors finalized.")
+		logger.Info("All interceptors and core services finalized.")
 	case <-time.After(finalizeTimeout):
-		logger.Warn("Timed out waiting for interceptors to finalize; exiting anyway.")
+		logger.Warn("Timed out waiting for interceptors and core services to finalize; exiting anyway.")
 	}
 
 	logger.Info("Shutdown complete.")
