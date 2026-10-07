@@ -1,6 +1,5 @@
 import { h } from 'preact'
 import htm from 'htm'
-import { listScripts, getScript, putScript, deleteScript } from '../tamperApi.js'
 import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
 import { NUMBER_TYPES } from '../transforms/numbers.js'
 import { camelCaseOpId, capitalizeTypeId } from '../transformWorkerApi.js'
@@ -71,6 +70,7 @@ const COMPLETIONS = { tamper: TAMPER_COMPLETION_SHAPE, ctx: CTX_COMPLETION_SHAPE
 // and whether to also keep it in the browser's own copy happen there; this panel only
 // renders what those choices imply.
 export default function TamperScriptsPanel({
+    tamperApi,
     connected, running, onRun, onStop, logLines, onClearLog, refreshSignal,
     logFile, bypassBrowserLog, onBypassBrowserLogChange,
     framerScripts, framerSelected, onFramerSelectedChange,
@@ -95,7 +95,8 @@ export default function TamperScriptsPanel({
         <div class="tamper-scripts-view">
             <${ScriptsCrudPanel}
                 className="tamper-scripts-main"
-                list=${listScripts} get=${getScript} put=${putScript} del=${deleteScript}
+                list=${tamperApi.listScripts} get=${tamperApi.getScript}
+                put=${tamperApi.putScript} del=${tamperApi.deleteScript}
                 completions=${COMPLETIONS}
                 refreshSignal=${refreshSignal}
                 listWidthKey="scriptsListWidth"

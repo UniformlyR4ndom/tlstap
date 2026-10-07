@@ -171,6 +171,13 @@ type DbDumpInterceptor struct {
 	stopCh    chan struct{}
 	flushDone chan struct{}
 
+	// framerJobs/dissectorJobs (jobrelay.go, framerjobs.go, dissectorjobs.go): let a
+	// connected browser tab, opted in via its own UI toggle, run a framer/dissector
+	// script on tapctl's behalf. Each guards its own connection/pending-jobs state
+	// internally, unrelated to mu above (no chunk-capture state involved).
+	framerJobs    *jobRelay
+	dissectorJobs *jobRelay
+
 	logger *logging.Logger
 }
 
@@ -490,6 +497,8 @@ func NewDbDumpInterceptor(path string, truncate bool, scriptsDir, dissectScripts
 		clientEndpoints: make(map[uint32]string),
 		chunkStates:     make(map[chunkKey]chunkState),
 		streamNextSTID:  make(map[uint32]int64),
+		framerJobs:      newJobRelay(),
+		dissectorJobs:   newJobRelay(),
 		logger:          logger,
 	}, nil
 }

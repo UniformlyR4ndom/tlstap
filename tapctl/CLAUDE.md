@@ -6,10 +6,10 @@ the flat command list doesn't get confusing as more interceptors gain commands. 
 command opens a fresh connection, performs one action, prints JSON to stdout, and
 exits — no persistent connection needed for anything, by design.
 
-Build: `go build -o tapctl ./test/tapctl`. Run `./tapctl help` (or `tapctl <group>
+Build: `go build -o tapctl ./tapctl`. Run `./tapctl help` (or `tapctl <group>
 help`) for the same usage text reproduced below. Source split by concern, mirroring the
 interceptor packages themselves: `main.go` (dispatch + shared HTTP/WS/flag/output
-helpers), `tamper.go`, `dbdump.go`.
+helpers), `tamper.go`, `dbdump.go`, `core.go`.
 
 This file documents `tapctl` itself — protocol/wire-format details (message shapes,
 config fields, server-side rationale) live in the root `CLAUDE.md`, referenced by
@@ -173,6 +173,15 @@ tapctl dbdump sgid-stream --session N [--start N] [--n 50] [--api URL]
 tapctl dbdump frame-progress --session N --stream N --script NAME --script-version HASH [--api URL]
 tapctl dbdump frames-timeline --session N --stream N --script NAME --script-version HASH
                                [--start N | --before-stid N] [--n 50] [--api URL]
+tapctl dbdump chunks-timeline --session N --stream N [--start N | --before-stid N] [--n 50] [--api URL]
+tapctl dbdump byte-range --session N --stream N --direction N --offset N --length N [--api URL]
+tapctl dbdump chunks-follow --session N --stream N [--start N] [--poll-ms 500] [--api URL]
+tapctl dbdump frames-follow --session N --stream N --script NAME --script-version HASH
+                             [--start N] [--poll-ms 500] [--api URL]
+tapctl dbdump run-framer --session N --stream N --script NAME [--api URL]
+tapctl dbdump run-dissector --session N --stream N --direction N --frame-id N
+                             --framer-script NAME --framer-script-version HASH
+                             --dissect-script NAME [--api URL]
 tapctl dbdump script-list [--api URL]
 tapctl dbdump script-get --name NAME [--hash] [--api URL]
 tapctl dbdump script-put --name NAME (--file PATH | --file -) [--api URL]
@@ -231,6 +240,72 @@ same convention `tamper peek` uses, for consistency across the tool.
   rule the server enforces, checked client-side here too for a clearer error than the
   server's own 400. `--n` defaults to 50, same reasoning as `stid-stream`/`sgid-stream`
   above.
+- `chunks-timeline` — `frames-timeline`'s raw-chunk counterpart (`POST
+  /chunks/timeline`, `intercept/dbdump/CLAUDE.md`'s "dbdump Interceptor" section): same
+  `(session, stream)` scoping and `--start`/`--before-stid`/`--n` pagination convention,
+  minus a script/script-version key (chunks have none — no prior `script-get --hash`
+  needed). Returns metadata only — `{id, direction, stid, time, offset, length}` per
+  chunk, merged across both directions in `stid` order — no chunk bytes; fetch those
+  separately via `chunk`/`chunk-stid` above. This is `/segments`' retired role's
+  metadata half, reborn as a plain paged listing (no server-side budget selection,
+  unlike `/segments` — the frontend applies its own byte budget client-side).
+- `byte-range` — a single-range convenience wrapper over `POST /byte-ranges`
+  (`intercept/dbdump/CLAUDE.md`'s "dbdump Interceptor" section), which fetches an
+  arbitrary `[offset, offset+length)` span for one direction, possibly spanning
+  multiple underlying chunks — unlike `chunk` above, which only ever returns whole
+  chunks by id. The real endpoint batches several ranges into one binary
+  request/response; this command always sends exactly one entry (encoding direction
+  into the wire length field's sign, per the endpoint's own convention) and decodes the
+  single length-prefixed reply. Prints `{"offset","direction","requested_length",
+  "length","data_base64"}` — `length` (and the decoded bytes) may come back shorter
+  than `--length`, even `0`: not an error, just means that much of the span isn't
+  captured yet (a still-live stream) or ever will be (the stream's genuine end).
+- `chunks-follow`/`frames-follow` — the only commands in this group that don't exit
+  once their initial request is answered: every other command here is a one-shot
+  snapshot, so watching an actively-growing capture otherwise means polling by hand in
+  a loop. Both run until killed, printing **one JSON object per line (NDJSON)** as new
+  data appears — unlike every other command's single pretty-printed blob, since the
+  whole point here is a caller can read output as it arrives — and re-poll after
+  `--poll-ms` (default `500`, clamped to a minimum of `100` regardless of what's
+  passed, to avoid an accidental busy-loop) whenever a poll comes back empty. Neither
+  takes an `--n`: there's no fixed batch size to ask for, just "keep going forever."
+  `chunks-follow` reuses `/stid-stream`'s WebSocket — its request/response loop already
+  accepts a fresh request after each `done` over one connection, so no server change
+  was needed — repeatedly asking for `stid >= cursor` and advancing `cursor` past the
+  last stid seen; each line matches `stid-stream`'s own per-chunk shape
+  (`{"stid","chunk_id","direction","time","offset","data_base64"}`). `frames-follow`
+  instead repolls `POST /frames/timeline` (no WebSocket variant exists for frames),
+  same `(session, stream, script, script_version)` key as `frame-progress`/
+  `frames-timeline`; each line matches `frames-timeline`'s own entry shape
+  (`{"id","ranges","meta","direction","stid","time","seq","virtual_offset"}`). Frames
+  are never computed server-side — `frames-follow` only ever shows what some client
+  (a browser tab running `catchUpFramer`, whether by hand or via `run-framer` below) is
+  actively persisting via `/frames/append` for that exact key; starting it doesn't make
+  anything happen on its own, it only observes.
+- `run-framer` is the one command in this group that *does* make framing happen: it asks
+  a currently-connected browser tab (the web UI's View menu → "Remote framer runs"
+  toggle, opted in explicitly — see `web/CLAUDE.md`'s "Remote framer job listener"
+  section) to run a script for real, through that tab's own already-loaded
+  `frameRuntime.js` — the exact same code path a manual Run click uses, not a second
+  implementation `tapctl` would otherwise need to carry. Blocks until that browser
+  reports success or failure, or the request times out server-side (`504`), or fails
+  immediately (`503`) if no browser is connected right now. `--script` is a name only, no
+  `--script-version` — the browser resolves the script's own current content and version
+  itself, the same way a manual Run does. On success, use `frames-follow`/
+  `frames-timeline` afterward to inspect what got persisted.
+- `run-dissector` is `run-framer`'s dissector-script sibling — same "ask a connected
+  browser tab" plumbing, but its own separate connection/toggle ("Remote dissector runs"
+  in the View menu, opted in independently from "Remote framer runs"), matching this
+  codebase's convention of keeping framer/dissector as separate systems throughout. It
+  identifies one already-persisted frame directly rather than a whole stream:
+  `--direction`/`--framer-script`/`--framer-script-version` name the framer run that
+  produced it (the same key `frame-progress`/`frames-timeline` use), and `--frame-id` is
+  that frame's own id within that key — learnable from `frames-timeline`'s or
+  `frames-follow`'s own `"id"` field. Unlike `run-framer`, dissection output is never
+  persisted anywhere — there's nothing to go inspect afterward the way `frames-timeline`
+  works for a framer run — so a successful call prints the dissector script's own
+  `FieldNode[]` tree directly (the same shape `DissectPanel.js` renders in the UI), not
+  just `{"status":"ok"}`.
 - `script-list`/`script-get`/`script-put`/`script-delete` — the same flat-verb shape as
   `tamper script-*` above (including `-get`'s `--hash`), but against dbdump's own
   framer-script store (`scripts-dir`; see `intercept/dbdump/CLAUDE.md`'s "Framer
@@ -279,10 +354,34 @@ tapctl dbdump search --pattern "GET /login"
 tapctl dbdump stid-stream --session 1 --stream 0 --start 0 --n 50
 tapctl dbdump sgid-stream --session 1 --start 0 --n 0   # 0 = unlimited
 
+# Pull the next batch of raw chunk metadata across both directions, in stid order.
+tapctl dbdump chunks-timeline --session 1 --stream 0 --start 0 --n 50
+
+# Fetch an arbitrary byte span (here spanning two 14-byte chunks) as base64.
+tapctl dbdump byte-range --session 1 --stream 0 --direction 0 --offset 10 --length 20
+
+# Watch a stream's chunks land live (NDJSON, one line per chunk) instead of polling by
+# hand — run this, then drive traffic through the proxy in another terminal.
+tapctl dbdump chunks-follow --session 1 --stream 0
+
+# Same, for a framer run's persisted frames (only shows something once some client,
+# typically a browser tab, is actively running the framer for this exact key).
+tapctl dbdump frames-follow --session 1 --stream 0 --script http1-framer --script-version "$V"
+
 # Learn the framer script's current version, then check progress and pull its frames.
 V=$(tapctl dbdump script-get --name http1-framer --hash | python3 -c 'import json,sys;print(json.load(sys.stdin)["sha256"])')
 tapctl dbdump frame-progress --session 1 --stream 0 --script http1-framer --script-version "$V"
 tapctl dbdump frames-timeline --session 1 --stream 0 --script http1-framer --script-version "$V"
+
+# Ask a connected browser tab (View menu -> "Remote framer runs" enabled) to actually
+# run the framer for real, then inspect what it persisted.
+tapctl dbdump run-framer --session 1 --stream 0 --script http1-framer
+tapctl dbdump frames-timeline --session 1 --stream 0 --script http1-framer --script-version "$V"
+
+# Ask a connected browser tab (View menu -> "Remote dissector runs" enabled) to dissect
+# one already-persisted frame (id 3, from the frames-timeline output above) for real.
+tapctl dbdump run-dissector --session 1 --stream 0 --direction 0 --frame-id 3 \
+    --framer-script http1-framer --framer-script-version "$V" --dissect-script http1-dissector
 
 # Framer script storage: list, fetch a script's content and its current version.
 tapctl dbdump script-list

@@ -33,6 +33,7 @@ type Proxy struct {
 
 	prober Prober
 
+	listenerMu sync.Mutex     // guards listener and listenAddr: Stop() and Finalize() run on other goroutines than the accept loop
 	listener   net.Listener   // set once the accept loop starts; closed by Stop()
 	listenAddr net.TCPAddr    // set alongside listener, reused by Finalize()
 	connWg     sync.WaitGroup // tracks in-flight HandleConnection goroutines, for WaitForConnections
@@ -67,6 +68,10 @@ func (p *Proxy) Start() error {
 
 	if p.Config.ConnectEndpoint == nil || *p.Config.ConnectEndpoint == "" {
 		return fmt.Errorf("connect endpoint must be specified")
+	}
+
+	if err := p.validateBufferingChains(); err != nil {
+		return err
 	}
 
 	var tlsServerConfig, tlsClientConfig *tls.Config
@@ -172,8 +177,7 @@ func (p *Proxy) startPlainProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
-	p.listener = listener
-	p.listenAddr = *tcpAddr
+	p.setListener(listener, *tcpAddr)
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
@@ -203,8 +207,7 @@ func (p *Proxy) startTlsProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
-	p.listener = listener
-	p.listenAddr = *tcpAddr
+	p.setListener(listener, *tcpAddr)
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
@@ -260,8 +263,7 @@ func (p *Proxy) startDetectTlsProxy() error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
-	p.listener = listener
-	p.listenAddr = *tcpAddr
+	p.setListener(listener, *tcpAddr)
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for {
@@ -297,8 +299,7 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 	p.logStartupInfo()
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	assert.Assertf(ok, "Unexpected address type: %T. This is a bug.", listener.Addr())
-	p.listener = listener
-	p.listenAddr = *tcpAddr
+	p.setListener(listener, *tcpAddr)
 	notifyInit(p.InterceptorsAll, *tcpAddr)
 
 	for _, h := range mux.handlers {
@@ -350,6 +351,44 @@ func (p *Proxy) startTlsMuxProxy(mux *Mux) error {
 		logClientConfigInfo(handler.ConnId, handler.logger, handler.Setting.TlsClientConfig)
 		p.trackConnection(func() { handler.HandleConnection(conn) })
 	}
+}
+
+// validateBufferingChains rejects interceptor chains that ConnHandler can't drive: more than one
+// buffering interceptor per direction, and any buffering interceptor in detecttls mode.
+func (p *Proxy) validateBufferingChains() error {
+	check := func(what string, chain []Interceptor) error {
+		n := len(scanBuffering(chain))
+		switch {
+		case n > 1:
+			return fmt.Errorf("%s: at most one buffering interceptor is supported per direction, got %d", what, n)
+		case n > 0 && p.Mode == ModeDetectTls:
+			return fmt.Errorf("%s: buffering interceptors are not supported in detecttls mode", what)
+		}
+
+		return nil
+	}
+
+	if err := check("up chain", p.InterceptorsUp); err != nil {
+		return err
+	}
+
+	if err := check("down chain", p.InterceptorsDown); err != nil {
+		return err
+	}
+
+	if p.Mux != nil {
+		for _, h := range p.Mux.handlers {
+			if err := check("mux handler "+h.Name+" up chain", h.InterceptorsUp); err != nil {
+				return err
+			}
+
+			if err := check("mux handler "+h.Name+" down chain", h.InterceptorsDown); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func (p *Proxy) newHandler(mode Mode, mux *Mux, serverName string) (*ConnHandler, error) {
@@ -421,9 +460,21 @@ func (p *Proxy) trackConnection(fn func()) {
 // Stop closes the proxy's listener, causing its accept loop to return nil. Safe to call
 // once Start() has set up the listener; a no-op before that.
 func (p *Proxy) Stop() {
-	if p.listener != nil {
-		p.listener.Close()
+	if l, _ := p.getListener(); l != nil {
+		l.Close()
 	}
+}
+
+func (p *Proxy) setListener(l net.Listener, addr net.TCPAddr) {
+	p.listenerMu.Lock()
+	defer p.listenerMu.Unlock()
+	p.listener, p.listenAddr = l, addr
+}
+
+func (p *Proxy) getListener() (net.Listener, net.TCPAddr) {
+	p.listenerMu.Lock()
+	defer p.listenerMu.Unlock()
+	return p.listener, p.listenAddr
 }
 
 // WaitForConnections blocks until every in-flight connection handler has returned, or ctx
@@ -451,10 +502,11 @@ func (p *Proxy) WaitForConnections(ctx context.Context) bool {
 // when the accept loop starts, and never mutated again.
 func (p *Proxy) Finalize() {
 	var wg sync.WaitGroup
-	notifyFinalize(&wg, p.InterceptorsAll, p.listenAddr)
+	_, listenAddr := p.getListener()
+	notifyFinalize(&wg, p.InterceptorsAll, listenAddr)
 	if p.Mux != nil {
 		for _, h := range p.Mux.handlers {
-			notifyFinalize(&wg, h.InterceptorAll, p.listenAddr)
+			notifyFinalize(&wg, h.InterceptorAll, listenAddr)
 		}
 	}
 	wg.Wait()

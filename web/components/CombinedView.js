@@ -1,7 +1,6 @@
 import { h } from 'preact'
 import { useEffect } from 'preact/hooks'
 import htm from 'htm'
-import { openSgidStream } from '../api.js'
 import HexDump from './HexDump.js'
 import { useChunkBuffer } from '../useChunkBuffer.js'
 import { fmtRelTime } from '../format.js'
@@ -41,11 +40,11 @@ function buildRows(chunks, sessionStart) {
     return rows
 }
 
-export default function CombinedView({ session, globalOffset, sizeFormat, pinHeader, refreshKey, latestSgid, jumpRef }) {
+export default function CombinedView({ dbdumpApi, session, globalOffset, sizeFormat, pinHeader, refreshKey, latestSgid, jumpRef }) {
     const { display, loading, error, handleScrollEnd, jumpToTop, jumpToBottom } = useChunkBuffer({
         entity: session,
         refreshKey,
-        openStream: openSgidStream,
+        openStream: dbdumpApi.openSgidStream,
         fetchPage,
         getId,
         buildRows,

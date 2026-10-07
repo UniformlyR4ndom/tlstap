@@ -1,5 +1,15 @@
 {
   "proxies": {
+    "example-detecttls": {
+      "mode": "detecttls",
+      "listen": "127.0.0.1:8000",
+      "connect": "127.0.0.1:8100",
+      "server": "basic-server",
+      "client": "basic-client",
+      "interceptors": [
+        "hexdump"
+      ]
+    },
     "ws-verify": {
       "mode": "tls",
       "listen": "127.0.0.1:8543",
@@ -26,10 +36,17 @@
     "dbdump-test": {
       "mode": "plain",
       "listen": "127.0.0.1:8000",
-      "y-connect": "212.102.35.236:80",
       "connect": "127.0.0.1:8100",
       "interceptors": [
         "dbdump"
+      ]
+    },
+    "dbdump-test-2": {
+      "mode": "plain",
+      "listen": "127.0.0.1:9000",
+      "connect": "127.0.0.1:8100",
+      "interceptors": [
+        "dbdump2"
       ]
     },
     "dbdump-test-tls": {
@@ -200,7 +217,19 @@
     }
   },
   "api": {
-    "listen": "127.0.0.1:9090"
+    "base-urls": [
+      "http://127.0.0.1:9090"
+    ],
+    "cert-pem": "test/certs/server.pem",
+    "cert-key": "test/certs/server.key",
+    "core-services": {
+      "kv": {
+        "file": "core-kv.sqlite"
+      },
+      "fs": {
+        "dir": "examples/fs"
+      }
+    }
   },
   "interceptors": {
     "hexdump": {
@@ -220,6 +249,15 @@
       "name": "dbdump",
       "args": {
         "file": "dump.sqlite",
+        "truncate": false,
+	"scripts-dir": "examples/dbdump/framer",
+	"dissect-scripts-dir": "examples/dbdump/dissect"
+      }
+    },
+    "dbdump2": {
+      "name": "dbdump",
+      "args": {
+        "file": "dump2.sqlite",
         "truncate": false,
 	"scripts-dir": "examples/dbdump/framer",
 	"dissect-scripts-dir": "examples/dbdump/dissect"

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildRows, evict, fillToTarget, windowIndexAtRow, rowIndexOfWindow } from './byteBufferCore.js'
+import { buildRows, evict, fillToTarget, windowIndexAtRow, rowIndexOfWindow, MAX_BUFFERED_SEGMENTS } from './byteBufferCore.js'
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────
 
@@ -357,4 +357,74 @@ test('fillToTarget: per-quantum maxBytes/maxSegments are clamped to the remainin
 
     assert.equal(fill.calls[0].maxBytes, 10) // remaining(10) < WINDOW_STEP
     assert.equal(fill.calls[0].maxSegments, 3) // remaining(3) < SEGMENT_STEP
+})
+
+test('fillToTarget: without mustReachStid, a satisfied budget stops the loop after the first page', async () => {
+    const w1 = fullWin(seg(1, 0, 0, 0, 8, 0))
+    const w2 = fullWin(seg(2, 0, 0, 8, 8, 0))
+    const fill = fakeFill([
+        { windows: [w1], reachedEnd: false },
+        { windows: [w2], reachedEnd: false },
+    ])
+    const windows = []
+    const genRef = { current: 1 }
+    await fillToTarget(fill, null, {}, windows, 1, -1, null, 8, 1, genRef, 1)
+
+    assert.equal(fill.calls.length, 1, 'baseline: the tiny (8-byte, 1-segment) budget alone stops the loop')
+})
+
+test('fillToTarget: mustReachStid keeps filling past an already-satisfied budget until that segment is loaded', async () => {
+    // Reproduces the real bug: a jump-to-stid reload's byte/segment budget (here a tiny
+    // 8-byte/1-segment stand-in for FILL_TARGET_BYTES/SEGMENTS) is satisfied long before
+    // the segment it's supposed to center on is actually loaded.
+    const w1 = fullWin(seg(1, 0, 0, 0, 8, 0))
+    const w2 = fullWin(seg(2, 0, 0, 8, 8, 0))
+    const w3 = fullWin(seg(3, 0, 0, 16, 8, 0))
+    const fill = fakeFill([
+        { windows: [w1], reachedEnd: false },
+        { windows: [w2], reachedEnd: false },
+        { windows: [w3], reachedEnd: true },
+    ])
+    const windows = []
+    const genRef = { current: 1 }
+    const result = await fillToTarget(fill, null, {}, windows, 1, -1, null, 8, 1, genRef, 1, 3)
+
+    assert.equal(fill.calls.length, 3, 'must keep going past the already-satisfied budget to reach stid 3')
+    assert.deepEqual(windows.map(w => w.segment.stid), [1, 2, 3])
+    assert.equal(result.reachedEnd, true)
+})
+
+test('fillToTarget: once past the exhausted budget, per-quantum maxBytes/maxSegments fall back to a full quantum, not a negative/zero clamp', async () => {
+    const w1 = fullWin(seg(1, 0, 0, 0, 8, 0))
+    const w2 = fullWin(seg(2, 0, 0, 8, 8, 0))
+    const fill = fakeFill([
+        { windows: [w1], reachedEnd: false },
+        { windows: [w2], reachedEnd: true },
+    ])
+    const windows = []
+    const genRef = { current: 1 }
+    await fillToTarget(fill, null, {}, windows, 1, -1, null, 8, 1, genRef, 1, 2)
+
+    assert.equal(fill.calls[0].maxBytes, 8) // still within budget on the first call
+    assert.equal(fill.calls[0].maxSegments, 1)
+    // Budget is exhausted (addedBytes=8>=8, addedSegments=1>=1) going into the 2nd call —
+    // a naive Math.min(WINDOW_STEP, remaining) would go negative here and break
+    // selectByBudget's own maxBytes handling (see fillToTarget's doc comment).
+    assert.ok(fill.calls[1].maxBytes > 0, 'must not be zero/negative once the budget is exhausted')
+    assert.ok(fill.calls[1].maxSegments > 0)
+})
+
+test('fillToTarget: mustReachStid chase is still bounded by MAX_BUFFERED_SEGMENTS if the target is never found', async () => {
+    let nextStid = 1
+    const fill = async (handle, entity, req) => {
+        const s = seg(nextStid, 0, 0, (nextStid - 1) * 8, 8, 0)
+        nextStid++
+        return { windows: [fullWin(s)], reachedEnd: false }
+    }
+    const windows = []
+    const genRef = { current: 1 }
+    const result = await fillToTarget(fill, null, {}, windows, 1, -1, null, 8, 1, genRef, 1, 999_999_999)
+
+    assert.equal(windows.length, MAX_BUFFERED_SEGMENTS, 'must give up at the hard segment cap rather than loop forever chasing an unreachable target')
+    assert.equal(result.reachedEnd, false)
 })

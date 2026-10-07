@@ -17,15 +17,35 @@ type ConfigFile struct {
 
 	// Optional REST API server configuration.
 	Api *ApiConfig `json:"api"`
-
-	// Optional core services — utility APIs not tied to any one interceptor. See
-	// doc/design/core-kv-store.md.
-	Core *CoreConfig `json:"core"`
 }
 
 type ApiConfig struct {
-	// TCP address the API server listens on (e.g. "127.0.0.1:9090").
-	Listen string `json:"listen"`
+	// Base URLs the API/UI should be reachable at (e.g. "http://127.0.0.1:9090") — one
+	// HTTP server per entry, all sharing the same handler; empty/absent starts no server
+	// at all. Each must have an "http" or "https" scheme and no path; the host:port is
+	// used as that entry's own listen address.
+	BaseUrls []string `json:"base-urls"`
+
+	// Certificate (PEM format, both required together) used by every "https" entry in
+	// BaseUrls — one shared certificate for the whole API server, not one per URL.
+	// Required as soon as any entry uses https; ignored otherwise.
+	CertPem string `json:"cert-pem"`
+	CertKey string `json:"cert-key"`
+
+	// Optional client-certificate verification for every "https" entry — same
+	// fields/semantics as TlsServerConfig's own ClientRoots/ClientAuthPolicy (a
+	// comma-separated list of PEM trust-root paths, and one of tls.ClientAuthType's
+	// policy names via proxy.ParseClientAuthPolicy). No client cert is requested at all
+	// when ClientAuthPolicy is unset, same default as TlsServerConfig's own — set it to
+	// e.g. "request" or "verify-if-given" for optional client auth, "require-and-verify"
+	// to make it mandatory.
+	ClientRoots      string `json:"client-roots"`
+	ClientAuthPolicy string `json:"client-auth"`
+
+	// Optional core services; utility APIs not tied to any one interceptor, nested here
+	// (rather than a sibling top-level key) since they have no purpose except being
+	// reached through this same API server — see doc/design/core-kv-store.md.
+	CoreServices *CoreConfig `json:"core-services"`
 }
 
 type CoreConfig struct {

@@ -1,6 +1,5 @@
 import { h } from 'preact'
 import htm from 'htm'
-import { listDissectScripts, getDissectScript, putDissectScript, deleteDissectScript } from '../dbdumpDissectApi.js'
 import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
 import { NUMBER_TYPES } from '../transforms/numbers.js'
 import { camelCaseOpId, capitalizeTypeId } from '../transformWorkerApi.js'
@@ -31,11 +30,12 @@ const COMPLETIONS = { dissector: DISSECTOR_COMPLETION_SHAPE }
 // a dissector script runs on-demand per selected frame from TrafficView.js's own
 // DissectPanel.js, and errors surface there directly rather than through a running log
 // (there's no long-running process to log from, unlike the framer's Run).
-export default function DissectScriptsPanel({ refreshSignal }) {
+export default function DissectScriptsPanel({ dissectApi, refreshSignal }) {
     return html`
         <${ScriptsCrudPanel}
             className="dissect-scripts-view"
-            list=${listDissectScripts} get=${getDissectScript} put=${putDissectScript} del=${deleteDissectScript}
+            list=${dissectApi.listDissectScripts} get=${dissectApi.getDissectScript}
+            put=${dissectApi.putDissectScript} del=${dissectApi.deleteDissectScript}
             completions=${COMPLETIONS}
             refreshSignal=${refreshSignal}
             listWidthKey="dissectScriptsListWidth"

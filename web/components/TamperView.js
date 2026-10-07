@@ -7,8 +7,8 @@ import TamperQueueList from './TamperQueueList.js'
 import TamperDetailPanel from './TamperDetailPanel.js'
 import TamperScriptsPanel from './TamperScriptsPanel.js'
 import TamperFramerScriptsPanel from './TamperFramerScriptsPanel.js'
-import { openTamperControl, peekBuffer, getLogFileInfo } from '../tamperApi.js'
-import { listFramerScripts, getFramerScript } from '../tamperFramerApi.js'
+import { createTamperApi } from '../tamperApi.js'
+import { createTamperFramerApi } from '../tamperFramerApi.js'
 import { createScriptRuntime } from '../scriptRuntime.js'
 import { useResizableLayout } from '../useResizableLayout.js'
 import { fmtLogArgs } from '../format.js'
@@ -22,7 +22,18 @@ const LOG_LIMIT = 500
 // Unlike the Analysis tab, state here is entirely live (no sessions/history) — every
 // push event just triggers a fresh list-streams call rather than incremental local
 // patching, since list-streams's "pending" array is already a complete snapshot.
-export default function TamperView() {
+//
+// basePath identifies one tamper interceptor instance (see the GET /api/instances
+// discovery endpoint). App.js remounts this whole component (via a `key` keyed on
+// basePath) on instance switch rather than reacting to a changed prop here — control
+// reconnection is already a full resync by design (see intercept/tamper/CLAUDE.md), so a
+// remount reproduces "close old control socket, open new one, resync" for free and also
+// correctly discards script-runtime/selected-queue-entry state that has no meaning
+// against a different instance. tamperApi/tamperFramerApi are therefore built once, not
+// memoized against a basePath change this component never actually sees happen to it.
+export default function TamperView({ basePath }) {
+    const tamperApi = createTamperApi(basePath)
+    const tamperFramerApi = createTamperFramerApi(basePath)
     const [connected,     setConnected]     = useState(false)
     const [streams,       setStreams]       = useState([])
     const [selectedKey,   setSelectedKey]   = useState(null)
@@ -65,7 +76,7 @@ export default function TamperView() {
     const scriptRuntimeRef = useRef(null)
     if (!scriptRuntimeRef.current) {
         scriptRuntimeRef.current = createScriptRuntime({
-            peek: (conn, direction) => peekBuffer(conn, direction),
+            peek: (conn, direction) => tamperApi.peekBuffer(conn, direction),
             release: (conn, direction, opts, editedBytes) => handleRelease(conn, direction, opts, editedBytes),
             dropConnection: (conn, direction) => handleDropConnection(conn, direction),
             // Wire command underneath (setMode) stays named after the "set-mode"
@@ -112,7 +123,7 @@ export default function TamperView() {
 
     function connect() {
         if (controlRef.current) return
-        const control = openTamperControl({
+        const control = tamperApi.openTamperControl({
             onOpen: () => { setConnected(true); control.listStreams().catch(() => {}) },
             onClose: () => {
                 setConnected(false)
@@ -143,7 +154,7 @@ export default function TamperView() {
             onScriptUpdated: () => setScriptsRefreshSignal(v => v + 1),
             onFramerScriptUpdated: () => {
                 setFramerScriptsRefreshSignal(v => v + 1)
-                listFramerScripts().then(setFramerScripts).catch(() => {})
+                tamperFramerApi.listFramerScripts().then(setFramerScripts).catch(() => {})
             },
         })
         controlRef.current = control
@@ -161,14 +172,14 @@ export default function TamperView() {
     // Independent of the control connection (a REST GET, not pushed over the
     // WebSocket) since log-file config never changes for the server's lifetime.
     useEffect(() => {
-        getLogFileInfo().then(setLogFileInfo).catch(() => {})
+        tamperApi.getLogFileInfo().then(setLogFileInfo).catch(() => {})
     }, [])
 
     // Also independent of the control connection's own lifecycle (a REST GET) — kept
     // fresh afterward via the control connection's "framer-script-updated" push event
     // instead (onFramerScriptUpdated below), same as the interception scripts list.
     useEffect(() => {
-        listFramerScripts().then(setFramerScripts).catch(() => {})
+        tamperFramerApi.listFramerScripts().then(setFramerScripts).catch(() => {})
     }, [])
 
     // One entry per (conn, direction) with something held — a summary (chunks/length),
@@ -233,7 +244,7 @@ export default function TamperView() {
             return
         }
         try {
-            const framerSource = await getFramerScript(framerSelected)
+            const framerSource = await tamperFramerApi.getFramerScript(framerSelected)
             scriptRuntimeRef.current.start(name, source, framerSelected, framerSource)
         } catch (e) {
             setScriptLog(log => [...log, { level: 'error', text: `Framer "${framerSelected}" failed to load: ${e.message}` }].slice(-LOG_LIMIT))
@@ -276,6 +287,7 @@ export default function TamperView() {
                 <${ResizeHandle} orientation="h" onResize=${handleDetailResize} />
                 <div class="tamper-detail-wrap" style=${`height: ${detailHeight}px`}>
                     <${TamperDetailPanel}
+                        peekBuffer=${tamperApi.peekBuffer}
                         entry=${selectedEntry}
                         onRelease=${handleRelease}
                         onDropConnection=${handleDropConnection}
@@ -286,6 +298,7 @@ export default function TamperView() {
             `}
             ${subTab === 'scripts' && html`
                 <${TamperScriptsPanel}
+                    tamperApi=${tamperApi}
                     connected=${connected}
                     running=${runningScript}
                     onRun=${handleRunScript}
@@ -302,7 +315,7 @@ export default function TamperView() {
                 />
             `}
             ${subTab === 'framer-scripts' && html`
-                <${TamperFramerScriptsPanel} refreshSignal=${framerScriptsRefreshSignal} />
+                <${TamperFramerScriptsPanel} tamperFramerApi=${tamperFramerApi} refreshSignal=${framerScriptsRefreshSignal} />
             `}
         </div>
     `

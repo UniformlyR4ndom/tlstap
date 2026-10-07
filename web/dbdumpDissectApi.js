@@ -5,38 +5,46 @@
 // see intercept/dbdump/CLAUDE.md's "Dissector scripts" section). No frame-index-style
 // read/extend API here: dissection output is never persisted, so there's nothing beyond
 // script storage to wrap.
-const BASE = '/api/i/dbdump/dissect'
 
-async function checkOk(res) {
-    if (!res.ok) {
-        let message = res.statusText
-        try {
-            const body = await res.json()
-            if (body.error) message = body.error
-        } catch {}
-        throw new Error(message)
+// createDbDumpDissectApi(dbdumpBasePath) binds these to one dbdump interceptor instance's
+// own base path, under its "/dissect" segment — see api.js's createDbDumpApi for the
+// sibling factory covering the rest of that instance's REST API.
+export function createDbDumpDissectApi(dbdumpBasePath) {
+    const basePath = `${dbdumpBasePath}/dissect`
+
+    async function checkOk(res) {
+        if (!res.ok) {
+            let message = res.statusText
+            try {
+                const body = await res.json()
+                if (body.error) message = body.error
+            } catch {}
+            throw new Error(message)
+        }
+        return res
     }
-    return res
-}
 
-export async function listDissectScripts() {
-    const res = await checkOk(await fetch(`${BASE}/scripts`))
-    return res.json()
-}
+    return {
+        async listDissectScripts() {
+            const res = await checkOk(await fetch(`${basePath}/scripts`))
+            return res.json()
+        },
 
-export async function getDissectScript(name) {
-    const res = await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`))
-    return res.text()
-}
+        async getDissectScript(name) {
+            const res = await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`))
+            return res.text()
+        },
 
-export async function putDissectScript(name, content) {
-    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/javascript' },
-        body: content,
-    }))
-}
+        async putDissectScript(name, content) {
+            await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/javascript' },
+                body: content,
+            }))
+        },
 
-export async function deleteDissectScript(name) {
-    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
+        async deleteDissectScript(name) {
+            await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
+        },
+    }
 }

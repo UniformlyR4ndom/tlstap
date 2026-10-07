@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -54,6 +55,17 @@ const (
 
 type InterceptorCallback func(config proxy.ResolvedProxyConfig, iConfig proxy.InterceptorConfig, logger *logging.Logger) (proxy.Interceptor, error)
 
+// InstanceInfo describes one interceptor instance reachable over the REST API, for the
+// GET /api/instances discovery endpoint. Populated for every interceptor that implements
+// proxy.ApiProvider, regardless of type, so the web frontend can pick among multiple
+// proxies' instances of the same interceptor (e.g. dbdump, tamper) instead of only ever
+// reaching whichever one claimed the canonical /api/i/<name> alias.
+type InstanceInfo struct {
+	Proxy       string `json:"proxy"`
+	Interceptor string `json:"interceptor"`
+	BasePath    string `json:"basePath"`
+}
+
 func StartWithCli(interceptorCallback InterceptorCallback) {
 	optEnable := flag.String("enable", "", `Comma-separated list of proxy configurations to enable (e.g. "myconfig-a,myconfig-b")`)
 	optConfig := flag.String("config", "config.json", "Path to configuration file (JSON)")
@@ -85,6 +97,7 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	}
 
 	canonicalRegistered := make(map[string]bool)
+	instances := []InstanceInfo{}
 	apiMux := http.NewServeMux()
 
 	sub, _ := fs.Sub(tlstapweb.FS, ".")
@@ -95,16 +108,22 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 
 	// Core services: like /ui/ above, registered directly here rather than discovered
 	// from a proxy's interceptor list, since they aren't tied to any one proxy or
-	// interceptor chain. See doc/design/core-kv-store.md.
+	// interceptor chain. Nested under Api (api.core-services in config.json) since they
+	// have no purpose except being reached through this same API server. See
+	// doc/design/core-kv-store.md.
 	var coreServices []CoreService
-	if configFile.Core != nil && configFile.Core.Kv != nil {
-		kvStore, err := corekv.New(configFile.Core.Kv.File)
+	var coreConfig *proxy.CoreConfig
+	if configFile.Api != nil {
+		coreConfig = configFile.Api.CoreServices
+	}
+	if coreConfig != nil && coreConfig.Kv != nil {
+		kvStore, err := corekv.New(coreConfig.Kv.File)
 		checkFatal(&mainLogger, err)
 		kvStore.RegisterRoutes(apiMux, "/api/core/kv")
 		coreServices = append(coreServices, kvStore)
 	}
-	if configFile.Core != nil && configFile.Core.Fs != nil {
-		fsStore, err := corefs.New(configFile.Core.Fs.Dir)
+	if coreConfig != nil && coreConfig.Fs != nil {
+		fsStore, err := corefs.New(coreConfig.Fs.Dir)
 		checkFatal(&mainLogger, err)
 		fsStore.RegisterRoutes(apiMux, "/api/core/fs")
 		coreServices = append(coreServices, fsStore)
@@ -171,10 +190,10 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 		if pConfig.Mode == "tls-mux" {
 			resolvedHandlers, err := resolveMuxHandlers(&config, &configFile, &mainLogger)
 			checkFatal(&mainLogger, err)
-			proxy, err = proxyFromConfig(&pConfig, resolvedHandlers, &mainLogger, interceptorCallback, apiMux, canonicalRegistered)
+			proxy, err = proxyFromConfig(&pConfig, resolvedHandlers, &mainLogger, interceptorCallback, apiMux, canonicalRegistered, &instances)
 			checkFatal(&mainLogger, err)
 		} else {
-			proxy, err = proxyFromConfig(&pConfig, nil, &mainLogger, interceptorCallback, apiMux, canonicalRegistered)
+			proxy, err = proxyFromConfig(&pConfig, nil, &mainLogger, interceptorCallback, apiMux, canonicalRegistered, &instances)
 			checkFatal(&mainLogger, err)
 		}
 
@@ -182,15 +201,48 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 		go startProxy(proxy, &mainLogger)
 	}
 
-	var apiServer *http.Server
-	if configFile.Api != nil && configFile.Api.Listen != "" {
-		mainLogger.Info("Starting API server at %s", configFile.Api.Listen)
-		apiServer = &http.Server{Addr: configFile.Api.Listen, Handler: apiMux}
-		go func() {
-			if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				mainLogger.Error("API server: %v", err)
+	// Lets the web frontend discover every interceptor instance's own proxy-scoped base
+	// path, rather than only ever reaching whichever one claimed the canonical
+	// /api/i/<name> alias above.
+	apiMux.HandleFunc("GET /api/instances", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(instances)
+	})
+
+	var apiServers []*http.Server
+	if configFile.Api != nil {
+		// Built once, shared by every "https" entry below (a single cert/client-auth
+		// policy for the whole API server, not one per URL) — cheap prefix scan first so
+		// a missing/invalid cert fails fast, before any listener (http or https) has
+		// been opened.
+		var tlsConfig *tls.Config
+		for _, baseUrl := range configFile.Api.BaseUrls {
+			if strings.HasPrefix(baseUrl, "https://") {
+				tlsConfig = buildApiTlsConfig(configFile.Api, &mainLogger)
+				break
 			}
-		}()
+		}
+
+		for _, baseUrl := range configFile.Api.BaseUrls {
+			addr, scheme := parseApiBaseUrl(baseUrl, &mainLogger)
+			apiServer := &http.Server{Addr: addr, Handler: apiMux}
+			if scheme == "https" {
+				apiServer.TLSConfig = tlsConfig
+			}
+			apiServers = append(apiServers, apiServer)
+			mainLogger.Info("Starting API server at %s (%s)", addr, baseUrl)
+			go func(apiServer *http.Server, scheme, baseUrl string) {
+				var err error
+				if scheme == "https" {
+					err = apiServer.ListenAndServeTLS("", "")
+				} else {
+					err = apiServer.ListenAndServe()
+				}
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					mainLogger.Error("API server (%s): %v", baseUrl, err)
+				}
+			}(apiServer, scheme, baseUrl)
+		}
 	}
 
 	// sigCh receives every SIGINT/SIGTERM for the rest of the process's life: the first
@@ -201,15 +253,76 @@ func StartWithCli(interceptorCallback InterceptorCallback) {
 	<-sigCh
 	mainLogger.Info("Shutdown signal received, shutting down gracefully...")
 
-	shutdown(allProxies, coreServices, apiServer, sigCh, &mainLogger)
+	shutdown(allProxies, coreServices, apiServers, sigCh, &mainLogger)
+}
+
+// parseApiBaseUrl validates baseUrl (must have an "http"/"https" scheme, a host:port, and
+// no path — see ApiConfig.BaseUrls) and returns the host:port to listen on and the
+// scheme ("http" or "https"), the latter deciding whether that listener needs the shared
+// TLS config (see buildApiTlsConfig).
+func parseApiBaseUrl(baseUrl string, logger *logging.Logger) (addr, scheme string) {
+	// Checked as a plain prefix before parsing so the common mistake (a bare host:port,
+	// with no scheme at all) gets this clear message instead of url.Parse's own — a bare
+	// "host:port" parses as a URL whose "scheme" is the host and whose "path" starts with
+	// the port, rejected for containing a colon, which reads as a non sequitur here.
+	if !strings.HasPrefix(baseUrl, "http://") && !strings.HasPrefix(baseUrl, "https://") {
+		logger.Fatal(`api base-url %q must start with "http://" or "https://"`, baseUrl)
+	}
+	u, err := url.Parse(baseUrl)
+	if err != nil {
+		logger.Fatal("Invalid api base-url %q: %v", baseUrl, err)
+	}
+	if u.Host == "" {
+		logger.Fatal("api base-url %q is missing a host:port", baseUrl)
+	}
+	if u.Path != "" && u.Path != "/" {
+		logger.Fatal("api base-url %q must not include a path", baseUrl)
+	}
+	return u.Host, u.Scheme
+}
+
+// buildApiTlsConfig builds the tls.Config shared by every "https" api.base-urls entry
+// (one config for the whole API server, not one per URL): the server certificate
+// (required — see ApiConfig.CertPem/CertKey) and, if configured, a client-certificate
+// trust pool plus authentication policy for optional or mandatory mutual TLS
+// (ApiConfig.ClientRoots/ClientAuthPolicy — same shape as TlsServerConfig's own fields,
+// reusing proxy.LoadCertPool/ParseClientAuthPolicy directly). Fatal on any load/parse
+// failure, since at least one base-urls entry has already committed to https by the time
+// this is called. Any explicitly-set ClientAuthPolicy other than "require-and-verify"
+// (including "none") logs a warning — every other policy either skips verification
+// entirely, doesn't cryptographically verify the chain, or doesn't require a cert at all.
+func buildApiTlsConfig(apiConfig *proxy.ApiConfig, logger *logging.Logger) *tls.Config {
+	if apiConfig.CertPem == "" || apiConfig.CertKey == "" {
+		logger.Fatal("api.cert-pem and api.cert-key are required when any api.base-urls entry uses https")
+	}
+	cert, err := tls.LoadX509KeyPair(apiConfig.CertPem, apiConfig.CertKey)
+	checkFatal(logger, err)
+
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	if apiConfig.ClientRoots != "" {
+		clientCAs, err := proxy.LoadCertPool(apiConfig.ClientRoots)
+		checkFatal(logger, err)
+		tlsConfig.ClientCAs = clientCAs
+	}
+	if apiConfig.ClientAuthPolicy != "" {
+		clientAuthType, err := proxy.ParseClientAuthPolicy(apiConfig.ClientAuthPolicy)
+		checkFatal(logger, err)
+		tlsConfig.ClientAuth = clientAuthType
+		if clientAuthType != tls.RequireAndVerifyClientCert {
+			logger.Warn(`api.client-auth is %q, not "require-and-verify"; client certificates are not both required and cryptographically verified`, apiConfig.ClientAuthPolicy)
+		}
+	}
+
+	return tlsConfig
 }
 
 // shutdown runs the graceful-shutdown sequence: stop accepting new work everywhere (close
-// every proxy's listener, start the API server's Shutdown), let both drain concurrently
-// bounded by their own timeouts, then finalize every interceptor and core service. A
-// second SIGINT/SIGTERM arriving on sigCh at any point during this forces an immediate
-// os.Exit(1) instead of waiting for the sequence to finish on its own.
-func shutdown(proxies []*proxy.Proxy, coreServices []CoreService, apiServer *http.Server, sigCh <-chan os.Signal, logger *logging.Logger) {
+// every proxy's listener, start every API server's Shutdown), let it all drain
+// concurrently bounded by their own timeouts, then finalize every interceptor and core
+// service. A second SIGINT/SIGTERM arriving on sigCh at any point during this forces an
+// immediate os.Exit(1) instead of waiting for the sequence to finish on its own.
+func shutdown(proxies []*proxy.Proxy, coreServices []CoreService, apiServers []*http.Server, sigCh <-chan os.Signal, logger *logging.Logger) {
 	go func() {
 		<-sigCh
 		logger.Warn("Second shutdown signal received, forcing immediate exit.")
@@ -234,16 +347,16 @@ func shutdown(proxies []*proxy.Proxy, coreServices []CoreService, apiServer *htt
 		}(p)
 	}
 
-	if apiServer != nil {
-		drainWg.Add(1)
-		go func() {
+	drainWg.Add(len(apiServers))
+	for _, apiServer := range apiServers {
+		go func(apiServer *http.Server) {
 			defer drainWg.Done()
 			apiCtx, cancelApi := context.WithTimeout(context.Background(), apiShutdownTimeout)
 			defer cancelApi()
 			if err := apiServer.Shutdown(apiCtx); err != nil {
 				logger.Warn("API server shutdown: %v", err)
 			}
-		}()
+		}(apiServer)
 	}
 	drainWg.Wait()
 
@@ -351,7 +464,7 @@ func resolveMuxHandlers(config *proxy.ProxyConfig, configFile *proxy.ConfigFile,
 	return resolvedHandlers, nil
 }
 
-func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (*proxy.Proxy, error) {
+func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.ResolvedMuxHandler, mainLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool, instances *[]InstanceInfo) (*proxy.Proxy, error) {
 	logWriter := os.Stdout
 	if config.LogFile != "" {
 		logFile, err := os.OpenFile(config.LogFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
@@ -380,7 +493,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 	case "tls-mux":
 		mode = proxy.ModeMux
 		for _, h := range muxHandlers {
-			handler, err := buildMuxHandler(h, config, mainLogger, &proxyLogger, cb, apiMux, canonicalRegistered)
+			handler, err := buildMuxHandler(h, config, mainLogger, &proxyLogger, cb, apiMux, canonicalRegistered, instances)
 			if err != nil {
 				return nil, err
 			}
@@ -401,7 +514,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 				continue
 			}
 
-			interceptor, err := buildInterceptor(&iConfig, config, &proxyLogger, cb, apiMux, canonicalRegistered)
+			interceptor, err := buildInterceptor(&iConfig, config, &proxyLogger, cb, apiMux, canonicalRegistered, instances)
 			checkFatal(mainLogger, err)
 
 			switch dir := strings.ToLower(iConfig.Direction); dir {
@@ -430,7 +543,7 @@ func proxyFromConfig(config *proxy.ResolvedProxyConfig, muxHandlers []proxy.Reso
 	return p, nil
 }
 
-func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (proxy.Interceptor, error) {
+func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedProxyConfig, logger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool, instances *[]InstanceInfo) (proxy.Interceptor, error) {
 	var interceptor proxy.Interceptor
 	switch iConfig.Name {
 	case InterceptorHexdump:
@@ -505,6 +618,7 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 	if ap, ok := interceptor.(proxy.ApiProvider); ok {
 		basePath := fmt.Sprintf("/%s/api/i/%s", pConfig.Name, iConfig.Name)
 		ap.RegisterRoutes(apiMux, basePath)
+		*instances = append(*instances, InstanceInfo{Proxy: pConfig.Name, Interceptor: iConfig.Name, BasePath: basePath})
 
 		canonicalPath := fmt.Sprintf("/api/i/%s", iConfig.Name)
 		if !canonicalRegistered[canonicalPath] {
@@ -516,7 +630,7 @@ func buildInterceptor(iConfig *proxy.InterceptorConfig, pConfig *proxy.ResolvedP
 	return interceptor, nil
 }
 
-func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool) (proxy.Handler, error) {
+func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedProxyConfig, mainLogger, proxyLogger *logging.Logger, cb InterceptorCallback, apiMux *http.ServeMux, canonicalRegistered map[string]bool, instances *[]InstanceInfo) (proxy.Handler, error) {
 	logFile := pConfig.LogFile
 	if muxSpec.LogFile != "" {
 		logFile = muxSpec.LogFile
@@ -552,7 +666,7 @@ func buildMuxHandler(muxSpec proxy.ResolvedMuxHandler, pConfig *proxy.ResolvedPr
 			continue
 		}
 
-		interceptor, err := buildInterceptor(&iConfig, pConfig, localLogger, cb, apiMux, canonicalRegistered)
+		interceptor, err := buildInterceptor(&iConfig, pConfig, localLogger, cb, apiMux, canonicalRegistered, instances)
 		if err != nil {
 			return proxy.Handler{}, err
 		}

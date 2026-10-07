@@ -41,6 +41,15 @@ body {
 /* ── Layout ── */
 .layout { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
 
+.insecure-context-banner {
+    background: #3b2f0a;
+    color: #d29922;
+    border-bottom: 1px solid #d29922;
+    padding: 6px 16px;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
 .header {
     height: 44px;
     background: var(--surface);
@@ -224,7 +233,7 @@ body {
 .sel-hl  { background: rgba(88,166,255,0.28); border-radius: 1px; }
 /* Dissector field-node highlight (DissectPanel.js) — distinct color from .sel-hl (mouse
    drag) and the marker triangles below, since a byte can be under more than one at once. */
-.dissect-hl { background: rgba(255,170,60,0.35); border-radius: 1px; }
+.range-hl { background: rgba(255,170,60,0.35); border-radius: 1px; }
 
 .hex-byte-marked, .asc-byte-marked { position: relative; }
 .hex-byte-marked::after, .asc-byte-marked::after {
@@ -712,6 +721,19 @@ body {
 }
 .top-tab:hover  { background: var(--hover-bg); color: var(--text); }
 .top-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+
+/* Instance selector — only rendered while more than one interceptor instance of the
+   relevant type is registered (see GET /api/instances); a single-instance setup keeps
+   today's look with nothing shown here. */
+.instance-selector {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-right: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+}
 
 /* ── Tamper tab ── */
 .tamper-view {
@@ -1258,13 +1280,14 @@ body {
     padding: 0 14px;
     height: 26px;
     border-bottom: 1px solid var(--border);
+    cursor: pointer;
 }
 .markers-tab-row:hover { background: var(--hover-bg); }
 .mtab-session { color: var(--text-dim); min-width: 32px; }
 .mtab-stream  { color: var(--text-dim); min-width: 56px; }
 .mtab-dir     { min-width: 28px; font-size: 11px; font-weight: 600; }
 .mtab-off     { min-width: 90px; }
-.mtab-label   { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.mtab-label   { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mtab-label-empty { color: var(--text-dim); font-style: italic; font-family: sans-serif; }
 .mtab-label-input {
     flex: 1;
@@ -1277,7 +1300,6 @@ body {
     font-family: 'Consolas', 'Courier New', monospace;
     outline: none;
 }
-.mtab-go { padding: 1px 8px; font-size: 11px; }
 .mtab-del {
     font-size: 14px;
     color: var(--text-dim);

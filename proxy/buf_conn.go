@@ -4,6 +4,8 @@ import (
 	"net"
 
 	"github.com/smallnest/ringbuffer"
+
+	"tlstap/assert"
 )
 
 type BufferedConn struct {
@@ -11,6 +13,9 @@ type BufferedConn struct {
 
 	ReadBuf *ringbuffer.RingBuffer
 	tmpBuf  []byte
+
+	// error returned by the underlying Read together with data; reported once ReadBuf is drained
+	pendingErr error
 }
 
 func NewBufConn(conn net.Conn, bufSize int) *BufferedConn {
@@ -22,30 +27,39 @@ func NewBufConn(conn net.Conn, bufSize int) *BufferedConn {
 }
 
 func (bc *BufferedConn) Read(b []byte) (int, error) {
-	if bc.ReadBuf.Length() == 0 {
-		if n, err := bc.fillBuf(); err != nil {
-			return n, err
-		}
+	if err := bc.fillBuf(); err != nil {
+		return 0, err
 	}
 
 	return bc.ReadBuf.Read(b)
 }
 
 func (bc *BufferedConn) Peek(b []byte) (int, error) {
-	if bc.ReadBuf.Length() == 0 {
-		if n, err := bc.fillBuf(); err != nil {
-			return n, err
-		}
+	if err := bc.fillBuf(); err != nil {
+		return 0, err
 	}
 
 	return bc.ReadBuf.Peek(b)
 }
 
-func (bc *BufferedConn) fillBuf() (int, error) {
-	n, err := bc.Conn.Read(bc.tmpBuf)
-	if err != nil {
-		return 0, err
+// fillBuf refills ReadBuf if it is empty. A returned error means nothing is buffered.
+func (bc *BufferedConn) fillBuf() error {
+	if bc.ReadBuf.Length() > 0 {
+		return nil
 	}
 
-	return bc.ReadBuf.Write(bc.tmpBuf[:n])
+	if err := bc.pendingErr; err != nil {
+		bc.pendingErr = nil // reported once, so a retry (e.g. after a deadline reset) reads again
+		return err
+	}
+
+	n, err := bc.Conn.Read(bc.tmpBuf)
+	if n > 0 {
+		_, werr := bc.ReadBuf.Write(bc.tmpBuf[:n])
+		assert.Assertf(werr == nil, "Failed to buffer %d bytes into an empty buffer: %v. This is a bug.", n, werr)
+		bc.pendingErr = err
+		return nil
+	}
+
+	return err
 }

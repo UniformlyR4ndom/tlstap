@@ -1,219 +1,351 @@
 package proxy
 
 import (
-	"io"
+	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"tlstap/logging"
 )
 
-// fakeBuffering is a minimal Interceptor + BufferingInterceptor: it holds every chunk it sees
-// (Intercept always returns empty) until the test explicitly releases it via release(). Existing
-// purely to exercise ConnHandler's generic buffering plumbing end-to-end, independent of any real
-// interceptor implementation.
+// fakeBuffering holds every chunk while holding is set and passes chunks through otherwise. Like
+// the tamper interceptor, it releases under its own lock, over a channel of capacity 1, so a
+// release blocks until the consumer has caught up.
 type fakeBuffering struct {
 	mu      sync.Mutex
-	holding [][]byte
-
-	relCh chan ReleasedData
-	seen  chan []byte // every chunk Intercept was called with, for the test to observe
+	holding bool
+	held    [][]byte
+	relCh   chan ReleasedData
+	once    sync.Once
 }
 
-func newFakeBuffering() *fakeBuffering {
-	return &fakeBuffering{
-		relCh: make(chan ReleasedData, 4),
-		seen:  make(chan []byte, 16),
-	}
+func newFakeBuffering(holding bool) *fakeBuffering {
+	return &fakeBuffering{holding: holding, relCh: make(chan ReleasedData, 1)}
 }
 
-func (f *fakeBuffering) Init(addr net.TCPAddr) error               { return nil }
-func (f *fakeBuffering) Finalize(addr net.TCPAddr)                 {}
+func (f *fakeBuffering) Init(addr net.TCPAddr) error                { return nil }
+func (f *fakeBuffering) Finalize(addr net.TCPAddr)                  {}
 func (f *fakeBuffering) ConnectionEstablished(info *ConnInfo) error { return nil }
 func (f *fakeBuffering) ConnectionUpgraded(info *ConnInfo) error    { return nil }
 
 func (f *fakeBuffering) ConnectionTerminated(info *ConnInfo) error {
-	close(f.relCh)
+	f.once.Do(func() { close(f.relCh) })
 	return nil
 }
 
 func (f *fakeBuffering) Intercept(info *ConnInfo, data []byte) ([]byte, error) {
-	cp := append([]byte(nil), data...)
-
 	f.mu.Lock()
-	f.holding = append(f.holding, cp)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	f.seen <- cp
+	if !f.holding {
+		return data, nil
+	}
+
+	f.held = append(f.held, append([]byte(nil), data...))
 	return nil, nil
 }
 
 func (f *fakeBuffering) HasPending(info *ConnInfo) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.holding) > 0
+	return len(f.held) > 0
 }
 
-func (f *fakeBuffering) ReleaseChannel(info *ConnInfo) <-chan ReleasedData {
-	return f.relCh
-}
+func (f *fakeBuffering) ReleaseChannel(info *ConnInfo) <-chan ReleasedData { return f.relCh }
 
-// release pops the oldest held chunk and sends it on the release channel.
-func (f *fakeBuffering) release(t *testing.T) {
-	t.Helper()
+func (f *fakeBuffering) heldCount() int {
 	f.mu.Lock()
-	if len(f.holding) == 0 {
-		f.mu.Unlock()
-		t.Fatal("release called with nothing held")
-	}
-	data := f.holding[0]
-	f.holding = f.holding[1:]
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	return len(f.held)
+}
 
+// releaseLocked sends the first n held chunks (all if n < 0) as one release; the caller holds f.mu.
+func (f *fakeBuffering) releaseLocked(n int) {
+	if n < 0 || n > len(f.held) {
+		n = len(f.held)
+	}
+
+	var data []byte
+	for _, c := range f.held[:n] {
+		data = append(data, c...)
+	}
+
+	f.held = f.held[n:]
 	f.relCh <- ReleasedData{Data: data}
 }
 
-func testLogger() *logging.Logger {
-	l := logging.NewLogger(io.Discard, nil, false)
-	return &l
+func (f *fakeBuffering) releaseAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseLocked(-1)
 }
 
-func recvString(t *testing.T, ch <-chan []byte, want string) {
+func (f *fakeBuffering) releaseOne() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseLocked(1)
+}
+
+// stopHolding releases everything held and lets later chunks pass, atomically (a mode switch).
+func (f *fakeBuffering) stopHolding() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.holding = false
+	f.releaseLocked(-1)
+}
+
+func (f *fakeBuffering) abort() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.relCh <- ReleasedData{Err: ErrAbort}
+}
+
+func (f *fakeBuffering) waitHeld(t *testing.T, n int) {
 	t.Helper()
-	select {
-	case got := <-ch:
-		if string(got) != want {
-			t.Fatalf("expected interceptor to see %q, got %q", want, got)
+
+	deadline := time.Now().Add(testIOTimeout)
+	for f.heldCount() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d held chunks, have %d", n, f.heldCount())
 		}
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for interceptor to see %q", want)
+
+		time.Sleep(time.Millisecond)
 	}
 }
 
-func expectNoData(t *testing.T, conn net.Conn) {
+// expectSilence expects that nothing (neither data nor EOF) arrives on conn for a short while.
+func expectSilence(t *testing.T, conn net.Conn) {
 	t.Helper()
-	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buf := make([]byte, 16)
-	if n, err := conn.Read(buf); err == nil {
-		t.Fatalf("expected no data forwarded yet, got %q", buf[:n])
+
+	conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	defer conn.SetReadDeadline(time.Time{})
+
+	n, err := conn.Read(make([]byte, 16))
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected silence, got n=%d err=%v", n, err)
 	}
 }
 
-func expectData(t *testing.T, conn net.Conn, want string) {
+// startBuffered runs a plain-mode handler between a client and an upstream server; the fake sits in the up chain.
+func startBuffered(t *testing.T, fake *fakeBuffering, halfCloseTimeout time.Duration) (client, server net.Conn, done <-chan error) {
 	t.Helper()
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 16)
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatalf("expected %q forwarded, got error: %v", want, err)
-	}
-	if string(buf[:n]) != want {
-		t.Fatalf("expected %q forwarded, got %q", want, buf[:n])
-	}
-}
 
-// TestBufferingHoldDoesNotStallSubsequentChunks is the core regression test for the bug that
-// motivated this whole feature: with a plain (non-buffering) interceptor, holding one chunk
-// blocks the read loop, so a second chunk on the same direction could never even be read. Here,
-// the fake holds chunk 1, and the test asserts sending chunk 2 while chunk 1 is still held does
-// not block — proving the lazy transition into the async pump+select phase actually happens.
-func TestBufferingHoldDoesNotStallSubsequentChunks(t *testing.T) {
-	client, srcConn := net.Pipe()
-	dstConn, upstream := net.Pipe()
-	defer client.Close()
-	defer upstream.Close()
-
-	fake := newFakeBuffering()
-	interceptors := []Interceptor{fake}
-	buffering := scanBuffering(interceptors)
-	if len(buffering) != 1 {
-		t.Fatalf("expected scanBuffering to find the fake interceptor, got %d entries", len(buffering))
-	}
-
-	info := &ConnInfo{SrcEndpoint: "client:1", DstEndpoint: "server:2", ConnID: 1}
+	upstream, front := listenTCP(t), listenTCP(t)
+	up := []Interceptor{fake}
 	h := &ConnHandler{
-		logger:   testLogger(),
-		ConnDown: srcConn,
-		ConnUp:   dstConn,
+		Setting:        ConnSettings{ConnectEndpoint: upstream.Addr().String(), Mode: ModePlain},
+		InterceptorsUp: up,
+		bufferingUp:    scanBuffering(up),
+		logger:         testLogger(),
+
+		halfCloseTimeout: halfCloseTimeout,
 	}
-	h.wg.Add(1)
+	done = runHandler(front, h, nil)
 
-	done := make(chan error, 1)
-	go func() {
-		done <- h.forwardOneWay(srcConn, dstConn, make([]byte, 4096), interceptors, info, buffering)
-	}()
+	client = dialTCP(t, front)
+	server = acceptConn(t, upstream)
+	return client, server, done
+}
 
-	// Chunk 1 arrives and is held.
-	if _, err := client.Write([]byte("chunk1")); err != nil {
-		t.Fatalf("write chunk1: %v", err)
+// held chunks don't stall later ones, and everything is forwarded in order once released
+func TestBuffering_HoldAndRelease(t *testing.T) {
+	fake := newFakeBuffering(true)
+	client, server, _ := startBuffered(t, fake, 0)
+
+	client.Write([]byte("AAA"))
+	fake.waitHeld(t, 1)
+	client.Write([]byte("BBB")) // read although AAA is still held
+	fake.waitHeld(t, 2)
+	expectSilence(t, server)
+
+	fake.stopHolding()
+	if got := mustRead(t, server, 6); got != "AAABBB" {
+		t.Fatalf("server got %q", got)
 	}
-	recvString(t, fake.seen, "chunk1")
-	expectNoData(t, upstream)
 
-	// Chunk 2 arrives while chunk 1 is still held. This write must not block — that's the bug
-	// this feature exists to fix.
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := client.Write([]byte("chunk2"))
-		writeDone <- err
-	}()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write chunk2: %v", err)
+	client.Write([]byte("CCC")) // passes through now
+	if got := mustRead(t, server, 3); got != "CCC" {
+		t.Fatalf("server got %q", got)
+	}
+}
+
+// a release sent before a later chunk passed the interceptor is forwarded before that chunk
+func TestBuffering_ReleaseNotOvertakenByLaterChunk(t *testing.T) {
+	fake := newFakeBuffering(true)
+	client, server, _ := startBuffered(t, fake, 0)
+
+	for i := 0; i < 500; i++ {
+		fake.mu.Lock()
+		fake.holding = true
+		fake.mu.Unlock()
+
+		client.Write([]byte(fmt.Sprintf("H%04d", i)))
+		fake.waitHeld(t, 1)
+
+		fake.stopHolding()
+		client.Write([]byte(fmt.Sprintf("P%04d", i)))
+
+		if got, want := mustRead(t, server, 10), fmt.Sprintf("H%04dP%04d", i, i); got != want {
+			t.Fatalf("iteration %d: server got %q, want %q", i, got, want)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("writing chunk2 blocked while chunk1 was still held — async transition did not happen")
 	}
-	recvString(t, fake.seen, "chunk2")
-	expectNoData(t, upstream)
+}
 
-	// Release in order: chunk1 must reach upstream before chunk2, even though chunk2 was read
-	// first by the pump.
-	fake.release(t)
-	expectData(t, upstream, "chunk1")
-	fake.release(t)
-	expectData(t, upstream, "chunk2")
+// a close must not overtake held data
+func TestBuffering_HalfCloseWaitsForHeldData(t *testing.T) {
+	fake := newFakeBuffering(true)
+	client, server, done := startBuffered(t, fake, 0)
 
-	// ConnectionTerminated firing (closing the release channel) must unblock the async loop even
-	// though the underlying connections are still open and the pump is still blocked in Read —
-	// this is the only thing that can end the loop in this scenario, proving the fan-in's
-	// close-propagation works and doesn't busy-loop.
-	if err := fake.ConnectionTerminated(info); err != nil {
-		t.Fatalf("ConnectionTerminated: %v", err)
+	client.Write([]byte("held"))
+	fake.waitHeld(t, 1)
+	closeWriteOf(t, client)
+	expectSilence(t, server)
+
+	fake.releaseAll()
+	if got := mustRead(t, server, 4); got != "held" {
+		t.Fatalf("server got %q", got)
 	}
+	mustEOF(t, server)
+
+	closeWriteOf(t, server)
+	mustEOF(t, client)
+	waitHandler(t, done)
+}
+
+// a close racing with the release of the last held data must never arrive before that data
+func TestBuffering_CloseNeverOvertakesRelease(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		fake := newFakeBuffering(true)
+		client, server, done := startBuffered(t, fake, 0)
+
+		client.Write([]byte("held"))
+		fake.waitHeld(t, 1)
+		closeWriteOf(t, client)
+		fake.releaseAll()
+
+		if got := mustRead(t, server, 4); got != "held" {
+			t.Fatalf("iteration %d: server got %q", i, got)
+		}
+		mustEOF(t, server)
+
+		closeWriteOf(t, server)
+		mustEOF(t, client)
+		waitHandler(t, done)
+	}
+}
+
+func TestBuffering_AbortTerminates(t *testing.T) {
+	fake := newFakeBuffering(true)
+	client, _, done := startBuffered(t, fake, 0)
+
+	client.Write([]byte("x"))
+	fake.waitHeld(t, 1)
+	fake.abort()
+
+	waitHandler(t, done)
+	client.SetReadDeadline(time.Now().Add(testIOTimeout))
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected the client connection to be closed")
+	}
+}
+
+// releases that block on a full channel while a chunk enters the interceptor must not deadlock
+func TestBuffering_NoDeadlockWithBlockingReleases(t *testing.T) {
+	fake := newFakeBuffering(true)
+	client, server, _ := startBuffered(t, fake, 0)
+
+	var want strings.Builder
+	for i := 0; i < 5; i++ {
+		chunk := fmt.Sprintf("h%d", i)
+		want.WriteString(chunk)
+		client.Write([]byte(chunk))
+		fake.waitHeld(t, i+1)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			fake.releaseOne()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			chunk := fmt.Sprintf("b%02d", i)
+			want.WriteString(chunk)
+			client.Write([]byte(chunk))
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(testIOTimeout):
+		t.Fatal("deadlock: releases and incoming chunks did not finish")
+	}
+
+	fake.waitHeld(t, 20)
+	fake.releaseAll()
+	if got := mustRead(t, server, want.Len()); got != want.String() {
+		t.Fatalf("server got %q, want %q", got, want.String())
+	}
+}
+
+// the half-close timeout must not end a connection while data is held
+func TestBuffering_HalfCloseTimeoutWaitsForHeldData(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+
+	fake := newFakeBuffering(true)
+	client, server, done := startBuffered(t, fake, timeout)
+
+	closeWriteOf(t, server) // the down direction ends, which starts the timeout
+	client.Write([]byte("held"))
+	fake.waitHeld(t, 1)
+
+	time.Sleep(4 * timeout)
 	select {
 	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("forwardOneWayAsync did not return after the release channel closed")
+		t.Fatal("connection was terminated while data was held")
+	default:
 	}
+
+	fake.releaseAll()
+	if got := mustRead(t, server, 4); got != "held" {
+		t.Fatalf("server got %q", got)
+	}
+
+	closeWriteOf(t, client)
+	mustEOF(t, server)
+	waitHandler(t, done)
 }
 
-// TestBufferingNoInterceptorUnchanged is a sanity check that a chain with no BufferingInterceptor
-// behaves exactly as before: data flows straight through, synchronously, never entering the async
-// phase.
-func TestBufferingNoInterceptorUnchanged(t *testing.T) {
-	client, srcConn := net.Pipe()
-	dstConn, upstream := net.Pipe()
-	defer client.Close()
-	defer srcConn.Close()
-	defer dstConn.Close()
-	defer upstream.Close()
+func TestStart_RejectsUnsupportedBufferingChains(t *testing.T) {
+	connect := "127.0.0.1:1"
+	config := ResolvedProxyConfig{ListenEndpoint: "127.0.0.1:0", ConnectEndpoint: &connect, Name: "test"}
 
-	info := &ConnInfo{SrcEndpoint: "client:1", DstEndpoint: "server:2", ConnID: 2}
-	h := &ConnHandler{
-		logger:   testLogger(),
-		ConnDown: srcConn,
-		ConnUp:   dstConn,
+	tests := []struct {
+		name string
+		mode Mode
+		up   []Interceptor
+		down []Interceptor
+	}{
+		{"two buffering interceptors in one chain", ModePlain, []Interceptor{newFakeBuffering(false), newFakeBuffering(false)}, nil},
+		{"buffering interceptor in detecttls", ModeDetectTls, nil, []Interceptor{newFakeBuffering(false)}},
 	}
-	h.wg.Add(1)
 
-	go h.forwardOneWay(srcConn, dstConn, make([]byte, 4096), nil, info, nil)
-
-	if _, err := client.Write([]byte("hello")); err != nil {
-		t.Fatalf("write: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewProxy(config, tc.mode, tc.up, tc.down, nil, *testLogger())
+			if err := p.Start(); err == nil || !strings.Contains(err.Error(), "buffering") {
+				t.Fatalf("expected a buffering related error, got %v", err)
+			}
+		})
 	}
-	expectData(t, upstream, "hello")
 }

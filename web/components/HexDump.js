@@ -318,10 +318,10 @@ function HexRow({ row, globalOffset, sel, highlightRange, markedC2S, markedS2C }
     const offStr   = (globalOffset ? (virtualOffset ?? offset) : localOffset).toString(16).padStart(8, '0')
     const markedSet = direction === DIRNUM_C2S ? markedC2S : markedS2C
 
-    // dissectHl: externally-driven (dissector node click), independent of sel (mouse-drag
-    // selection) — a different CSS class so the two read as visually distinct even if
-    // both happen to cover the same byte.
-    function isDissectHl(byteOff) {
+    // rangeHl: externally-driven (a dissector node click or a search-result jump),
+    // independent of sel (mouse-drag selection) — a different CSS class so the two read as
+    // visually distinct even if both happen to cover the same byte.
+    function isRangeHl(byteOff) {
         return !!highlightRange && highlightRange.direction === direction && byteOff >= highlightRange.start && byteOff <= highlightRange.end
     }
 
@@ -334,7 +334,7 @@ function HexRow({ row, globalOffset, sel, highlightRange, markedC2S, markedS2C }
         const byteOff = offset + i
         const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
         const marked  = markedSet?.has(byteOff)
-        const cls     = [hl ? 'sel-hl' : null, isDissectHl(byteOff) ? 'dissect-hl' : null, marked ? 'hex-byte-marked' : null].filter(Boolean).join(' ') || undefined
+        const cls     = [hl ? 'sel-hl' : null, isRangeHl(byteOff) ? 'range-hl' : null, marked ? 'hex-byte-marked' : null].filter(Boolean).join(' ') || undefined
         hexContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${bytes[i].toString(16).padStart(2, '0')}</span>`)
     }
     // Pad to 48 chars so short rows align with full rows.
@@ -348,7 +348,7 @@ function HexRow({ row, globalOffset, sel, highlightRange, markedC2S, markedS2C }
         const byteOff = offset + i
         const hl      = sel && sel.direction === direction && byteOff >= sel.start && byteOff <= sel.end
         const marked  = markedSet?.has(byteOff)
-        const cls     = [hl ? 'sel-hl' : null, isDissectHl(byteOff) ? 'dissect-hl' : null, marked ? 'asc-byte-marked' : null].filter(Boolean).join(' ') || undefined
+        const cls     = [hl ? 'sel-hl' : null, isRangeHl(byteOff) ? 'range-hl' : null, marked ? 'asc-byte-marked' : null].filter(Boolean).join(' ') || undefined
         const ch = bytes[i] >= 0x20 && bytes[i] < 0x7f ? String.fromCharCode(bytes[i]) : '.'
         asciiContent.push(html`<span data-off=${byteOff} data-dir=${direction} class=${cls}>${ch}</span>`)
     }

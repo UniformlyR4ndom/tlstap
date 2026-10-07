@@ -1,5 +1,3 @@
-import { listFramesTimeline, listFramesTimelineBackward } from './dbdumpFramerApi.js'
-import { fetchByteRanges } from './api.js'
 import { isWindowFull } from './byteBufferCore.js'
 import { mergeUint8Arrays } from './format.js'
 import {
@@ -21,9 +19,25 @@ import {
 //
 // entity: the synthetic frame-mode object TrafficView.js builds —
 // {id, session, streamId, script, scriptVersion, end}.
+//
+// fillForward/fillBackward below take their network calls via `handle` (built by
+// openConnection) rather than module-level api.js/dbdumpFramerApi.js imports, so they
+// stay plain, dbdump-instance-agnostic exports — directly unit-testable with a fake
+// handle (frameSegments.test.js) with no dbdump instance/api.js involved at all.
+// createFrameSegmentsAdapter(dbdumpApi, framerApi) is what a caller (TrafficView.js)
+// actually uses, binding openConnection to one dbdump instance's own
+// createDbDumpApi(...)/createDbDumpFramerApi(...) objects.
 
-export function openConnection() {
-    return { listFramesTimeline, listFramesTimelineBackward, fetchByteRanges }
+export function createFrameSegmentsAdapter(dbdumpApi, framerApi) {
+    return {
+        openConnection() {
+            const { listFramesTimeline, listFramesTimelineBackward } = framerApi
+            const { fetchByteRanges } = dbdumpApi
+            return { listFramesTimeline, listFramesTimelineBackward, fetchByteRanges }
+        },
+        fillForward,
+        fillBackward,
+    }
 }
 
 function timelineKey(entity) {

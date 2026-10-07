@@ -11,7 +11,7 @@ const html = htm.bind(h)
 // Intercept/Scripts split (TamperView.js). refreshKey/frameLog/onClearFrameLog are owned
 // by App.js (frameLog specifically needs to survive switching sub-tabs here without
 // resetting, the same reason TamperView.js lifts its own script log above its sub-tabs).
-export default function FramingPanel({ refreshSignal, frameLog, onClearFrameLog }) {
+export default function FramingPanel({ framerApi, refreshSignal, frameLog, onClearFrameLog }) {
     const [subTab, setSubTab] = useState('scripts') // 'scripts' | 'log'
 
     return html`
@@ -21,7 +21,7 @@ export default function FramingPanel({ refreshSignal, frameLog, onClearFrameLog 
                 <div class=${'top-tab' + (subTab === 'log'     ? ' active' : '')} onclick=${() => setSubTab('log')}>Log</div>
             </div>
             <div class="framing-body">
-                ${subTab === 'scripts' && html`<${FramerScriptsPanel} refreshSignal=${refreshSignal} />`}
+                ${subTab === 'scripts' && html`<${FramerScriptsPanel} framerApi=${framerApi} refreshSignal=${refreshSignal} />`}
                 ${subTab === 'log'     && html`<${FramerLogPanel} lines=${frameLog} onClear=${onClearFrameLog} />`}
             </div>
         </div>

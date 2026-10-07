@@ -11,9 +11,15 @@ import (
 )
 
 type EchoServerConfig struct {
-	Listen     string `json:"listen"`
-	Trigger    string `json:"trigger"`
-	BufferSize int    `json:"buffer-size"`
+	Listen           string `json:"listen"`
+	TriggerUpgrade   string `json:"trigger-upgrade"`
+	TriggerDowngrade string `json:"trigger-downgrade"`
+
+	// downgrade only the client->server / server->client direction
+	TriggerDowngradeC2s string `json:"trigger-downgrade-c2s"`
+	TriggerDowngradeS2c string `json:"trigger-downgrade-s2c"`
+
+	BufferSize int `json:"buffer-size"`
 
 	TlsServerConfig proxy.TlsServerConfig `json:"tls-config"`
 }
@@ -40,14 +46,29 @@ func main() {
 		bufSize = config.BufferSize
 	}
 
-	trigger := "starttls"
-	if config.Trigger != "" {
-		trigger = config.Trigger
+	triggerUpgrade := "starttls"
+	if config.TriggerUpgrade != "" {
+		triggerUpgrade = config.TriggerUpgrade
+	}
+
+	triggerDowngrade := "stoptls"
+	if config.TriggerDowngrade != "" {
+		triggerDowngrade = config.TriggerDowngrade
+	}
+
+	triggerDowngradeC2s := "c2s-plain"
+	if config.TriggerDowngradeC2s != "" {
+		triggerDowngradeC2s = config.TriggerDowngradeC2s
+	}
+
+	triggerDowngradeS2c := "s2c-plain"
+	if config.TriggerDowngradeS2c != "" {
+		triggerDowngradeS2c = config.TriggerDowngradeS2c
 	}
 
 	tlsConfig, _, err := proxy.ParseServerConfig(&config.TlsServerConfig)
 	proxy.CheckFatal(err)
 
-	server := test.NewFramedEchoServer(config.Listen, bufSize, tlsConfig, []byte(trigger))
+	server := test.NewFramedEchoServer(config.Listen, bufSize, tlsConfig, []byte(triggerUpgrade), []byte(triggerDowngrade), []byte(triggerDowngradeC2s), []byte(triggerDowngradeS2c))
 	proxy.CheckFatal(server.Start())
 }

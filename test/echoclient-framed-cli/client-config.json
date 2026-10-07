@@ -1,11 +1,27 @@
 {
-    "mtls-default": {
+    "tls-updown": {
         "connect": "127.0.0.1:8000",
-        "trigger": "tls",
+        "trigger-upgrade": "starttls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "tlsstop-c2s",
+        "trigger-downgrade-s2c": "tlsstop-s2c",
         "tls-config": {
             "cert-pem": "../certs/client.pem",
             "cert-key": "../certs/client.key",
-            "roots": "../certs/ca.pem", 
+            "server-name": "echoserver.local",
+            "skip-verify": true
+        }
+    },
+    "mtls-default": {
+        "connect": "127.0.0.1:8000",
+        "trigger-upgrade": "tls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "c2s-plain",
+        "trigger-downgrade-s2c": "s2c-plain",
+        "tls-config": {
+            "cert-pem": "../certs/client.pem",
+            "cert-key": "../certs/client.key",
+            "roots": "../certs/ca.pem",
             "server-name": "echoserver.local",
             "skip-verify": false,
             "min-version": "",
@@ -14,11 +30,14 @@
     },
     "mtls-system-roots": {
         "connect": "127.0.0.1:8000",
-        "trigger": "tls",
+        "trigger-upgrade": "tls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "c2s-plain",
+        "trigger-downgrade-s2c": "s2c-plain",
         "tls-config": {
             "cert-pem": "../certs/client.pem",
             "cert-key": "../certs/client.key",
-            "roots": "", 
+            "roots": "",
             "server-name": "echoserver.local",
             "skip-verify": false,
             "min-version": "",
@@ -27,11 +46,14 @@
     },
     "mtls-int-1": {
         "connect": "127.0.0.1:8000",
-        "trigger": "tls",
+        "trigger-upgrade": "tls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "c2s-plain",
+        "trigger-downgrade-s2c": "s2c-plain",
         "tls-config": {
             "cert-pem": "../certs/client-int-1-chain.pem",
             "cert-key": "../certs/client-int-1.key",
-            "roots": "../certs/ca.pem", 
+            "roots": "../certs/ca.pem",
             "server-name": "echoserver.local",
             "skip-verify": false,
             "min-version": "",

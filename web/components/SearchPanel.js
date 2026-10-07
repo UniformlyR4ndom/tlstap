@@ -1,7 +1,6 @@
 import { h } from 'preact'
 import { useState } from 'preact/hooks'
 import htm from 'htm'
-import { searchText } from '../api.js'
 import { parseRaw, fmtAsBase64 } from '../format.js'
 import { dirClass, dirLabel, DIR_C2S, DIR_S2C, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
 
@@ -54,13 +53,20 @@ const PLACEHOLDERS = {
 
 // ── component ─────────────────────────────────────────────────────────────────
 
-export default function SearchPanel({ session, stream, onJump }) {
-    const [pattern,     setPattern]     = useState('')
-    const [format,      setFormat]      = useState('ascii')
-    const [direction,   setDirection]   = useState('')   // '' = both, '0' = C→S, '1' = S→C
-    const [contiguous,  setContiguous]  = useState(false)
-    const [streamInput, setStreamInput] = useState('')   // empty = all streams
-    const [results,     setResults]     = useState(null) // null = not yet searched
+// results: null = not yet searched, else { session, list } — tagged with the session
+// object it was searched in, so a response landing after a session switch isn't shown.
+export const INITIAL_SEARCH_STATE = {
+    pattern:     '',
+    format:      'ascii',
+    direction:   '',    // '' = both, '0' = C→S, '1' = S→C
+    contiguous:  false,
+    streamInput: '',    // empty = all streams
+    results:     null,
+}
+
+export default function SearchPanel({ dbdumpApi, session, stream, onJump, searchState, onSearchStateChange }) {
+    const { pattern, format, direction, contiguous, streamInput } = searchState
+    const results = searchState.results?.session === session ? searchState.results.list : null
     const [searching,   setSearching]   = useState(false)
     const [error,       setError]       = useState(null)
 
@@ -94,9 +100,9 @@ export default function SearchPanel({ session, stream, onJump }) {
 
         setSearching(true)
         setError(null)
-        setResults(null)
+        onSearchStateChange({ results: null })
         try {
-            setResults(await searchText(req))
+            onSearchStateChange({ results: { session, list: await dbdumpApi.searchText(req) } })
         } catch (err) {
             setError(err.message)
         } finally {
@@ -114,23 +120,23 @@ export default function SearchPanel({ session, stream, onJump }) {
                     type="text"
                     placeholder=${PLACEHOLDERS[format]}
                     value=${pattern}
-                    oninput=${e => setPattern(e.target.value)}
+                    oninput=${e => onSearchStateChange({ pattern: e.target.value })}
                     spellcheck="false"
                 />
-                <select class="goto-select" value=${format} onchange=${e => setFormat(e.target.value)}>
+                <select class="goto-select" value=${format} onchange=${e => onSearchStateChange({ format: e.target.value })}>
                     <option value="ascii">ASCII</option>
                     <option value="utf16le">UTF-16 LE</option>
                     <option value="utf16be">UTF-16 BE</option>
                     <option value="hex">Hex</option>
                     <option value="regex">Regex</option>
                 </select>
-                <select class="goto-select" value=${direction} onchange=${e => setDirection(e.target.value)}>
+                <select class="goto-select" value=${direction} onchange=${e => onSearchStateChange({ direction: e.target.value })}>
                     <option value="">both</option>
                     <option value=${DIRNUM_C2S}>${DIR_C2S}</option>
                     <option value=${DIRNUM_S2C}>${DIR_S2C}</option>
                 </select>
                 <label class="search-check">
-                    <input type="checkbox" checked=${contiguous} onchange=${e => setContiguous(e.target.checked)} />
+                    <input type="checkbox" checked=${contiguous} onchange=${e => onSearchStateChange({ contiguous: e.target.checked })} />
                     Contiguous
                 </label>
                 <span class="search-stream-wrap">
@@ -140,7 +146,7 @@ export default function SearchPanel({ session, stream, onJump }) {
                         type="text"
                         placeholder=${streamPlaceholder}
                         value=${streamInput}
-                        oninput=${e => setStreamInput(e.target.value)}
+                        oninput=${e => onSearchStateChange({ streamInput: e.target.value })}
                     />
                 </span>
                 <button class="btn" type="submit" disabled=${searching || !pattern}>
@@ -156,7 +162,7 @@ export default function SearchPanel({ session, stream, onJump }) {
                             <div class="search-results-header">${results.length} match${results.length === 1 ? '' : 'es'}</div>
                             ${results.map((m, idx) => html`
                                 <div key=${idx} class="search-result"
-                                     onclick=${() => onJump?.({ streamId: m.stream, direction: m.direction, offset: m.offset })}>
+                                     onclick=${() => onJump?.({ streamId: m.stream, direction: m.direction, offset: m.offset, length: m.length })}>
                                     <span class="search-result-stream">stream ${m.stream}</span>
                                     <span class=${'search-result-dir ' + dirClass(m.direction)}>
                                         ${dirLabel(m.direction)}

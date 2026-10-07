@@ -5,7 +5,7 @@ import {
     totalBytes, isWindowFull, buildRows, evict, fillToTarget, windowIndexAtRow, rowIndexOfWindow,
 } from './byteBufferCore.js'
 
-export { MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS, FILL_TARGET_SEGMENTS }
+export { MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS }
 
 // Byte-budgeted replacement for useChunkBuffer.js's item-count-based windowing — see
 // doc/design/hexview-segment-buffer.md for the full design this implements, and
@@ -25,13 +25,17 @@ export { MAX_BUFFERED_BYTES, MAX_BUFFERED_SEGMENTS, FILL_TARGET_SEGMENTS }
 // must satisfy, including why fillForward/fillBackward are two distinctly-named
 // functions rather than one taking a direction parameter. isClosed(entity): optional,
 // stops refresh/live-poll top-up once true. latestId: optional, a plain number (the hook
-// itself does no polling); omit to disable the live-poll reaction below.
+// itself does no polling); omit to disable the live-poll reaction below. hasPendingJump:
+// optional, true for the one render where a caller-owned jump-to-target is about to
+// immediately reload this same (possibly just-changed) entity itself — see the "Initial
+// load" effect below for why this hook needs to know, rather than always reloading from
+// stid 0 on every entity change.
 //
 // No fetchPage/getId/buildRows props here, unlike useChunkBuffer.js — pagination is
 // entirely the adapter's concern now (there's no single "next id" the hook manages
 // itself), and row-building is shared/internal (byteBufferCore.js's buildRows) since the
 // row shape no longer differs between chunk mode and frame mode.
-export function useByteBuffer({ entity, refreshKey, openConnection, fillForward, fillBackward, isClosed, latestId }) {
+export function useByteBuffer({ entity, refreshKey, openConnection, fillForward, fillBackward, isClosed, latestId, hasPendingJump }) {
     const [display, setDisplay] = useState({ rows: [], scrollAdjust: 0, adjustVersion: 0, scrollTo: 0, scrollToVersion: 0 })
     const [loading, setLoading] = useState(false)
     const [error,   setError]   = useState(null)
@@ -40,6 +44,11 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
     const reachedForwardRef    = useRef(false)
     const reachedBackwardRef   = useRef(false)
     const loadingMoreRef       = useRef(false)
+    // True for the whole span of a reloadFromBoundary/reloadCenteredOn call (not just
+    // loadingMoreRef's narrower "an incremental top-up is in flight") — topUp() must not
+    // start appending to windowsRef.current while a full reload is about to replace it
+    // wholesale out from under it; see topUp's own guard below.
+    const reloadInFlightRef    = useRef(false)
     const generationRef        = useRef(0)
     const entityRef            = useRef(entity)
     const handleRef            = useRef(null)
@@ -60,8 +69,10 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
     // Opens a fresh connection and fills toward FILL_TARGET_BYTES/FILL_TARGET_SEGMENTS
     // starting at boundaryStid, in direction dir (1 = forward, -1 = backward), replacing
     // display. computeExtra(rows) merges extra fields into display, same as
-    // useChunkBuffer.js's reloadFrom.
-    function reloadFromBoundary(dir, boundaryStid, { computeExtra } = {}) {
+    // useChunkBuffer.js's reloadFrom. mustReachStid: forwarded to fillToTarget — see its
+    // own doc comment; lets a jump-to-stid caller guarantee the segment it's centering on
+    // actually ends up loaded, rather than the byte budget potentially binding first.
+    function reloadFromBoundary(dir, boundaryStid, { computeExtra, mustReachStid } = {}) {
         handleRef.current?.close?.()
         const handle = openConnection(entityRef.current)
         handleRef.current = handle
@@ -69,7 +80,8 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
         generationRef.current++
         const gen = generationRef.current
 
-        loadingMoreRef.current = false
+        loadingMoreRef.current  = false
+        reloadInFlightRef.current = true
         windowsRef.current = []
         setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
         setLoading(true)
@@ -81,7 +93,7 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
                 const fill = dir === 1 ? fillForward : fillBackward
                 const { reachedEnd } = await fillToTarget(
                     fill, handle, entityRef.current, windows, dir, boundaryStid, null,
-                    FILL_TARGET_BYTES, FILL_TARGET_SEGMENTS, generationRef, gen,
+                    FILL_TARGET_BYTES, FILL_TARGET_SEGMENTS, generationRef, gen, mustReachStid,
                 )
                 if (generationRef.current !== gen) return
                 windowsRef.current = windows
@@ -97,24 +109,96 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
             } catch (e) {
                 if (generationRef.current === gen) setError(e.message)
             } finally {
-                if (generationRef.current === gen) setLoading(false)
+                if (generationRef.current === gen) {
+                    setLoading(false)
+                    reloadInFlightRef.current = false
+                }
             }
         })()
     }
 
-    // Forward reload from startId (inclusive) — the general-purpose entry point
-    // (initial load, jump-to-top, jump-to-stid), mirroring useChunkBuffer.js's
-    // reloadFrom(startId) signature exactly so a future migration barely touches call sites.
+    // Forward reload from startId (inclusive) — the general-purpose entry point (initial
+    // load, jump-to-top), mirroring useChunkBuffer.js's reloadFrom(startId) signature
+    // exactly so a future migration barely touches call sites. Not used for jump-to-stid
+    // (see reloadCenteredOn below) — a distant startId would mean walking the whole way
+    // there in WINDOW_STEP-sized quanta.
     function reloadFrom(startId, opts) {
         reloadFromBoundary(1, startId - 1, opts)
     }
 
-    // Initial load — runs whenever the selected entity changes.
+    // Loads a window centered on targetStid directly — one backward fill ending just
+    // before it (leading context, capped at half the normal fill target) and one forward
+    // fill starting *at* it (mustReachStid as a defensive backstop only; the very first
+    // candidate a forward fill from targetStid-1 sees already *is* targetStid, so this
+    // resolves in essentially one round trip per direction) — run concurrently, merged
+    // once both settle. This is what a jump-to-stid caller needs instead of reloadFrom:
+    // reloadFrom always starts from a given boundary and walks forward from there, and a
+    // segment-count-centered boundary (targetStid - N segments) can be genuinely far from
+    // the target in *byte* terms for realistic chunk sizes — turning a jump into a long
+    // chain of small quanta just to reach it, even though the server can resolve a query
+    // at any stid directly (an indexed `WHERE stid >= start` lookup) with no need to walk
+    // through everything before it.
+    function reloadCenteredOn(targetStid, { computeExtra } = {}) {
+        handleRef.current?.close?.()
+        const handle = openConnection(entityRef.current)
+        handleRef.current = handle
+
+        generationRef.current++
+        const gen = generationRef.current
+
+        loadingMoreRef.current  = false
+        reloadInFlightRef.current = true
+        windowsRef.current = []
+        setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
+        setLoading(true)
+        setError(null)
+
+        ;(async () => {
+            try {
+                const backWindows = []
+                const fwdWindows  = []
+                const halfBytes    = FILL_TARGET_BYTES / 2
+                const halfSegments = FILL_TARGET_SEGMENTS / 2
+
+                const [back, fwd] = await Promise.all([
+                    fillToTarget(fillBackward, handle, entityRef.current, backWindows, -1, targetStid, null, halfBytes, halfSegments, generationRef, gen),
+                    fillToTarget(fillForward, handle, entityRef.current, fwdWindows, 1, targetStid - 1, null, halfBytes, halfSegments, generationRef, gen, targetStid),
+                ])
+                if (generationRef.current !== gen) return
+
+                const windows = [...backWindows, ...fwdWindows]
+                windowsRef.current = windows
+                // Unlike reloadFromBoundary (which only ever fills one direction and has to
+                // guess the other), both directions' real reachedEnd are known here.
+                reachedBackwardRef.current = back.reachedEnd
+                reachedForwardRef.current  = fwd.reachedEnd
+                const rows  = buildRows(windows, entityRef.current.start)
+                const extra = computeExtra ? computeExtra(rows) : {}
+                setDisplay({ rows, scrollAdjust: 0, adjustVersion: 0, ...extra })
+            } catch (e) {
+                if (generationRef.current === gen) setError(e.message)
+            } finally {
+                if (generationRef.current === gen) {
+                    setLoading(false)
+                    reloadInFlightRef.current = false
+                }
+            }
+        })()
+    }
+
+    // Initial load — runs whenever the selected entity changes. Skipped while
+    // hasPendingJump is true: a caller-owned jump effect that also just switched entity
+    // (e.g. a search result in a different stream) is about to call reloadFrom itself for
+    // the actual target — without this check, this effect's own reloadFrom(0) races it,
+    // and since it needs only one round trip against the jump's two (resolve offset, then
+    // reload), it can commit last and silently strand the view at the top instead of the
+    // jump's real destination.
     useEffect(() => {
         if (!entity) {
             setDisplay({ rows: [], scrollAdjust: 0, adjustVersion: 0 })
             return
         }
+        if (hasPendingJump) return
         reachedForwardRef.current  = false
         reachedBackwardRef.current = false
         reloadFrom(0)
@@ -133,7 +217,13 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
         const e = entityRef.current
         if (!e) return
         if (isClosed?.(e)) return
-        if (loadingMoreRef.current) return
+        // reloadInFlightRef: a full reload (reloadFromBoundary/reloadCenteredOn) is about
+        // to replace windowsRef.current wholesale — appending to it here (built from a
+        // momentarily-empty windowsRef.current, mid-reload) would race the reload's own
+        // commit and can land after it, silently overwriting the reload's correct rows
+        // with a bogus from-stid-0 result while leaving its scrollTo/scrollToVersion in
+        // place pointing at a row no longer there.
+        if (loadingMoreRef.current || reloadInFlightRef.current) return
 
         const windows = windowsRef.current
         const roomBytes    = MAX_BUFFERED_BYTES    - totalBytes(windows)
@@ -374,7 +464,7 @@ export function useByteBuffer({ entity, refreshKey, openConnection, fillForward,
     }, [])
 
     return {
-        display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
+        display, loading, error, setError, handleScrollEnd, reloadFrom, reloadCenteredOn, displayRef,
         jumpToTop, jumpToBottom, jumpToNextSegment, jumpToPrevSegment,
     }
 }

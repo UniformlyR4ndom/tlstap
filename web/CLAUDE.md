@@ -12,12 +12,22 @@ Served at `/ui/` by the API HTTP server. No build step — uses vendored ES modu
 
 **Technology:** Preact 10.25.4 + htm 3.1.1, vendored under `web/vendor/`. The importmap in `index.html` maps bare specifiers (`preact`, `preact/hooks`, `htm`) to the vendored files so the Preact hooks module (which imports bare `"preact"`) resolves correctly.
 
-**Layout:** Header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
+**Layout:** Insecure-context banner (below) → header bar (title + refresh button) → top-level tab bar (**Analysis** / **Tamper**, `App.js`'s `view` state) → for Analysis: menu bar → sidebar (sessions + streams) + main area (traffic view) + collapsible bottom panel; for Tamper: see "Tamper tab" below, an entirely separate layout with no sidebar/bottom-panel reuse.
+
+**Insecure-context banner (`App.js`):** a plain `!window.isSecureContext` check (no state
+— the value can't change during a session), shown above the header, in both tabs, while
+true. `isSecureContext` is `false` whenever the page is served over plain HTTP to
+anything other than `localhost`/`127.0.0.1` — several features the UI relies on
+(`crypto.subtle`, used by `framerRun.js`'s `sha256Hex` for framer script versioning;
+`showSaveFilePicker`/clipboard writes) are unavailable or throw outside a secure context,
+so this exists to make that failure mode legible instead of a confusing runtime error the
+first time one of those is used. No dismiss button — the condition doesn't change while
+the tab is open, so hiding it would just mean the user forgets why something later fails.
 
 **Menu bar (`App.js`, `index.html`):**
 - `App.js` owns `openMenu` (null | `'view'`), `globalOffset` (bool, default `true`), `sizeFormat` (`'size'` | `'count'`, default `'size'`), `pinHeader` (bool, default `true`), and `rememberPosition` (bool, default `false`).
 - A `mousedown` listener on `document` (active only while a menu is open) closes the menu when clicking outside `.menubar`.
-- One menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), **Size** / **Byte count** (chunk header banner's `sizeFormat`), **Pin header when scrolled past** toggle (`pinHeader`), **Remember stream position** toggle, **Default framer** select.
+- One menu: **View** → **Global offset** toggle, **View mode** (Single stream / Combined streams), **Size** / **Byte count** (chunk header banner's `sizeFormat`), **Pin header when scrolled past** toggle (`pinHeader`), **Remember stream position** toggle, **Remote framer runs** toggle (see "Remote framer job listener" below), **Remote dissector runs** toggle (see "Remote dissector job listener" below, an independent opt-in from the framer one), **Default framer** select, **Default dissector** select.
 - `globalOffset`/`sizeFormat`/`pinHeader` are each passed down: `App` → `TrafficView`/`CombinedView` → `HexDump` (→ `HexRow` for `globalOffset` specifically).
 - **Remember stream position** (single-stream view only): while on, `App.js` remembers the byte offset/direction at the top of the viewport per stream, in-memory only, keyed by `` `${session}:${id}` `` (stream `id` is only unique within a session). `selectStream(s)` looks up a saved position and jumps to it with `align: 'top'` instead of a plain `setStream(s)`; re-clicking the already-selected stream is a no-op. Switching **View mode** away and back doesn't auto-restore — only reselecting via the Streams list does.
 
@@ -112,7 +122,7 @@ view's own `jumpRef.current` object simply lacks the key rather than providing a
     frame/chunk-mode branching of its own. `??`, not `||`, since a direction's very first
     frame legitimately has `virtualOffset: 0`.
 - **Byte selection**: `sel` state `{direction, start, end}` (byte offsets, inclusive). `onMouseDown` starts selection; `onMouseMove` extends it if same direction as anchor; document-level `mouseup` ends drag. Per-byte `<span data-off=N data-dir=D>` elements carry `.sel-hl` class when highlighted. Selection is scoped to one direction (cannot drag across c2s/s2c boundary).
-- **Dissector highlight** (`highlightRange` prop, `null | {direction, start, end}`, inclusive like `sel`): externally driven — set by clicking a field node in `DissectPanel.js`, not by any mouse interaction inside `HexDump.js` itself — and rendered via its own `.dissect-hl` class alongside (not replacing) `.sel-hl`/marker classes, so a byte under more than one at once shows all of them. See "Dissector scripts" below.
+- **External highlight** (`highlightRange` prop, `null | {direction, start, end}`, inclusive like `sel`): driven from outside `HexDump.js` itself, not by any mouse interaction inside it — rendered via its own `.range-hl` class alongside (not replacing) `.sel-hl`/marker classes, so a byte under more than one at once shows all of them. Two independent sources feed it, one per `HexDump` instance: `TrafficView.js`'s frame-mode instance gets `dissectHighlight`, set by clicking a field node in `DissectPanel.js` (see "Dissector scripts" below); its raw-mode instance gets `searchHighlight`, set from a search-result jump's `jumpTo.highlight` (see "Search panel" below).
 - **Byte markers**: `markedC2S` / `markedS2C` — `Set<offset>` derived from `markers` prop. Marked bytes receive `.hex-byte-marked` / `.asc-byte-marked` CSS classes.
 - **Chunk header** format: `[+T.TTTs] [#stid] DIRECTION  #chunkId  N B` (stid shown when present; stream number shown in CombinedView), where the size field is `fmtByteSize`'s or `fmtByteCount`'s output depending on the `sizeFormat` prop (`'size'`/`'count'`, App.js's View-menu toggle — see "Menu bar" above). A `⋯ ` prefix (plus a `title` tooltip) marks a `row.continued` header — the byte-budgeted segment buffer's loaded window doesn't start at the segment's own offset, so the real header is further up, out of the loaded range (only possible in `TrafficView.js`'s frame mode today, for a still-growing huge frame).
 - **Pinned header** (`pinHeader` prop, App.js's View-menu toggle, default on): when the chunk header for whatever row sits at the very top of the viewport has itself been scrolled above it, a second copy is rendered pinned to the top via `position: sticky` inside a zero-height wrapper (`.chunk-hdr-pinned-wrap` — contributes no height to the flow, so it doesn't perturb `topSpacer`/`scrollHeight` math elsewhere) — `.chunk-hdr-pinned`'s own class adds an opaque background/shadow/border so it reads as floating above the rows scrolling underneath, plus a `▲ ` prefix and a distinct tooltip. `headerRowIdxs` (`useMemo`, keyed on `rows`) + a binary search (`lastHeaderIdxAtOrBefore`) finds it in O(log n) rather than scanning back through however many rows the current segment has. Clicking it calls `scrollToRow` to jump back to the real header; its own `onContextMenu` stops propagation so a right-click there doesn't get misattributed to whatever row is underneath at that screen position (the container's context-menu handler maps click position to a row via `scrollTop`, which doesn't account for the pinned banner's fixed on-screen position).
@@ -223,7 +233,13 @@ references it.
   whole set, not just the most recently finished one, to avoid re-surfacing an
   already-consumed sibling as "new"), `fillToTarget` (the quantized fill loop driving an
   adapter's `fillForward`/`fillBackward` toward a target, with generation-based
-  cancellation between quanta), `windowIndexAtRow`/`rowIndexOfWindow` (row↔segment-index
+  cancellation between quanta; optional trailing `mustReachStid` param keeps it looping —
+  using full `WINDOW_STEP`/`SEGMENT_STEP` quanta rather than the shrinking, potentially
+  negative remaining-budget clamp `selectByBudget` can't handle — past `targetBytes`/
+  `targetSegments` until a segment with that stid is actually loaded, bounded by
+  `MAX_BUFFERED_BYTES`/`MAX_BUFFERED_SEGMENTS` regardless so an unreachable target can't
+  grow the buffer without limit; backs `TrafficView.js`'s jump effect, see below),
+  `windowIndexAtRow`/`rowIndexOfWindow` (row↔segment-index
   lookups over `windows`, using the same per-window row-span math `buildRows` does — back
   `useByteBuffer.js`'s `jumpToNextSegment`/`jumpToPrevSegment`, the same role
   `HexDump.js`'s own `headerRowIdxs` binary search plays for its pinned-header feature,
@@ -231,10 +247,39 @@ references it.
 - **`useByteBuffer.js`**: the Preact hook wrapping that core — same external contract as
   `useChunkBuffer.js` above (`display`, `loading`, `error`, `setError`, `handleScrollEnd`,
   `reloadFrom`, `displayRef`, `jumpToTop`, `jumpToBottom`, plus `jumpToNextSegment`/
-  `jumpToPrevSegment` — see below), so migrating a view onto it is
+  `jumpToPrevSegment` and `reloadCenteredOn` — see below), so migrating a view onto it is
   meant to be a small change. Caller props shrink to `{entity, refreshKey, openConnection,
-  fillForward, fillBackward, isClosed, latestId}` — no `fetchPage`/`getId`/`buildRows`,
-  since pagination is now the adapter's own concern and row-building is shared.
+  fillForward, fillBackward, isClosed, latestId, hasPendingJump}` — no `fetchPage`/`getId`/
+  `buildRows`, since pagination is now the adapter's own concern and row-building is
+  shared. `hasPendingJump` (optional, only `TrafficView.js`'s raw-mode instance passes it)
+  makes the "reload from stid 0 on entity change" effect skip itself for the one render
+  where a caller-owned jump is about to load this same entity instead — see the jump
+  effect's own note below for why.
+- **`reloadCenteredOn(targetStid, {computeExtra})`**: what a jump-to-stid caller uses
+  instead of `reloadFrom` — one backward `fillToTarget` ending just before `targetStid`
+  (leading context, capped at half the normal fill target) and one forward `fillToTarget`
+  starting *at* it (`mustReachStid: targetStid` as a defensive backstop only — the very
+  first candidate a forward fill from `targetStid-1` sees already *is* `targetStid`, so
+  this resolves in essentially one round trip per direction), run concurrently via
+  `Promise.all`, merged into one `windows` array once both settle. Exists because
+  `reloadFrom`'s own boundary-plus-walk-forward shape doesn't fit a jump: centering via a
+  segment-count-computed start (`targetStid - FILL_TARGET_SEGMENTS/2`, clamping to 0 for
+  anything not deep into the stream) can be genuinely far from the target in *byte* terms
+  for realistic chunk sizes, turning a jump into a long chain of `WINDOW_STEP`-sized
+  quanta just to reach it — even though the server resolves a query at any stid directly
+  (an indexed `WHERE stid >= start` lookup) with no need to walk through everything
+  before it.
+- **`reloadInFlightRef`**: true for a `reloadFromBoundary`/`reloadCenteredOn` call's whole
+  span (cleared in its `finally`, only if still the current generation) — distinct from
+  `loadingMoreRef`'s narrower "an incremental top-up/scroll-fill is in flight" meaning,
+  which both of those explicitly set `false` at their own start (a full reload isn't an
+  incremental one). `topUp()` checks both: without this, a live-poll tick or Refresh click
+  landing in a reload's async gap reads `windowsRef.current` as the reload's momentarily-
+  empty `[]`, fetches its own small forward-from-0 result under the reload's own (not yet
+  superseded) generation, and can commit *after* the reload's own final `setDisplay` —
+  silently overwriting its correct rows with a bogus one while leaving its
+  `scrollTo`/`scrollToVersion` pointing at a row that's no longer there. Most likely to
+  bite when jumping around in a stream that's still actively growing.
 - **`jumpToNextSegment(currentRowIndex)`/`jumpToPrevSegment(currentRowIndex)`**: jump to
   the segment right after/before whatever row the caller says the viewport is currently
   showing (`TrafficView.js` derives this from its own `scrollTopRef`, see above — the hook
@@ -345,20 +390,53 @@ references it.
 - `totalBytes` (the ↑/↓ byte counters in the meta bar) is `TrafficView.js`-only state, independent of either hook's `display`, mirrored via its own small effect on `stream?.id`.
 - **Jump effect** (`useEffect([jumpTo?.version])`, no `CombinedView.js` equivalent, and not
   wired to frame mode): resolves `jumpTo` to a target stid, then calls the raw-mode hook's
-  `reloadFrom`. A local `cancelled` flag (set in the effect's cleanup) guards the resolution
-  step against a stale jump firing after a newer one has superseded it — the hook's own
-  `generationRef` only protects `reloadFrom`'s internal async work, not this caller-side step.
-  - `chunks` unit: `targetStid = jumpTo.value`.
-  - `chunks-c2s` / `chunks-s2c`: `POST /chunk-stid` resolves per-direction `id` → `stid`.
-  - `offset-c2s` / `offset-s2c`: `POST /byte-stid` resolves byte offset → `stid`, also recording `targetByteOffset`/`targetDirection`.
-  - Calls `reloadFrom(max(0, targetStid - FILL_TARGET_SEGMENTS/2), { computeExtra })` —
-    `FILL_TARGET_SEGMENTS` (from `useByteBuffer.js`) plays the same centering role `BATCH`
-    played before this view's migration — where `computeExtra` scans the freshly-built rows
-    for the target row (byte-offset jumps match both direction and offset range, since
-    c2s/s2c offsets both start at 0) and returns `{scrollTo, scrollToVersion: jumpTo.version}`
-    — centered by default, or placed at the very top when `jumpTo.align === 'top'` (marker
-    jumps, remembered-position restore).
-  - A resolution failure calls the hook's `setError` directly, since `reloadFrom` is never reached.
+  `reloadCenteredOn` (not `reloadFrom` — see that function's own doc comment). A local
+  `cancelled` flag (set in the effect's cleanup) guards the resolution step against a stale
+  jump firing after a newer one has superseded it — the hook's own `generationRef` only
+  protects `reloadCenteredOn`'s internal async work, not this caller-side step.
+  `reportError(message)` (effect-local) is every failure path's single exit: calls the
+  `onJumpError` prop with `(jumpTo, message)` when `jumpTo.source` is set (routes to that
+  source's own UI — currently just Goto, see `GoToPanel.js`'s `error` prop above), else
+  falls back to the hook's own `setError` (the top-of-view banner search-result/marker
+  jumps still use — their own target is always real/already-found, so nothing there
+  validates it client-side).
+  - `chunks` unit: `targetStid = jumpTo.value` directly — no resolution call, so
+    `latestStid` (already available, the same prop the raw-mode hook's live-poll reaction
+    uses) is checked client-side instead: `jumpTo.value > latestStid` reports an error and
+    returns before touching `reloadCenteredOn`, skipped only if `latestStid` itself isn't
+    known yet (`null`/`< 0`).
+  - `chunks-c2s` / `chunks-s2c`: same pre-check, against `POST /chunklist`'s per-direction
+    `latest0`/`latest1` instead (not already available as a prop, so this unit alone pays
+    for the extra round trip even on success) — keeps the error message in the same
+    phrasing as the other two units rather than surfacing `/chunk-stid`'s own 404 text
+    (`"chunk not found"`) verbatim.
+  - `offset-c2s` / `offset-s2c`: validated against `stream.length0`/`length1` (whichever
+    matches direction) before calling `POST /byte-stid` at all — that endpoint resolves to
+    the *last* chunk rather than 404ing for an offset past what's captured so far, so
+    without this check a too-large/stale typed offset lands at the top of that chunk's
+    window instead of failing outright. On failure neither `/byte-stid` nor
+    `reloadCenteredOn` is called and `display` is left untouched. `stream.length0`/
+    `length1` only refresh on the poll/Refresh (not per keystroke), so a just-captured
+    legitimate offset can trip this on an actively-growing stream — an accepted,
+    narrow false-positive trade against silently mis-landing.
+  - Calls `reloadCenteredOn(targetStid, { computeExtra })`, where `computeExtra` scans the
+    freshly-built rows for the target row (byte-offset jumps match both direction and
+    offset range, since c2s/s2c offsets both start at 0) and returns `{scrollTo,
+    scrollToVersion: jumpTo.version}` — centered by default, or placed at the very top when
+    `jumpTo.align === 'top'` (marker jumps, remembered-position restore). With `pinHeader`
+    on, a top-aligned byte target lands one row lower, since the pinned header covers the
+    top row; the remembered-position capture on stream leave skips that covered row to
+    match, so save/restore round-trips without drifting.
+  - **`hasPendingJump`** (passed into the raw-mode `useByteBuffer` instance, computed each
+    render as `jumpTo.version !== lastJumpVersionRef.current`): a jump that also switches
+    `stream` (e.g. a search result in a different stream) changes `entity` and `jumpTo` in
+    the same commit, so `useByteBuffer`'s own "reload from stid 0 on entity change" effect
+    and this jump effect both fire — the former runs first (registered earlier in hook
+    order) and, needing only one round trip against the jump's two (resolve offset, then
+    reload), can commit last and strand the view at the top. `hasPendingJump` tells that
+    effect to skip its own reload and leave the jump effect as the sole loader for that
+    entity; `lastJumpVersionRef.current` is set at the top of the jump effect itself so the
+    flag is true for exactly the one render with a genuinely unprocessed jump.
 - **Leave effect** (`useEffect([stream?.id])`, save side of "Remember stream position"): its
   cleanup resolves the row at `Math.floor(scrollTopRef.current / ROW_HEIGHT)` in
   `displayRef.current.rows`, scanning forward past any `'header'` row to the next `'hex'`
@@ -372,13 +450,21 @@ threaded to `<HexDump>` at all.
 
 **Goto panel (`GoToPanel.js`):**
 - Text input (accepts decimal or `0x`-prefixed hex).
-- Unit select (option values / labels): `chunks` / "chunks (total)", `chunks-c2s` / "chunks (c→s)", `chunks-s2c` / "chunks (s→c)", `offset-c2s` / "offset (c→s)", `offset-s2c` / "offset (s→c)".
+- Unit select (option values / labels): `chunks` / "chunks (total)", `chunks-c2s` / "chunks (c→s)", `chunks-s2c` / "chunks (s→c)", `offset-c2s` / "offset (c→s)", `offset-s2c` / "offset (s→c)". The unit lives in `App.js` (`gotoUnit`; props `unit`, `onUnitChange`) so it survives tab switches; the typed value is local and resets.
 - No separate direction dropdown — direction is encoded in the unit choice.
 - Shows "Select a stream first" placeholder when no stream selected.
 - `onGoTo({value: N, unit})` is called on submit (Enter or button click).
+- **`error` prop** (string or null, rendered as an `.error-msg` line below the form):
+  `App.js`'s own `gotoError` state, set by `handleJumpError` when `TrafficView.js`'s jump
+  effect reports a failure for a jump `handleGoTo` tagged `source: 'goto'` — shown here
+  instead of the hex view's generic top-of-view banner (every other jump source stays on
+  that banner; see the jump effect's own note in "Jump effect" below for why only Goto's
+  target can be wrong to begin with). `handleGoTo` clears it optimistically on every new
+  attempt, so a fixed/different value that succeeds silently drops the old message.
 
 **Search panel (`SearchPanel.js`):**
-- Props: `session`, `stream`, `onJump`.
+- Props: `session`, `stream`, `onJump`, `searchState`, `onSearchStateChange(patch)`.
+- Form values and results live in `App.js` (`searchState`, initialized from `SearchPanel.js`'s `INITIAL_SEARCH_STATE`, merged via `updateSearchState`), so they survive bottom-tab and Analysis/Tamper switches (in memory only — lost on page reload). Only `searching`/`error` are local. `results` is `{session, list}`; the panel shows it only while `session` is the same object, and `App.js` clears it whenever `session` changes (which also covers a dbdump instance switch).
 - Shows "Select a session first" placeholder when no session selected.
 - Form fields: pattern input (monospace, dynamic placeholder), format select, direction select (`both` / `c→s` / `s→c`), **Contiguous** checkbox, stream number input (empty = all streams in session).
 - Format select options and encoding behaviour:
@@ -387,8 +473,8 @@ threaded to `<HexDump>` at all.
   - `hex` — accepts `0xff 0x00`, `\xff\x00`, `ff00`, space/comma-separated; sent as base64.
   - `regex` — sent as raw text with `pattern_encoding: "regex"`; no base64.
 - All non-regex formats are always sent as base64 (`pattern_encoding: "base64"`).
-- Results list: match count header + scrollable rows showing stream id, direction (coloured), hex offset. Clicking a row calls `onJump({streamId, direction, offset})`.
-- `App.js` wires `onJump` → `handleSearchJump`: finds the stream in `streamList`, switches to it if needed (sets `stream` state), then sets `jumpTo` with unit `offset-c2s` or `offset-s2c`.
+- Results list: match count header + scrollable rows showing stream id, direction (coloured), hex offset. Clicking a row calls `onJump({streamId, direction, offset, length})` — `length` (bytes matched, from the backend's `SearchMatch.length`) is passed straight through, undecoded.
+- `App.js` wires `onJump` → `handleSearchJump`: finds the stream in `streamList`, switches to it if needed (sets `stream` state), builds a `{direction, start: offset, end: offset + length - 1}` highlight range, and calls `jumpToOffset` with it — `jumpToOffset`'s optional `highlight` param rides along on the `jumpTo` object it builds (`jumpTo.highlight`) as the one extra field distinguishing a search-originated jump from every other kind (Goto, marker jump, remembered-position restore), all of which simply omit it. `TrafficView.js`'s jump effect picks it up into local `searchHighlight` state, fed to the raw-mode `HexDump` as its `highlightRange` prop (see "Virtual scroll"'s "External highlight" note above) — reset alongside `dissectHighlight` on stream (re)selection.
 - `streamList` state in `App.js` is populated via `StreamList`'s `onLoad` prop (called after each fetch).
 
 **`format.js` (shared encoding/formatting helpers):**
@@ -427,6 +513,7 @@ threaded to `<HexDump>` at all.
 
 **Transform panel (`TransformPanel.js`, `transforms.js`):**
 - Layout: resizable options column (`.encdec-options`, left) + input/output column (`.encdec-io`, right), split by `ResizeHandle`s.
+- **State lives in `App.js`** (`transformState`, initialized from `INITIAL_TRANSFORM_STATE`; props `transformState`, `onTransformStateChange(prev => next)`), so input, steps, output and collapsed menu sections survive bottom-tab and Analysis/Tamper switches (in memory only — lost on page reload). The panel's `field(key)` builds `useState`-style setters over it (value or updater). Transient UI state (`menuOpen`, `dragOverId`, `HexEditor`'s cursor) stays local.
 - **Canonical state is `bytes: Uint8Array`**: text mode derives the `<textarea>`'s value from `bytes` each render (never stored back except via its own `oninput`), so toggling Hexdump view off/on never loses data even with invalid UTF-8 (a warning line appears when the decode is lossy); hexdump mode operates on `bytes` directly via `<${HexEditor}>`.
 - **Steps** (`steps: [{id, op, label, params}]`), built from the `+` button's dropdown (`transforms.js`'s `ALGORITHM_SECTIONS`, subsections rendered as a nested indent level). An algorithm with no matching `OPERATIONS` entry renders `[TODO]` and isn't clickable. `addStep` seeds `params` from each param's `default`, including ones hidden by `showIf`. Step rows are HTML5-draggable for reordering.
 - **Per-step parameters** (`renderStepParam`): `param.type` is `'number'` (clamped to `min`/`max`), `'boolean'`, `'select'`, or `'text'`.
@@ -483,9 +570,10 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
   marker's own stream is shown per row since more than one can appear here.
 - Marker rows (`.markers-tab-row`/`.mtab-*`, a single-line table row — replaced the old
   side panel's multi-line card layout, a better fit for a wide/short bottom panel):
-  session, stream, direction, offset, an inline-editable label, a **Go** button (`onJump`),
-  and `×` (`onRemove`). Clicking **Go** doesn't collapse the bottom panel — same convention
-  `GoToPanel.js`/`SearchPanel.js` already follow for their own jumps.
+  session, stream, direction, offset, an inline-editable label (double-click to edit), and
+  `×` (`onRemove`). A single click anywhere else on the row jumps (`onJump`), like a
+  `SearchPanel.js` result row; the label input and `×` stop propagation. Jumping doesn't
+  collapse the bottom panel.
 - **Import/export** (bottom bar): `[clipboard ▾] [Import] [Export]` + status line.
   - File format: deflate-compressed JSON, base64-encoded, extension `.tlstap-markers`. Content is the raw `tlstap-markers` localStorage JSON (`{ version: 1, markers: [{id, session, stream, direction, offset, label?}] }`).
   - `compress(str)` / `decompress(b64)`: use `CompressionStream`/`DecompressionStream` with `'deflate'` (Chrome 80+, Firefox 113+, Safari 16.4+).
@@ -495,8 +583,15 @@ Operations are implemented in per-category modules under `transforms/`; `transfo
   - `parseImport(text)`: validates JSON has `markers` array with required typed fields; returns `null` on invalid data.
 
 **`api.js`:**
+- `errorMessage(r)`: extracts a failed response's `{"error": "..."}` body (falling back to
+  `r.statusText` if the body isn't JSON) — every throw in this file goes through it (or
+  `okJson`, which wraps it), matching the `checkOk`-shaped helper every other API client
+  in this codebase already has (`coreApiClient.js`, `tamperApi.js`, ...), so a thrown
+  message is always the server's own text, not a raw JSON blob.
 - `openStidStream()` → `{ fetch(sessionId, streamId, start, n), close() }`: persistent WS to `/stid-stream`.
 - `openSgidStream()` → `{ fetch(session, start, n), close() }`: persistent WS to `/sgid-stream`.
+- `openFramerJobs(handlers)` → `{ respond(jobId, ok, error?), close() }`: persistent WS to `/framer-jobs` — the browser-tab side of the remote framer-job relay (`intercept/dbdump/CLAUDE.md`'s "Framer jobs" section), pushed one `{onOpen, onClose, onError, onJob(job)}` handler set at open time, same shape as `tamperApi.js`'s `openTamperControl`. See "Remote framer job listener" below for the caller.
+- `openDissectorJobs(handlers)` → `{ respond(jobId, ok, extra), close() }`: persistent WS to `/dissector-jobs` — `openFramerJobs`'s dissector-script sibling (`intercept/dbdump/CLAUDE.md`'s "Dissector jobs" section); `respond`'s `extra` is merged into the result message (`{nodes}` on success, `{error}` on failure) rather than a plain `error?` param, since a dissector job's success payload actually carries data. See "Remote dissector job listener" below for the caller.
 - `getSessions()`, `getStreams(sessionId)`, `getChunkList(sessionId, streamId)`.
 - `getLatest({session, stream} = {})`: POST `/latest` — `App.js`'s central live poll; both fields optional/independent, omitted entirely when falsy/nullish rather than sent as `0`/`null`. See "Central live poll" above and `intercept/dbdump/CLAUDE.md`'s `/latest` entry.
 - `getChunkStid(sessionId, streamId, direction, id)`: POST `/chunk-stid`.
@@ -1016,7 +1111,9 @@ two-way ~18.6MB/direction capture (multi-megabyte frame, clean close both direct
   not whole session/stream objects; no `direction` param — combined mode's key spans both;
   `streamEnd` is the stream's own `end` field, `0` while ongoing — same convention
   `TrafficView.js`'s `isClosed(stream)` and `chunkSegments.js`'s own `end` prop already
-  use; `tlsInfo` is `TrafficView.js`'s `streamTlsInfo(stream)` — `null`, or `{sni, alpn,
+  use; `tlsInfo` is `framerRun.js`'s own `streamTlsInfo(stream)` (moved here from
+  `TrafficView.js` once `framerJobsListener.js` below needed it too — a manual Run and a
+  remote-triggered one must derive it identically) — `null`, or `{sni, alpn,
   version, cipherSuite}` from the stream's downstream TLS handshake, attached as
   `chunk.tls` on every chunk built below, constant for the run) is the orchestration:
   fetches `frame-progress` (both directions' processed offset, the framer's own shared
@@ -1202,6 +1299,40 @@ bottom-tab bar (`Goto | Markers | Search | Extract | Transform | Framing`).
   signal; the Log tab becomes a persistent trail that includes that same failure, not
   just successful runs.
 
+**Remote framer job listener (`framerJobsListener.js`):** lets `tapctl dbdump run-framer`
+(see `tapctl/CLAUDE.md`) trigger a real framer run through this tab, over the relay
+`intercept/dbdump/CLAUDE.md`'s "Framer jobs" section documents server-side. Runs the
+*exact same* `catchUpFramer(...)` a manual Run click calls — no separate execution path
+to keep in sync with the real one, and no server-side script execution exists or is
+being added; this is purely a dispatch mechanism from a CLI call to a tab that already
+has the real code loaded. Browser-verified 2026-09-08 (see the dbdump-side note for what
+was exercised).
+
+- **`useFramerJobsListener(enabled, dbdumpApi, framerApi)`**: a plain hook, mounted
+  unconditionally in `App.js` (independent of stream/session selection — a job names its
+  own session/stream, unrelated to whatever's currently on screen) but only opens the
+  `openFramerJobs` connection while `enabled` is true. Returns `'disconnected'` |
+  `'connecting'` | `'connected'` for the toggle's own status text.
+  - **Deliberately opt-in** — `App.js`'s View-menu "Remote framer runs" checkbox
+    (default off, not persisted — same as every other View-menu toggle except the two
+    `*Prefs.js`-backed script selects). A tab never becomes remotely triggerable just by
+    being open; the checkbox's own row shows live connection status (`● connected` /
+    `connecting…` / `○ disconnected`) next to it, and — unlike every sibling toggle in
+    that menu — clicking it does *not* close the menu, so that status is actually visible
+    to watch change right after toggling on.
+  - **On a job**: resolves the target stream (`dbdumpApi.getStreams(job.session)`,
+    matched by `job.stream`) and the script's current content
+    (`framerApi.getFramerScript(job.script)`) concurrently, then calls `catchUpFramer`
+    exactly as `TrafficView.js`'s own manual Run does, using the shared
+    `streamTlsInfo` (see above). Any failure along the way — stream not found, unknown
+    script (a real `getFramerScript` 404), or `catchUpFramer` itself throwing — is caught
+    and reported back as an ordinary job failure (`conn.respond(job.job_id, false,
+    err.message)`), never left to throw unhandled in the hook.
+  - **No persistence of its own**: this hook doesn't track which jobs it has handled or
+    keep any state across renders beyond the connection itself — `intercept/dbdump/
+    CLAUDE.md`'s relay is what tracks in-flight jobs, and `frames`/`frame_progress` (via
+    the ordinary `appendFrames` calls inside `catchUpFramer`) are what actually persist.
+
 **Dissector scripts (`dissectRuntime.js`, `dbdumpDissectApi.js`, `dissectPrefs.js`,
 `DissectPanel.js`, `DissectScriptsPanel.js`) — done, feature-complete for v1:** produces a
 labeled field-tree breakdown of one frame's bytes, à la Wireshark's packet-details pane.
@@ -1333,3 +1464,37 @@ renders, clicking a field highlights the corresponding hex-view bytes.
   a stream switch, reloaded from `dissectPrefs.js` like `framerSelected` is from
   `framerPrefs.js`. `dissectPanelWidth` (`layout.js`) is not stream-scoped, same as every
   other resizable-panel width in this codebase.
+
+**Remote dissector job listener (`dissectorJobsListener.js`):** the "Remote framer job
+listener" section's dissector-script sibling — lets `tapctl dbdump run-dissector` (see
+`tapctl/CLAUDE.md`) trigger a real dissection through this tab, over the relay
+`intercept/dbdump/CLAUDE.md`'s "Dissector jobs" section documents server-side. Runs the
+*exact same* `runDissector(...)` (`dissectRuntime.js`) a per-frame click in
+`DissectPanel.js` calls — no separate execution path. Independent opt-in from the framer
+listener (own `remoteDissectorJobs` state, own "Remote dissector runs" View-menu toggle,
+own connection) — kept separate rather than folding both job kinds into one relay/toggle,
+matching this codebase's consistent framer/dissector-are-separate-systems precedent (own
+stores, own panels, own default-script prefs). Browser-verified 2026-09-08 alongside the
+framer listener.
+
+- **`useDissectorJobsListener(enabled, dbdumpApi, framerApi, dissectApi)`**: same shape
+  as `useFramerJobsListener` (mounted unconditionally in `App.js`, only connects while
+  `enabled`), returning the same three-state status string.
+- **On a job**: unlike a framer job, there's no framer script to fetch or run here — the
+  target frame is already fully computed and persisted. Fetches the exact frame
+  (`framerApi.listFrames({...key}, job.frame_id, 1)`, verified against the returned
+  `id` — a mismatch or empty result means "frame not found," reported as an ordinary job
+  failure) and the dissector script's current content (`dissectApi.getDissectScript`)
+  concurrently, then its bytes via `dbdumpApi.fetchByteRanges` over the frame's own
+  `ranges` (merged in range order via `format.js`'s `mergeUint8Arrays` when there's more
+  than one — the same primitive `frameSegments.js` uses for the UI's own frame view, not
+  a second implementation of it), then calls `runDissector` with a `frame` argument
+  shaped like `TrafficView.js`'s `handleFrameHeaderClick` builds one (`offset: 0` — always
+  the start of a frame's own virtual concatenation, per `frameSegmentsCore.js`'s module
+  comment — `length`, `direction`, `kind: meta?.kind`, `meta`).
+- **Result carries data, not just ok/error**: `conn.respond(jobId, ok, extra)`'s `extra`
+  is merged into the wire message — `{nodes}` on success (the dissector's own
+  `FieldNode[]` tree, nothing persisted for `tapctl` to go query afterward the way a
+  framer job's frames are), `{error}` on failure. `api.js`'s `openDissectorJobs` is the
+  thin WS wrapper this hook opens, mirroring `openFramerJobs`'s shape with that one
+  payload difference.

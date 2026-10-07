@@ -2,7 +2,6 @@ import { h } from 'preact'
 import { useState, useEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
 import HexEditor from './HexEditor.js'
-import { peekBuffer } from '../tamperApi.js'
 import { mergeUint8Arrays, parseHexdump, parseRaw } from '../format.js'
 import { OPERATIONS } from '../transforms.js'
 import { dirClass, dirLabel } from '../direction.js'
@@ -165,7 +164,7 @@ function chunksForView(viewMode, chunks) {
 // block only replaces that entry. Continuous view is a single editor over the merged
 // buffer, whose onChange collapses chunks to one entry — editing across former chunk
 // boundaries has no well-defined per-chunk meaning, so structure is discarded on edit.
-export default function TamperDetailPanel({ entry, onRelease, onDropConnection, paused, onContinue }) {
+export default function TamperDetailPanel({ peekBuffer, entry, onRelease, onDropConnection, paused, onContinue }) {
     const [viewMode,        setViewMode]       = useState('segmented') // 'segmented' | 'continuous'
     const [editMode,        setEditMode]       = useState('insert') // 'insert' | 'overwrite'
     const [chunks,          setChunks]         = useState([])

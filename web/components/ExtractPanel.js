@@ -1,7 +1,6 @@
 import { h } from 'preact'
 import { useState } from 'preact/hooks'
 import htm from 'htm'
-import { fetchDirectionChunks } from '../api.js'
 import { fmtAsRaw, fmtAsBase64, fmtAsHex, fmtAsHexdump, mergeUint8Arrays } from '../format.js'
 import { downloadBlob, acquireSaveHandle, writeToFileHandle } from '../download.js'
 import { DIR_C2S, DIR_S2C, DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
@@ -61,8 +60,8 @@ function downloadFallback(bytes, format, baseOffset) {
     downloadBlob(content, `extract${ext}`, mime)
 }
 
-async function fetchRange(session, stream, dir, fromOffset, toOffset) {
-    const chunks = await fetchDirectionChunks(session.id, stream.id, dir, fromOffset, toOffset)
+async function fetchRange(dbdumpApi, session, stream, dir, fromOffset, toOffset) {
+    const chunks = await dbdumpApi.fetchDirectionChunks(session.id, stream.id, dir, fromOffset, toOffset)
     const parts = []
     for (const chunk of chunks) {
         if (chunk.offset + chunk.data.length - 1 < fromOffset) continue
@@ -74,7 +73,7 @@ async function fetchRange(session, stream, dir, fromOffset, toOffset) {
     return mergeUint8Arrays(parts)
 }
 
-export default function ExtractPanel({ session, stream, direction, from, to, onDirectionChange, onFromChange, onToChange }) {
+export default function ExtractPanel({ dbdumpApi, session, stream, direction, from, to, onDirectionChange, onFromChange, onToChange }) {
     const [format,  setFormat]  = useState('raw')
     const [method,  setMethod]  = useState('clipboard')
     const [working, setWorking] = useState(false)
@@ -111,7 +110,7 @@ export default function ExtractPanel({ session, stream, direction, from, to, onD
         setStatus(null)
         try {
             const dir   = parseInt(direction, 10)
-            const bytes = await fetchRange(session, stream, dir, fromOffset, toOffset)
+            const bytes = await fetchRange(dbdumpApi, session, stream, dir, fromOffset, toOffset)
             if (method === 'clipboard') {
                 await navigator.clipboard.writeText(encodeForClipboard(bytes, format, fromOffset))
                 setStatus({ ok: true, msg: `Copied ${bytes.length} B` })

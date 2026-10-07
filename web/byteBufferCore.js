@@ -19,8 +19,6 @@ export const MAX_BUFFERED_BYTES    = 256 * 1024
 export const MAX_BUFFERED_SEGMENTS = 4096
 
 export const FILL_TARGET_BYTES = MAX_BUFFERED_BYTES / 2
-// Exported for a future caller centering a jump-to-stid fetch window on its own resolved
-// id — the same role BATCH plays for useChunkBuffer.js's callers today.
 export const FILL_TARGET_SEGMENTS = MAX_BUFFERED_SEGMENTS / 2
 
 // Per-adapter-call quantum: the amount asked for in any single fillForward/fillBackward
@@ -177,12 +175,26 @@ export function rowIndexOfWindow(windows, index) {
 // initialResumeWindow is the buffer's current edge window when it isn't fully loaded yet
 // (a still-growing huge frame); null when starting fresh (reload, or the edge was
 // already complete). Returns { addedBytes, addedSegments, addedRows, reachedEnd }.
-export async function fillToTarget(fill, handle, entity, windows, dir, boundaryStid, initialResumeWindow, targetBytes, targetSegments, generationRef, gen) {
+//
+// mustReachStid (optional): keeps the loop going past targetBytes/targetSegments — using
+// full WINDOW_STEP/SEGMENT_STEP quanta rather than the shrinking (and potentially
+// negative, which selectByBudget can't handle) remaining-budget clamp — until a segment
+// with this stid is actually present in windows, so a caller centering a jump-to-stid
+// load on a segment-count budget isn't silently short-changed by the byte budget binding
+// first (real chunk sizes routinely exceed the ~128-byte/segment average that budget
+// assumes). Bounded by MAX_BUFFERED_BYTES/MAX_BUFFERED_SEGMENTS regardless, so a target
+// pathologically far from boundaryStid in byte terms can't grow the buffer unboundedly —
+// it just falls through unreached, same degraded (caller-visible-as "not found") outcome
+// as before this existed, not a new failure mode.
+export async function fillToTarget(fill, handle, entity, windows, dir, boundaryStid, initialResumeWindow, targetBytes, targetSegments, generationRef, gen, mustReachStid) {
     let addedBytes = 0, addedSegments = 0, addedRows = 0, reachedEnd = false
     let resumeWindow = initialResumeWindow
     let boundary = boundaryStid
 
-    while (addedBytes < targetBytes && addedSegments < targetSegments) {
+    const targetReached = () => mustReachStid == null || windows.some(w => w.segment.stid === mustReachStid)
+    const underHardCap  = () => totalBytes(windows) < MAX_BUFFERED_BYTES && windows.length < MAX_BUFFERED_SEGMENTS
+
+    while ((addedBytes < targetBytes && addedSegments < targetSegments) || (!targetReached() && underHardCap())) {
         const remainingBytes    = targetBytes - addedBytes
         const remainingSegments = targetSegments - addedSegments
         const req = {
@@ -191,8 +203,13 @@ export async function fillToTarget(fill, handle, entity, windows, dir, boundaryS
             // needs the whole set, not just resumeWindow's own id, once more than one
             // sibling at that stid has been consumed across successive rounds.
             excludeIds:  resumeWindow ? idsAtStid(windows, dir, boundary) : [],
-            maxBytes:    Math.min(WINDOW_STEP, remainingBytes),
-            maxSegments: Math.min(SEGMENT_STEP, remainingSegments),
+            // Once the normal budget is used up (only possible while still chasing
+            // mustReachStid), remainingBytes/Segments go non-positive — fall back to a
+            // full quantum rather than clamping to that, since selectByBudget can't
+            // handle a zero/negative maxBytes (its "first candidate alone exceeds
+            // maxBytes" branch would compute a nonsensical negative-length openRange).
+            maxBytes:    remainingBytes > 0 ? Math.min(WINDOW_STEP, remainingBytes) : WINDOW_STEP,
+            maxSegments: remainingSegments > 0 ? Math.min(SEGMENT_STEP, remainingSegments) : SEGMENT_STEP,
         }
         req[dir === 1 ? 'afterStid' : 'beforeStid'] = boundary
 

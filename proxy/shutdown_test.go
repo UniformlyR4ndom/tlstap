@@ -51,7 +51,7 @@ func TestProxyStop_AcceptLoopReturns(t *testing.T) {
 
 	// Wait for the listener to actually be set (Start() races this test goroutine).
 	deadline := time.Now().Add(time.Second)
-	for p.listener == nil {
+	for l, _ := p.getListener(); l == nil; l, _ = p.getListener() {
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for listener to be set")
 		}

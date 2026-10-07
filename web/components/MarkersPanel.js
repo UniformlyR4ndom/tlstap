@@ -183,7 +183,7 @@ function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
     }
 
     return html`
-        <div class="markers-tab-row">
+        <div class="markers-tab-row" onclick=${() => onJump(marker)}>
             <span class="mtab-session">#${marker.session}</span>
             <span class="mtab-stream">#${marker.stream}</span>
             <span class=${'mtab-dir ' + dir}>${label}</span>
@@ -194,6 +194,7 @@ function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
                         class="mtab-label-input"
                         value=${draft}
                         oninput=${e => setDraft(e.target.value)}
+                        onclick=${e => e.stopPropagation()}
                         onblur=${commitEdit}
                         onkeydown=${e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') { setDraft(marker.label); setEditing(false) } }}
                         ref=${el => el?.focus()}
@@ -202,15 +203,14 @@ function MarkerRow({ marker, onRemove, onUpdateLabel, onJump }) {
                 : html`
                     <span
                         class=${'mtab-label' + (marker.label ? '' : ' mtab-label-empty')}
-                        onclick=${() => { setDraft(marker.label); setEditing(true) }}
-                        title="Click to edit"
+                        ondblclick=${e => { e.stopPropagation(); setDraft(marker.label); setEditing(true) }}
+                        title="Double-click to edit"
                     >
-                        ${marker.label || 'click to add note…'}
+                        ${marker.label || 'double-click to add note…'}
                     </span>
                 `
             }
-            <button class="btn mtab-go" type="button" onclick=${() => onJump(marker)}>Go</button>
-            <span class="mtab-del" onclick=${() => onRemove(marker.id)} title="Delete">×</span>
+            <span class="mtab-del" onclick=${e => { e.stopPropagation(); onRemove(marker.id) }} title="Delete">×</span>
         </div>
     `
 }

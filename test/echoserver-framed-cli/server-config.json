@@ -1,7 +1,21 @@
 {
+    "tls-updown": {
+        "listen": "127.0.0.1:8100",
+        "trigger-upgrade": "starttls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "tlsstop-c2s",
+        "trigger-downgrade-s2c": "tlsstop-s2c",
+        "tls-config": {
+            "cert-pem": "../certs/server.pem",
+            "cert-key": "../certs/server.key"
+        }
+    },
     "mtls-forced": {
         "listen": "127.0.0.1:8100",
-        "trigger": "tls",
+        "trigger-upgrade": "tls",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "c2s-plain",
+        "trigger-downgrade-s2c": "s2c-plain",
         "tls-config": {
             "cert-pem": "../certs/server.pem",
             "cert-key": "../certs/server.key",
@@ -13,7 +27,10 @@
     },
     "bulk-test": {
         "listen": "127.0.0.1:8100",
-        "trigger": "unused",
+        "trigger-upgrade": "unused",
+        "trigger-downgrade": "stoptls",
+        "trigger-downgrade-c2s": "c2s-plain",
+        "trigger-downgrade-s2c": "s2c-plain",
         "tls-config": {
             "cert-pem": "../certs/server.pem",
             "cert-key": "../certs/server.key"

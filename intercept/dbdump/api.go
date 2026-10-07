@@ -45,6 +45,10 @@ func (i *DbDumpInterceptor) RegisterRoutes(mux *http.ServeMux, basePath string) 
 	mux.HandleFunc("POST "+basePath+"/frames/by-seq", i.handleFramesBySeq)
 	mux.HandleFunc("POST "+basePath+"/frames/append", i.handleFramesAppend)
 	mux.HandleFunc("POST "+basePath+"/frames/clear", i.handleFramesClear)
+	mux.HandleFunc("GET "+basePath+"/framer-jobs", i.handleFramerJobsSocket)
+	mux.HandleFunc("POST "+basePath+"/framer-jobs/run", i.handleFramerJobsRun)
+	mux.HandleFunc("GET "+basePath+"/dissector-jobs", i.handleDissectorJobsSocket)
+	mux.HandleFunc("POST "+basePath+"/dissector-jobs/run", i.handleDissectorJobsRun)
 
 	scriptstore.RegisterRoutes(mux, basePath, i.scripts, i.onFramerScriptPut, i.onFramerScriptDelete)
 

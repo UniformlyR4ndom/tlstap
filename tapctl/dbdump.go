@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func dbdumpMain(args []string) {
@@ -47,6 +49,18 @@ func dbdumpMain(args []string) {
 		cmdDbdumpFrameProgress(args[1:])
 	case "frames-timeline":
 		cmdDbdumpFramesTimeline(args[1:])
+	case "chunks-timeline":
+		cmdDbdumpChunksTimeline(args[1:])
+	case "byte-range":
+		cmdDbdumpByteRange(args[1:])
+	case "chunks-follow":
+		cmdDbdumpChunksFollow(args[1:])
+	case "frames-follow":
+		cmdDbdumpFramesFollow(args[1:])
+	case "run-framer":
+		cmdDbdumpRunFramer(args[1:])
+	case "run-dissector":
+		cmdDbdumpRunDissector(args[1:])
 	case "script-list":
 		cmdDbdumpScriptList(args[1:])
 	case "script-get":
@@ -91,6 +105,15 @@ Usage:
   tapctl dbdump frame-progress --session N --stream N --script NAME --script-version HASH [--api URL]
   tapctl dbdump frames-timeline --session N --stream N --script NAME --script-version HASH
                                  [--start N | --before-stid N] [--n 50] [--api URL]
+  tapctl dbdump chunks-timeline --session N --stream N [--start N | --before-stid N] [--n 50] [--api URL]
+  tapctl dbdump byte-range --session N --stream N --direction N --offset N --length N [--api URL]
+  tapctl dbdump chunks-follow --session N --stream N [--start N] [--poll-ms 500] [--api URL]
+  tapctl dbdump frames-follow --session N --stream N --script NAME --script-version HASH
+                               [--start N] [--poll-ms 500] [--api URL]
+  tapctl dbdump run-framer --session N --stream N --script NAME [--api URL]
+  tapctl dbdump run-dissector --session N --stream N --direction N --frame-id N
+                               --framer-script NAME --framer-script-version HASH
+                               --dissect-script NAME [--api URL]
   tapctl dbdump script-list [--api URL]
   tapctl dbdump script-get --name NAME [--hash] [--api URL]
   tapctl dbdump script-put --name NAME (--file PATH | --file -) [--api URL]
@@ -120,6 +143,66 @@ for backward pagination — exactly one of the two, matching the server's own
 error than the server's own 400 would give). --n defaults to 50 like stid-stream/
 sgid-stream above, for the same reason (buffered into one JSON blob before printing);
 pass --n 0 for unlimited.
+
+chunks-timeline is frames-timeline's raw-chunk counterpart: same (session, stream)
+scoping minus a script/script-version key (chunks have none), same start/before-stid/n
+pagination convention, but metadata-only (id, direction, stid, time, offset, length) —
+no bytes; fetch those separately via chunk/chunk-stid or a byte-range read. Backs the
+same raw-view scrolling /segments used to (see CLAUDE.md's "dbdump Interceptor"
+section), merged across both directions in stid order.
+
+byte-range fetches an arbitrary [offset, offset+length) span for one direction,
+possibly spanning multiple underlying chunks — unlike "chunk", which only ever returns
+whole chunks by id. A single-range convenience wrapper over POST /byte-ranges' batched
+binary wire protocol (see CLAUDE.md's "dbdump Interceptor" section), which can request
+several ranges per call; this always sends exactly one entry. Prints
+{"offset","direction","requested_length","length","data_base64"} — "length" (and thus
+the decoded data) may come back shorter than --length, even 0: not an error, just means
+that much of the requested span isn't captured yet (a still-live stream) or ever will be
+(the stream's genuine end).
+
+chunks-follow/frames-follow are the only two commands in this group that don't exit once
+their initial request is answered: every other command here is a one-shot snapshot, so
+watching an actively-growing capture otherwise means polling by hand in a loop. Both run
+until killed (Ctrl-C), printing one JSON object per line (NDJSON, unlike every other
+command's single pretty-printed blob — the whole point is a caller can read output as it
+arrives) as new data appears, and re-poll after --poll-ms (default 500; clamped to a
+minimum of 100 regardless of what's passed) whenever a poll comes back empty. Neither
+needs a --n: there's no fixed batch size to ask for, just "keep going forever."
+chunks-follow reuses /stid-stream's WebSocket (its request/response loop already
+supports sending a fresh request after each "done" over one connection — no server
+change was needed), repeatedly asking for stid >= cursor and advancing cursor past the
+last stid seen; each line is shaped like stid-stream's own per-chunk output
+({"stid","chunk_id","direction","time","offset","data_base64"}). frames-follow instead
+repolls POST /frames/timeline (no WebSocket variant exists for frames), same
+(session, stream, script, script_version) key as frame-progress/frames-timeline; each
+line is one frame, shaped like frames-timeline's own entries
+({"id","ranges","meta","direction","stid","time","seq","virtual_offset"}). Frames are
+never computed here or anywhere server-side — frames-follow only ever shows what some
+client (typically a browser tab running catchUpFramer) is actively persisting via
+/frames/append for that exact key; it doesn't make anything happen on its own.
+
+run-framer asks a currently-connected browser tab (View menu's "Remote framer runs"
+toggle in the web UI, opted in explicitly — see web/CLAUDE.md's "Remote framer job
+listener" section) to run a framer script for real, through its own already-loaded
+frameRuntime.js — the same code path a manual Run click uses, not a separate
+implementation. Blocks until that browser reports success or failure (or the request
+times out server-side, or fails outright with 503 if no browser is connected right now).
+--script is a name only, no --script-version: unlike frame-progress/frames-timeline
+above, the browser resolves the script's own current content and version itself, the
+same way a manual Run does — there's no stale-version risk to guard against here. On
+success, use frames-follow/frames-timeline afterward to inspect what got persisted.
+
+run-dissector is run-framer's dissector-script sibling — same "ask a connected browser
+tab to run it for real" plumbing, same connection (View menu's "Remote dissector runs"
+toggle — a separate, independent opt-in from "Remote framer runs"). It identifies one
+already-persisted frame directly: --direction/--framer-script/--framer-script-version
+name the framer run that produced it (the same key frame-progress/frames-timeline use),
+and --frame-id is that frame's own id within that key (learnable from frames-timeline's
+or frames-follow's own "id" field). Unlike run-framer, dissection output is never
+persisted anywhere server-side — there's nothing to go inspect afterward the way
+frames-timeline works for a framer run — so a successful call prints the dissector
+script's own FieldNode[] tree directly, the same shape DissectPanel.js renders in the UI.
 
 script-list/-get/-put/-delete are plain REST CRUD wrappers over dbdump's framer-script
 store (scripts-dir; frame(state, chunk) scripts run in the browser to reassemble a
@@ -223,6 +306,17 @@ type frameTimelineKeyRequest struct {
 // around it — a real inconsistency in the wire protocol itself, not a typo here.
 type framesTimelineRequest struct {
 	frameTimelineKeyRequest
+	Start      *int64 `json:"start,omitempty"`
+	BeforeStid *int64 `json:"beforeStid,omitempty"`
+	N          int    `json:"n"`
+}
+
+// chunksTimelineRequest mirrors handleChunksTimeline's anonymous request struct
+// (intercept/dbdump/chunks.go) — framesTimelineRequest minus the script/script_version
+// key, since chunks have none.
+type chunksTimelineRequest struct {
+	Session    int64  `json:"session"`
+	Stream     int64  `json:"stream"`
 	Start      *int64 `json:"start,omitempty"`
 	BeforeStid *int64 `json:"beforeStid,omitempty"`
 	N          int    `json:"n"`
@@ -447,6 +541,7 @@ func cmdDbdumpSearch(args []string) {
 		Stream    int64 `json:"stream"`
 		Direction int   `json:"direction"`
 		Offset    int64 `json:"offset"`
+		Length    int64 `json:"length"`
 		Stid      int64 `json:"stid"`
 	}
 	all := []taggedMatch{} // never printed as JSON null, even with zero sessions/matches
@@ -460,13 +555,14 @@ func cmdDbdumpSearch(args []string) {
 			Stream    int64 `json:"stream"`
 			Direction int   `json:"direction"`
 			Offset    int64 `json:"offset"`
+			Length    int64 `json:"length"`
 			Stid      int64 `json:"stid"`
 		}
 		if err := json.Unmarshal(data, &matches); err != nil {
 			fail("parse search results for session %d: %v", s.ID, err)
 		}
 		for _, m := range matches {
-			all = append(all, taggedMatch{Session: s.ID, Stream: m.Stream, Direction: m.Direction, Offset: m.Offset, Stid: m.Stid})
+			all = append(all, taggedMatch{Session: s.ID, Stream: m.Stream, Direction: m.Direction, Offset: m.Offset, Length: m.Length, Stid: m.Stid})
 		}
 	}
 	printJSON(all)
@@ -923,6 +1019,301 @@ func cmdDbdumpFramesTimeline(args []string) {
 	}
 
 	data, err := httpPostJSON(*api, "/api/i/dbdump/frames/timeline", req)
+	if err != nil {
+		fail("%v", err)
+	}
+	printRawJSON(data)
+}
+
+func cmdDbdumpChunksTimeline(args []string) {
+	fs := flag.NewFlagSet("dbdump chunks-timeline", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	start := fs.Int64("start", 0, "first stid to fetch (inclusive); default unless --before-stid is given")
+	beforeStid := fs.Int64("before-stid", 0, "fetch backward instead, exclusive upper bound stid (mutually exclusive with --start)")
+	n := fs.Int("n", 50, "max chunks to fetch; 0 = unlimited")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+	if flagWasSet(fs, "start") && flagWasSet(fs, "before-stid") {
+		fail("--start and --before-stid are mutually exclusive")
+	}
+
+	req := chunksTimelineRequest{Session: *session, Stream: *stream, N: *n}
+	if flagWasSet(fs, "before-stid") {
+		req.BeforeStid = beforeStid
+	} else {
+		req.Start = start // defaults to 0 when neither flag is given
+	}
+
+	data, err := httpPostJSON(*api, "/api/i/dbdump/chunks/timeline", req)
+	if err != nil {
+		fail("%v", err)
+	}
+	printRawJSON(data)
+}
+
+// encodeByteRangeSignedLength mirrors intercept/dbdump/byteranges.go's
+// encodeSignedLength: the /byte-ranges wire entry's single signed length field's sign
+// encodes direction (negative = c2s, positive = s2c) — offset can legitimately be 0, so
+// length is the only field that can safely carry it.
+func encodeByteRangeSignedLength(direction int, magnitude int64) int64 {
+	if direction == 0 {
+		return -magnitude
+	}
+	return magnitude
+}
+
+func cmdDbdumpByteRange(args []string) {
+	fs := flag.NewFlagSet("dbdump byte-range", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	direction := fs.Int("direction", 0, "0 = client->server, 1 = server->client (required)")
+	offset := fs.Int64("offset", 0, "byte offset (required)")
+	length := fs.Int64("length", 0, "number of bytes to fetch, > 0 (required)")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream", "direction", "offset", "length"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+	if *length <= 0 {
+		fail("--length must be > 0")
+	}
+	if *direction != 0 && *direction != 1 {
+		fail("--direction must be 0 or 1")
+	}
+
+	var body [16]byte
+	binary.BigEndian.PutUint64(body[0:], uint64(*offset))
+	binary.BigEndian.PutUint64(body[8:], uint64(encodeByteRangeSignedLength(*direction, *length)))
+
+	path := fmt.Sprintf("/api/i/dbdump/byte-ranges?session=%d&stream=%d", *session, *stream)
+	data, err := httpPostRawBody(*api, path, body[:], "application/octet-stream")
+	if err != nil {
+		fail("%v", err)
+	}
+	if len(data) < 8 {
+		fail("response too short: %d bytes", len(data))
+	}
+	respLength := int64(binary.BigEndian.Uint64(data[:8]))
+	if int64(len(data)-8) < respLength {
+		fail("response truncated: header says %d bytes, got %d", respLength, len(data)-8)
+	}
+	payload := data[8 : 8+respLength]
+
+	printJSON(struct {
+		Offset          int64  `json:"offset"`
+		Direction       int    `json:"direction"`
+		RequestedLength int64  `json:"requested_length"`
+		Length          int64  `json:"length"`
+		DataBase64      string `json:"data_base64"`
+	}{
+		Offset: *offset, Direction: *direction, RequestedLength: *length, Length: respLength,
+		DataBase64: base64.StdEncoding.EncodeToString(payload),
+	})
+}
+
+// clampPollMs enforces chunks-follow/frames-follow's shared sanity floor: a poll
+// interval below 100ms is almost certainly a typo (e.g. seconds meant, not
+// milliseconds), and would otherwise busy-poll the server.
+func clampPollMs(ms int) int {
+	if ms < 100 {
+		return 100
+	}
+	return ms
+}
+
+func cmdDbdumpChunksFollow(args []string) {
+	fs := flag.NewFlagSet("dbdump chunks-follow", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	start := fs.Int64("start", 0, "first stid to fetch (inclusive)")
+	pollMs := fs.Int("poll-ms", 500, "delay between polls that found nothing new, in milliseconds (minimum 100)")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+	poll := time.Duration(clampPollMs(*pollMs)) * time.Millisecond
+
+	conn, err := dialWS(*api, "/api/i/dbdump/stid-stream")
+	if err != nil {
+		fail("connect: %v", err)
+	}
+	defer conn.Close()
+
+	type outChunk struct {
+		Stid       int64  `json:"stid"`
+		ChunkID    int64  `json:"chunk_id"`
+		Direction  int    `json:"direction"`
+		Time       int64  `json:"time"`
+		Offset     int64  `json:"offset"`
+		DataBase64 string `json:"data_base64"`
+	}
+
+	cursor := *start
+	enc := json.NewEncoder(os.Stdout)
+	for {
+		if err := conn.WriteJSON(stidStreamRequest{Session: *session, Stream: *stream, Start: cursor, N: 0}); err != nil {
+			fail("send request: %v", err)
+		}
+
+		found := false
+		for {
+			var f streamFrame
+			if err := conn.ReadJSON(&f); err != nil {
+				fail("read reply: %v", err)
+			}
+			if f.Error != "" {
+				fail("%s", f.Error)
+			}
+			if f.Done {
+				break
+			}
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				fail("read chunk data: %v", err)
+			}
+			if err := enc.Encode(outChunk{
+				Stid: f.Stid, ChunkID: f.ChunkID, Direction: f.Direction, Time: f.Time, Offset: f.Offset,
+				DataBase64: base64.StdEncoding.EncodeToString(data),
+			}); err != nil {
+				fail("write output: %v", err)
+			}
+			cursor = f.Stid + 1
+			found = true
+		}
+		if !found {
+			time.Sleep(poll)
+		}
+	}
+}
+
+// frameFollowRecord mirrors intercept/dbdump/frames.go's frameResponse — needed as a
+// real Go type (rather than frames-timeline's own printRawJSON passthrough) so each
+// polled batch can be re-emitted one line at a time and its Stid read back out to
+// advance the cursor.
+type frameFollowRecord struct {
+	ID     int64 `json:"id"`
+	Ranges []struct {
+		Offset int64 `json:"offset"`
+		Length int64 `json:"length"`
+	} `json:"ranges"`
+	Meta          *string `json:"meta"`
+	Direction     int     `json:"direction"`
+	Stid          int64   `json:"stid"`
+	Time          int64   `json:"time"`
+	Seq           int64   `json:"seq"`
+	VirtualOffset int64   `json:"virtual_offset"`
+}
+
+func cmdDbdumpFramesFollow(args []string) {
+	fs := flag.NewFlagSet("dbdump frames-follow", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	script := fs.String("script", "", "framer script name (required)")
+	scriptVersion := fs.String("script-version", "", "framer script's sha256 version, e.g. from \"dbdump script-get --hash\" (required)")
+	start := fs.Int64("start", 0, "first stid to fetch (inclusive)")
+	pollMs := fs.Int("poll-ms", 500, "delay between polls that found nothing new, in milliseconds (minimum 100)")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream", "script", "script-version"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+	poll := time.Duration(clampPollMs(*pollMs)) * time.Millisecond
+
+	key := frameTimelineKeyRequest{Session: *session, Stream: *stream, Script: *script, ScriptVersion: *scriptVersion}
+	cursor := *start
+	enc := json.NewEncoder(os.Stdout)
+	for {
+		data, err := httpPostJSON(*api, "/api/i/dbdump/frames/timeline", framesTimelineRequest{
+			frameTimelineKeyRequest: key, Start: &cursor, N: 0,
+		})
+		if err != nil {
+			fail("%v", err)
+		}
+		var frames []frameFollowRecord
+		if err := json.Unmarshal(data, &frames); err != nil {
+			fail("decode response: %v", err)
+		}
+		for _, fr := range frames {
+			if err := enc.Encode(fr); err != nil {
+				fail("write output: %v", err)
+			}
+			cursor = fr.Stid + 1
+		}
+		if len(frames) == 0 {
+			time.Sleep(poll)
+		}
+	}
+}
+
+func cmdDbdumpRunFramer(args []string) {
+	fs := flag.NewFlagSet("dbdump run-framer", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	script := fs.String("script", "", "framer script name (required)")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream", "script"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+
+	data, err := httpPostJSON(*api, "/api/i/dbdump/framer-jobs/run", struct {
+		Session int64  `json:"session"`
+		Stream  int64  `json:"stream"`
+		Script  string `json:"script"`
+	}{*session, *stream, *script})
+	if err != nil {
+		fail("%v", err)
+	}
+	printRawJSON(data)
+}
+
+func cmdDbdumpRunDissector(args []string) {
+	fs := flag.NewFlagSet("dbdump run-dissector", flag.ExitOnError)
+	api := fs.String("api", defaultAPI, "API server root")
+	session := fs.Int64("session", 0, "session id (required)")
+	stream := fs.Int64("stream", 0, "stream id (required)")
+	direction := fs.Int("direction", 0, "0 = client->server, 1 = server->client (required) — the framer run's direction for the target frame")
+	framerScript := fs.String("framer-script", "", "framer script name that produced the frame (required)")
+	framerScriptVersion := fs.String("framer-script-version", "", "framer script's sha256 version, e.g. from \"dbdump script-get --hash\" (required)")
+	frameID := fs.Int64("frame-id", 0, "per-direction frame id to dissect, e.g. from frames-timeline/frames-follow (required)")
+	dissectScript := fs.String("dissect-script", "", "dissector script name (required)")
+	fs.Parse(args)
+
+	for _, name := range []string{"session", "stream", "direction", "framer-script", "framer-script-version", "frame-id", "dissect-script"} {
+		if !flagWasSet(fs, name) {
+			fail("--%s is required", name)
+		}
+	}
+
+	data, err := httpPostJSON(*api, "/api/i/dbdump/dissector-jobs/run", struct {
+		Session             int64  `json:"session"`
+		Stream              int64  `json:"stream"`
+		Direction           int    `json:"direction"`
+		FramerScript        string `json:"framer_script"`
+		FramerScriptVersion string `json:"framer_script_version"`
+		FrameID             int64  `json:"frame_id"`
+		DissectScript       string `json:"dissect_script"`
+	}{*session, *stream, *direction, *framerScript, *framerScriptVersion, *frameID, *dissectScript})
 	if err != nil {
 		fail("%v", err)
 	}

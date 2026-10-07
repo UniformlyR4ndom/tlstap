@@ -12,11 +12,26 @@ Build: `go build .`; custom interceptors build their own `main` under `examples/
 Available on demand — prefer these over hand-rolled equivalents:
 - `jq` — JSON processing.
 - `yq` — YAML processing (e.g. `doc/openapi.yaml`).
-- `tapctl` — CLI for the tamper/dbdump WebSocket + REST APIs; see "Testing interceptor
-  APIs" below.
+- `tapctl` — CLI for the tamper/dbdump WebSocket + REST APIs; see "tapctl" below.
 
 If one of these isn't installed when needed, ask the user to install it rather than
 working around its absence.
+
+## Local Dev State
+
+`config.json`'s test proxies write real state to the repo root while running: SQLite
+files (`dump.sqlite`, `dump2.sqlite`, `core-kv.sqlite`, each with `-wal`/`-shm`
+siblings), `dump.pcap`, `/tmp/tamper.log`, etc. A `tlstap` process on the dev ports
+(8000/9090/...) may already be running — started by the user, not by the current
+session — holding these files open with real captured traffic the user cares about.
+
+**Never delete or truncate any existing file in this repo (or elsewhere) to get a clean
+slate for testing — check first (`lsof`/`ps` for who has it open, `git status` for
+whether it's tracked) and ask before removing anything you didn't create in the current
+session.** Deleting a file a running process has open doesn't free its data
+immediately, but once that process exits the data is gone for good — there is no
+"undo" once that happens. If you need an isolated instance, use a different config/port
+and a different state-file path instead of clearing the shared one.
 
 ## Code Style
 
@@ -70,7 +85,13 @@ proxy/              ← core proxy logic
   probe.go          ← Prober: ALPN probe via deliberate TLS handshake
   mode.go           ← Mode constants: ModePlain/ModeTls/ModeDetectTls/ModeMux
   settings.go       ← ConnSettings (per-connection resolved config)
-  buf_conn.go       ← BufferedConn: peek-capable wrapper for TLS detection
+  buf_conn.go       ← BufferedConn: peek-capable wrapper for TLS detection; serves data
+                      returned together with an error before the error
+  tls_record_conn.go ← tlsRecordConn: transport wrapper for tls.Server/tls.Client in detecttls
+                      that never lets a Read cross a TLS record boundary
+  buffering.go      ← BufferingInterceptor interface + ReleasedData (see "Buffering Interceptors")
+  dir_flow.go       ← chainForwarder: per-direction chain execution; dirFlow adds the release
+                      worker/barrier for chains with a buffering interceptor
   asn1.go, util.go  ← certificate formatting helpers
   api.go            ← ApiProvider optional interface for interceptor REST APIs
 intercept/          ← built-in interceptor implementations
@@ -103,16 +124,18 @@ web/                ← embedded web frontend (Preact + htm, no build step)
                       imported module", not a build failure)
   index.html        ← HTML shell, importmap, all CSS (dark theme)
   main.js           ← mounts App into #root
-  api.js            ← fetch/WebSocket wrappers for /api/i/dbdump/*
-  tamperApi.js      ← WebSocket wrappers for /api/i/tamper/* (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, log-file)
+  api.js            ← createDbDumpApi(basePath): fetch/WebSocket wrappers for one dbdump
+                      instance's REST API — GET /api/instances discovers available instances
+  tamperApi.js      ← createTamperApi(basePath): WebSocket wrappers for one tamper instance
+                      (openTamperControl, peekBuffer) plus plain REST wrappers (scripts, log-file)
   coreApiClient.js  ← direct-fetch fs.*/kv.* clients (createFsApi/createKvApi), dynamically imported inside each script runtime's own Worker; backs fs.*/kv.* uniformly across all three runtimes (framer/dissector/tamper) — see web/CLAUDE.md
-  dbdumpFramerApi.js ← REST wrappers for /api/i/dbdump/* framer-script CRUD + frame-progress/frames/frames-append (see "Framer scripts" in web/CLAUDE.md)
+  dbdumpFramerApi.js ← createDbDumpFramerApi(basePath): REST wrappers for one dbdump instance's framer-script CRUD + frame-progress/frames/frames-append (see "Framer scripts" in web/CLAUDE.md)
   frameRuntime.js   ← Worker bootstrap that runs a framer script's frame() function over pre-fetched chunks (no RPC bridge, unlike scriptRuntime.js — see web/CLAUDE.md)
   hpackDecode.js    ← decode-only HPACK (RFC 7541); exposed to framer scripts only, as framer.hpack.decode(bytes, table) — see "Framer scripts" in web/CLAUDE.md
-  framerRun.js      ← catchUpFramer(): orchestrates fetching un-framed chunks, running frameRuntime.js, and persisting each batch via dbdumpFramerApi.js
+  framerRun.js      ← createFramerRun(dbdumpApi, framerApi).catchUpFramer(): orchestrates fetching un-framed chunks, running frameRuntime.js, and persisting each batch via dbdumpFramerApi.js
   framerPrefs.js    ← localStorage: global default framer script + per-stream override (see "Framer scripts" in web/CLAUDE.md)
   dissectRuntime.js ← Worker bootstrap that runs a dissector script's dissect() function once over one frame's bytes (no RPC bridge, no batch/ack cycle, unlike frameRuntime.js — see "Dissector scripts" in web/CLAUDE.md)
-  dbdumpDissectApi.js ← REST wrappers for /api/i/dbdump/dissect/* script CRUD (same shape as dbdumpFramerApi.js's script functions, separate namespace)
+  dbdumpDissectApi.js ← createDbDumpDissectApi(dbdumpBasePath): REST wrappers for one dbdump instance's dissector-script CRUD (same shape as dbdumpFramerApi.js's script functions, separate namespace)
   dissectPrefs.js   ← localStorage: global default dissector script + per-stream override (see "Dissector scripts" in web/CLAUDE.md)
   format.js         ← shared byte-encoding helpers (fmtAsRaw/Base64/Hex/Ascii/Hexdump, mergeUint8Arrays)
   direction.js      ← direction constants/helpers (DIRNUM_C2S/DIRNUM_S2C, DIR_C2S/DIR_S2C, dirClass, dirLabel)
@@ -127,7 +150,7 @@ web/                ← embedded web frontend (Preact + htm, no build step)
   package.json      ← "type":"module" + `npm test` for the transforms/* unit tests (Node's built-in test runner; not embedded into the binary)
   vendor/           ← vendored ES modules (preact 10.25.4, htm 3.1.1, fflate 0.8.3)
   components/
-    App.js          ← root; owns top-level view (Analysis/Tamper), session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
+    App.js          ← root; owns top-level view (Analysis/Tamper), dbdump/tamper instance discovery+selection (GET /api/instances) and the per-instance api.js/dbdumpFramerApi.js/dbdumpDissectApi.js factory objects built from the selection, session/stream selection, view mode, menu bar, bottom panel, jumpTo, extract state, sidebar/bottom-panel sizing
     ListPanel.js    ← shared panel-header (title/badge/sort-toggle) + sorted/selectable item list, used by SessionList.js/StreamList.js
     SessionList.js  ← sessions panel, built on ListPanel.js (sort toggle asc/desc)
     StreamList.js   ← streams panel, built on ListPanel.js (sort toggle resets to asc on session change)
@@ -141,7 +164,7 @@ web/                ← embedded web frontend (Preact + htm, no build step)
     ExtractPanel.js ← "Extract" bottom-panel tab: fetch and save/copy a byte range in various formats
     TransformPanel.js ← "Transform" bottom-panel tab: a step pipeline that runs input bytes through encode/decode operations into an output panel
     MarkersPanel.js ← side panel listing session markers with inline label editing; import/export
-    TamperView.js   ← Tamper tab root: control connection lifecycle, live queue state, layout
+    TamperView.js   ← Tamper tab root, scoped to one tamper instance (basePath prop, remounted via key by App.js on instance switch): control connection lifecycle, live queue state, layout
     TamperStreamsList.js ← Tamper tab: per-stream list with intercept/watch toggle
     TamperQueueList.js   ← Tamper tab: list of currently-held buffers (one per stream+direction) across all streams
     TamperDetailPanel.js ← Tamper tab: selected buffer's chunks (via peek), segmented/continuous view, forward/drop/drop-connection, and a per-chunk context menu (drop/forward/split/merge)
@@ -152,8 +175,9 @@ examples/           ← standalone binaries showing how to write custom intercep
                       — a TLS record-layer framer; dbdump/dissect/tls-dissector.js — its
                       dissector counterpart, breaking one TLS record into its fixed
                       header fields; see "Framer scripts"/"Dissector scripts" below)
-test/               ← echo server/client helpers, CLI wrappers for manual testing, and tapctl/
-                      (one-shot test client for the tamper/dbdump WebSocket + REST APIs)
+tapctl/             ← one-shot CLI for driving the tamper/dbdump WebSocket + REST APIs by
+                      hand — see "tapctl" below
+test/               ← echo server/client helpers and other CLI wrappers for manual testing
 ```
 
 ## Proxy Modes
@@ -162,8 +186,60 @@ test/               ← echo server/client helpers, CLI wrappers for manual test
 |---|---|---|
 | `plain` | `ModePlain` | Plain TCP forwarding; TLS configs ignored |
 | `tls` | `ModeTls` | Full TLS MITM; terminates TLS on both sides |
-| `detecttls` | `ModeDetectTls` | Starts plain; detects TLS Client Hello and upgrades in-place |
+| `detecttls` | `ModeDetectTls` | Starts plain; detects TLS Client Hello and upgrades in-place; follows TLS shutdowns back to plain and re-upgrades (see below) |
 | `tls-mux` | `ModeMux` | TLS MITM with per-SNI routing to different upstreams/configs |
+
+## TLS Shutdown and Half-Close
+
+A clean end of one direction (EOF) ends only that direction; the connection lives on until the
+other direction ends too, or `defaultHalfCloseTimeout` (5 s, `proxy/conn_handler.go`) passes after
+the first clean end — extended while a buffering interceptor holds data. A read error other than
+a clean EOF (reset, `io.ErrUnexpectedEOF`, deadline) is fatal for both directions. Buffered data
+returned together with an EOF is always forwarded first.
+
+- **`plain`**: EOF on one side → FIN (`(*net.TCPConn).CloseWrite`) to the other.
+- **`tls` / `tls-mux`**: EOF (a `close_notify`) on one side → `(*tls.Conn).CloseWrite()` on the
+  other, i.e. a `close_notify` and nothing at TCP level. Go reports a clean `close_notify` and a
+  bare TCP close at a record boundary identically (RFC 8446 §6.1); both are treated as
+  `close_notify`. TLS 1.3 peers can keep sending after their peer's `close_notify`; many TLS 1.2
+  peers close fully instead, which ends the connection the same way.
+- **`detecttls`** (`forwardDetectTls`): each direction is its own state machine
+  (`stateUp`/`stateDown`, atomics): `fwdPlain` → `fwdTls` → `fwdTlsCloseNotify` → `fwdPlain`
+  (plaintext seen again) or → `fwdTerminated` (clean end, e.g. TCP FIN in plain state). Two flows
+  run: *up* (client → server) on the `HandleConnection` goroutine, *down* on a goroutine; each
+  owns its read side and write side (`ConnUpRead`/`ConnUpWrite`/`ConnDownRead`/`ConnDownWrite`,
+  swapped between the raw conns `TcpConnUp`/`TcpConnDown` and `*tls.Conn`s; the two flows never
+  swap the same field). A `close_notify` on one direction is translated to the *other* leg
+  (`CloseWrite()` there), then that direction reverts to plaintext; `ConnInfo.TLS` becomes `nil`
+  for it. The write deadline that `tls.Conn.CloseWrite()` leaves on the raw conn is reset before
+  plaintext is written. Direction-independent otherwise, so one direction can be plain while the
+  other is still TLS.
+  - **Re-upgrade** (a fresh `ClientHello` in the plain loop) only works while both directions are
+    `fwdPlain`/`fwdTlsCloseNotify`; in any other state the connection ends (see the TODO note on
+    how, since the explicit state check in `forwardDetectTlsUp` is not reached today). The up
+    flow signals the down flow on `upgradeChan`, pokes a read deadline on `TcpConnUp`, and waits
+    for `upgradeAckChan`, then drains the upstream (`drainConn`, until quiet for
+    `drainTimeoutMs`), runs both handshakes, swaps the conns and signals completion. Waits also
+    select on `done` (closed by `terminate()`) and, for the ack, on `downEnded` (closed when the
+    down flow returns), so neither side can be stranded. The downstream TLS info for the down
+    flow is handed over through `tlsInfoDown`, written before the completion signal.
+  - `ConnectionUpgraded` fires on every (re-)upgrade; there is no downgrade hook.
+  - Buffering interceptors are rejected in this mode for now (see "Buffering Interceptors").
+
+**Manual testing** (`test/echoserver-framed-cli`, `test/echoclient-framed-cli`; framed echo, one
+line per message, triggers are substrings of a message; configs in `server-config.json` /
+`client-config.json`, all overridable per config entry):
+
+| Config key | Default word | Effect |
+|---|---|---|
+| `trigger-upgrade` | `starttls` | both directions switch to TLS (only while both are plain) |
+| `trigger-downgrade` | `stoptls` | both directions leave TLS in lockstep (only while both are TLS) |
+| `trigger-downgrade-s2c` | `s2c-plain` | the server sends `close_notify` and answers in plaintext; the client keeps sending TLS |
+| `trigger-downgrade-c2s` | `c2s-plain` | the client sends `close_notify` and continues in plaintext; the server keeps answering in TLS |
+
+Both asymmetric triggers together (either order) leave both directions plain, so `starttls` can
+start a new session. Trigger words must not be substrings of each other (an empty word never
+matches). Run a `detecttls` proxy with `loglevel: debug` between them to watch the translation.
 
 ## Interceptor Interface (`proxy/interceptor.go`)
 
@@ -172,7 +248,7 @@ type Interceptor interface {
     Init(addr net.TCPAddr) error              // called once before first connection
     Finalize(addr net.TCPAddr)               // called on shutdown
     ConnectionEstablished(info *ConnInfo) error
-    ConnectionUpgraded(info *ConnInfo) error  // TLS upgrade completed; return ErrAbort to drop
+    ConnectionUpgraded(info *ConnInfo) error  // TLS upgrade completed (every time in detecttls); return ErrAbort to drop
     ConnectionTerminated(info *ConnInfo) error
     Intercept(info *ConnInfo, data []byte) ([]byte, error)
     // return empty slice to drop data; return ErrAbort to terminate connection
@@ -208,32 +284,53 @@ be read off the socket while the first is held. `tamper`'s original design (befo
 interface) hit exactly this limit, holding at most one chunk per direction at a time — see
 `intercept/tamper/CLAUDE.md`'s "No goroutine is parked per held chunk" note for how that changed.
 
-**Contract for implementers:**
+**Contract for implementers** (the authoritative version is the doc comment in
+`proxy/buffering.go`):
 - No constraint on combining a non-empty `Intercept()` return with something still pending — an
   implementation may forward part of what it received and keep holding the rest.
 - Must never release data that arrived later before data that arrived earlier, for a given
-  `(ConnID, direction)` — i.e. must preserve its own local FIFO. Global ordering across a chain
-  with multiple buffering interceptors falls out of composing this local guarantee at each stage;
-  `ConnHandler` enforces nothing itself beyond calling interceptors in chain order.
+  `(ConnID, direction)` — i.e. must preserve its own local FIFO, and `Intercept()` must not return
+  data unheld while earlier data is still held.
+- `HasPending` returning false means everything previously held has already been sent on the
+  release channel (state change and send happen under one lock).
+- Sends on the release channel may block (`tamper` sends under its own lock, over a channel of
+  capacity 1); `ConnHandler` always has a consumer for it and never holds a lock the interceptor
+  could be waiting for.
 - Must close the channel returned by `ReleaseChannel` once `ConnectionTerminated` has fired for
   that `ConnID`, and never send on it afterward.
 
-**`ConnHandler` mechanics** (`proxy/conn_handler.go`):
-- `forwardOneWay` (phase 1) is the direct blocking-read loop, unchanged in cost for any chain
-  without a buffering interceptor (`scanBuffering`, run once per connection, makes the check a
-  single cheap boolean). The first time a buffering interceptor reports pending data, it
-  transitions once, between loop iterations, into `forwardOneWayAsync` (phase 2): a `select`
-  between a `readPump` goroutine (owns all further `Read` calls for that direction, since Go can't
-  `select` on a plain blocking `net.Conn.Read`) and a merged release channel (`fanInReleases`,
-  supports multiple buffering interceptors per chain). A released chunk resumes the chain via
-  `interceptFrom(idx+1, ...)` (`intercept()` is a thin wrapper `interceptFrom(0, ...)`).
-- Every goroutine `forwardOneWayAsync` spawns races its sends against a `stop` channel closed via
-  `defer` on return, so nothing blocks forever handing data to an already-exited consumer (same
-  discipline `tamper`'s watcher teardown uses — see `intercept/tamper/CLAUDE.md`).
-- Wired into `forwardGeneric` (plain/tls/tls-mux) and post-upgrade `forwardDetectTls`; the
-  down-direction of `detecttls` and `drainConn` are a deliberate scope cut (still synchronous).
+**Supported scope:** `plain`, `tls`, `tls-mux`. At most one buffering interceptor per direction
+chain, and none in `detecttls` — both rejected by `Proxy.validateBufferingChains` at `Start()`
+(`forwardDetectTls` also refuses defensively). Extending this to `detecttls` is a TODO (see "TODO"): it reuses `dirFlow` and needs
+flush-before-transition rules.
+
+**`ConnHandler` mechanics** (`proxy/dir_flow.go`, `proxy/conn_handler.go`):
+- Every direction runs through a `chainForwarder` (`forward`, `waitDrained`, `hasHeld`,
+  `close`). Chains without a buffering interceptor get a `plainForwarder` (synchronous
+  intercept + write, zero overhead); the reader loop (`forwardOneWay`) is a plain blocking-`Read`
+  loop either way.
+- A chain with a buffering interceptor gets a `dirFlow`. The chain is split at the buffering
+  interceptor: the *head* (up to and including it) runs only on the reader's goroutine and
+  **outside** the lock — the interceptor may block on its own lock while sending a release — while
+  the *tail* plus the write run under `dirFlow.mu`, for fresh and released data alike. A released
+  chunk resumes the chain via `interceptFrom(idx+1, ...)` (`intercept()` is a thin wrapper
+  `interceptFrom(0, ...)`).
+- One **release worker goroutine per direction per connection** is the sole receiver of the
+  release channel. Before a fresh chunk enters the tail, the reader calls `sync()`, a barrier the
+  worker answers after draining everything already on the channel. That makes ordering exact: a
+  release sent before `Intercept()` returned is always written before that call's output. Polling
+  or merely consuming the channel would leave a window where a received-but-unprocessed release
+  gets overtaken (e.g. when a human switches off intercept mode).
+- `waitDrained` (used before propagating a clean EOF, so a close never overtakes held data) checks
+  `HasPending` **first** and only then runs the barrier — the other order lets a release that
+  lands in between slip past. `hasHeld` (used by the half-close timeout, which must not end a
+  connection while a human is deciding) follows the same rule.
+- A release error (`ErrAbort`) calls `terminate()` from the worker — the one place besides
+  `runFlows` that does — because the forwarding goroutines may be blocked in `Read`. Write errors
+  on the release path are logged and otherwise ignored.
 - `tamper` is the one production implementer (via `heldBuffer`); `proxy/buffering_test.go` has a
-  test-only fake for exercising `ConnHandler`'s mechanics in isolation.
+  test-only fake (capacity-1 channel, sends under its own lock, like `tamper`) plus tests for
+  ordering, close-after-release, abort, deadlock freedom and the half-close timeout.
 
 ## Writing a Custom Interceptor
 
@@ -274,7 +371,19 @@ Proxies reference server/client configs and interceptors by name (string keys). 
 
 Key TLS server options: `cert-pem`, `cert-key`, `alpn-preference`, `alpn-probe`, `alpn-probe-cache`, `keylog`.  
 Key TLS client options: `skip-verify`, `sni-passthrough`, `alpn-passthrough`, `roots`, `server-name`, `alpn`, `keylog`.  
-`api` key: `{"listen": "127.0.0.1:9090"}` — starts the REST API HTTP server on the given address.
+`api` key: `{"base-urls": ["http://127.0.0.1:9090"]}` — starts one REST API HTTP server per
+entry (all sharing the same handler), listening on that entry's `host:port`. Each URL
+must have an `http`/`https` scheme and no path. Any `https` entry needs `cert-pem`/
+`cert-key` (PEM paths, both required together) also set on `api` — one certificate shared
+by every `https` entry, not one per URL; missing/invalid when needed is a fatal startup
+error. Optional `client-roots`/`client-auth` (same fields/semantics as a TLS server
+config's own, above — `proxy.LoadCertPool`/`ParseClientAuthPolicy`) add client-certificate
+verification for every `https` entry, uniformly; `client-auth` defaults to no client cert
+requested at all when unset, so setting only `client-roots` does nothing on its own — set
+e.g. `"request"`/`"verify-if-given"` for optional mutual TLS, `"require-and-verify"` to
+make it mandatory. Also where core services are configured, under a nested
+`core-services` key (see "Core Services" below) — they have no purpose except being
+reached through this same server.
 
 ## ALPN Negotiation
 
@@ -300,17 +409,20 @@ Three strategies (configured on the server side):
 ## Core Services
 
 Utility services independent of any interceptor or proxy — see `core/CLAUDE.md` for full
-implementation details. Configured under a top-level `core` key in `config.json`;
-absence of a service's own key disables it entirely (same convention as an interceptor's
-`scripts-dir`). Each is wired directly in `cli.go` (`CoreService` interface, `cli/core.go`)
-right alongside `/ui/`'s own registration, not discovered from any proxy's interceptor
-list, and reachable at `/api/core/<name>/...` regardless of which proxies/interceptors
-are configured.
+implementation details. Configured under `api.core-services` in `config.json` — nested
+under `api` rather than a sibling top-level key since these services have no purpose
+except being reached through that same REST API server (unlike an interceptor's own
+optional REST API, which sits alongside proxying behavior that's independently
+meaningful with no `api` key present at all); absence of a service's own key disables it
+entirely (same convention as an interceptor's `scripts-dir`). Each is wired directly in
+`cli.go` (`CoreService` interface, `cli/core.go`) right alongside `/ui/`'s own
+registration, not discovered from any proxy's interceptor list, and reachable at
+`/api/core/<name>/...` regardless of which proxies/interceptors are configured.
 
 | Config key | Package | Config args |
 |---|---|---|
-| `core.kv` | `core/kv` | `file` (path to its own SQLite file, created if missing); general-purpose opaque key-value store, e.g. for sharing a small value (a crypto key exchanged on one connection) across streams/scripts/interceptors. REST API at `/api/core/kv` — see `doc/design/core-kv-store.md`. Script-facing wrapper: `kv.*` on all three script runtimes (`framer`/`dissector`/`tamper`) — see `web/CLAUDE.md`. |
-| `core.fs` | `core/fs` | `dir` (path, must already exist); scoped read/write/list access to one host directory. REST API at `/api/core/fs` — usable from any script/tool that can reach the API server, not tamper-specific. Script-facing wrapper: `fs.*` on all three script runtimes (`framer`/`dissector`/`tamper`), uniformly via a direct Worker `fetch()`; see `web/CLAUDE.md`. |
+| `api.core-services.kv` | `core/kv` | `file` (path to its own SQLite file, created if missing); general-purpose opaque key-value store, e.g. for sharing a small value (a crypto key exchanged on one connection) across streams/scripts/interceptors. REST API at `/api/core/kv` — see `doc/design/core-kv-store.md`. Script-facing wrapper: `kv.*` on all three script runtimes (`framer`/`dissector`/`tamper`) — see `web/CLAUDE.md`. Referred to below and elsewhere as `core.kv`, its Go package name — not a config path. |
+| `api.core-services.fs` | `core/fs` | `dir` (path, must already exist); scoped read/write/list access to one host directory. REST API at `/api/core/fs` — usable from any script/tool that can reach the API server, not tamper-specific. Script-facing wrapper: `fs.*` on all three script runtimes (`framer`/`dissector`/`tamper`), uniformly via a direct Worker `fetch()`; see `web/CLAUDE.md`. Referred to below and elsewhere as `core.fs`, its Go package name — not a config path. |
 
 ## REST API
 
@@ -322,9 +434,11 @@ type ApiProvider interface {
 }
 ```
 
-`cli.go` checks each built interceptor for this interface and calls `RegisterRoutes` with `/<proxy-name>/api/i/<interceptor-name>` as `basePath`. A single `http.ServeMux` is shared across all proxies; the server is started once after all proxies are wired up, only if `"api": {"listen": "..."}` is present in `config.json`.
+`cli.go` checks each built interceptor for this interface and calls `RegisterRoutes` with `/<proxy-name>/api/i/<interceptor-name>` as `basePath`. A single `http.ServeMux` is shared across all proxies and every `api.base-urls` entry's own server; servers are started once after all proxies are wired up, once per `base-urls` entry, only if `"api": {"base-urls": [...]}` is present and non-empty in `config.json`.
 
-**Canonical alias:** each interceptor type is also registered at `/api/i/<interceptor-name>` (once, on first occurrence). This is what the web frontend uses — it never needs to know the proxy name. The `canonicalRegistered map[string]bool` in `cli.go` prevents duplicate-pattern panics.
+**Canonical alias:** each interceptor type is also registered at `/api/i/<interceptor-name>` (once, on first occurrence), for tools like `tapctl` that only ever target one instance. The `canonicalRegistered map[string]bool` in `cli.go` prevents duplicate-pattern panics. The web frontend instead discovers every instance's own proxy-scoped path via `GET /api/instances` and lets the user pick one per tab — see "Web Frontend" below.
+
+**`GET /api/instances`:** returns every `ApiProvider`-implementing interceptor instance across all proxies, as a JSON array of `{"proxy": "...", "interceptor": "...", "basePath": "/<proxy-name>/api/i/<interceptor-name>"}`. Registered once, after every proxy is wired up.
 
 The web frontend is served unconditionally at `/ui/` (`GET /ui` → 302 redirect). It is embedded into the binary via `web.FS`.
 
@@ -347,29 +461,31 @@ alternative documented in `web/CLAUDE.md` (filesystem/key-value access for scrip
 `heldBuffer`, script storage — lives in `intercept/tamper/CLAUDE.md`**, loaded
 automatically when working in that directory.
 
-## Testing interceptor APIs (`test/tapctl/`)
+## tapctl (`tapctl/`)
 
 `tapctl` is a one-shot Go CLI (`tapctl <group> <command> [flags]`, one group per
 interceptor: `tamper`, `dbdump`) for driving the `dbdump`/`tamper` REST/WebSocket APIs
-by hand — build via `go build -o tapctl ./test/tapctl`. **Full command reference, usage
-examples, and `tapctl`-specific design notes live in `test/tapctl/CLAUDE.md`**, kept
+by hand — build via `go build -o tapctl ./tapctl`. **Full command reference, usage
+examples, and `tapctl`-specific design notes live in `tapctl/CLAUDE.md`**, kept
 separate from this file (loaded only when working in that directory) since it's a
 sizable, fairly self-contained document that mirrors the API rather than defining it.
 
 ## Key Implementation Details
 
 - **`ConnHandler.intercept()` / `interceptFrom()`** (`conn_handler.go`): `intercept` is a thin wrapper over `interceptFrom(0, ...)`, which folds interceptors from a given start index — used both for a normal full pass and to resume the chain right after a buffering interceptor releases data. On non-abort errors, logs a warning and forwards the previous data unchanged; the fold also breaks the moment data becomes empty, so remaining interceptors in that pass are never called.
-- **`forwardOneWay` / `forwardOneWayAsync`** (`conn_handler.go`): see "Buffering Interceptors" above for the full two-phase design (direct blocking read vs. pump+select).
-- **`forwardDetectTls`**: uses `BufferedConn.Peek()` to look for a TLS Client Hello without consuming bytes. On detection it sets a deadline on the upstream conn, signals via `upgradeChan`, drains outstanding data, then upgrades both sides.
-- **`terminate()`** uses `sync.Once` to set deadlines on both conns — this is the shutdown mechanism; errors in `forwardOneWay` trigger it. Note: `terminate()` calls `wg.Done()` unconditionally (once, via the `sync.Once`) regardless of which direction's goroutine called it — so `ConnHandler.forwardGeneric()`'s `wg.Wait()` can return, and `ConnectionTerminated` can fire, *before* the other direction's `forwardOneWay` goroutine has actually returned (e.g. while it's still mid-`Intercept()` call, or — for a `BufferingInterceptor` like `tamper` — mid-append to a buffer `ConnectionTerminated` is about to close; see `intercept/tamper/CLAUDE.md`'s "No goroutine is parked per held chunk" note). Interceptor code that reacts to `ConnectionTerminated` must not assume no other goroutine for the same `ConnID` can still be mid-`Intercept()`.
+- **`forwardOneWay`** (`conn_handler.go`): the per-direction read loop for `plain`/`tls`/`tls-mux`; hands every chunk to a `chainForwarder` (see "Buffering Interceptors" above). A clean `io.EOF` is a half-close: it waits for held data, then shuts down the write side of the destination (`closeWrite`: FIN, or `close_notify` for a `*tls.Conn`) and ends only this direction. Data returned together with an error is forwarded before the error is looked at.
+- **`forwardDetectTls`**: the up flow uses `BufferedConn.Peek()` to look for a TLS Client Hello without consuming bytes; the upgrade/downgrade machinery is described under "TLS Shutdown and Half-Close". The two `tls.Server`/`tls.Client` handshakes wrap their transports in `tlsRecordConn`.
+- **`runFlows` / `terminate()`**: every mode runs one direction on the `HandleConnection` goroutine and one in a goroutine. A flow returning an error calls `terminate()` (`sync.Once`: sets deadlines on both raw conns and closes `done`), which wakes the flow still blocked in `Read`. A flow returning `nil` ended its own direction cleanly (half-close); the other one may then continue for up to the half-close timeout (`defaultHalfCloseTimeout`, 5 s, per-handler override for tests), and the timeout is extended while a buffering interceptor holds data. `wg` counts only the goroutine flow, and `notifyConnTerminated` runs after `runFlows` has waited for it — interceptors reacting to `ConnectionTerminated` can rely on no `Intercept()` still running for that connection.
+- **`tlsRecordConn`** (`proxy/tls_record_conn.go`): `detecttls` wraps the transport handed to `tls.Server`/`tls.Client` in it so a `Read` never crosses a TLS record boundary. `tls.Conn` reads ahead into a private buffer, which would swallow plaintext (or a new `ClientHello`) that follows a `close_notify`.
+- **`BufferedConn`**: if the underlying `Read` returns data together with an error, the data is served first and the error is reported once the buffer is drained.
 - **`Prober`**: makes a real TLS dial with a `VerifyConnection` hook that captures the negotiated protocol then returns an error to abort immediately. Failures are counted; after `maxFailures=5` the cache gives up.
 - Package name in `proxy/` is `proxy`, matching the directory name. Import as `"tlstap/proxy"`.
 - `bufSize = 1<<16` (64 KB) — single shared read buffer per direction per connection.
-- `drainTimeoutMs = 10` microseconds (not milliseconds despite the name).
+- `drainTimeoutMs = 100` milliseconds.
 - **Graceful shutdown** (`cli.StartWithCli`, `proxy.Proxy`): `SIGINT`/`SIGTERM` trigger a
-  bounded sequence — stop every proxy's listener (`Proxy.Stop()`) and start the API
-  server's `http.Server.Shutdown()` together, wait (bounded, `drainTimeout`/
-  `apiShutdownTimeout`) for in-flight connections/requests to drain, *then* call every
+  bounded sequence — stop every proxy's listener (`Proxy.Stop()`) and start every
+  `api.base-urls` entry's own `http.Server.Shutdown()` together, wait (bounded,
+  `drainTimeout`/`apiShutdownTimeout`) for in-flight connections/requests to drain, *then* call every
   interceptor's `Finalize()` (`Proxy.Finalize()`, concurrently, bounded by
   `finalizeTimeout`) — draining before finalizing is what stops `Finalize()` (e.g.
   `dbdump` closing its DB) from racing a still-in-flight `Intercept()`/REST call against
@@ -386,7 +502,10 @@ Served at `/ui/` by the API HTTP server — Preact 10.25.4 + htm 3.1.1, no build
 vendored ES modules loaded via an importmap. Two top-level tabs: **Analysis** (browse
 captured/combined traffic, search, extract, and transform bytes) and **Tamper** (live
 intercept — hold/edit/drop/forward traffic by hand, or via a scripted `tamper.*`/`ctx.*`
-API running in a Worker). **Full component/hook reference, wire-level UI mechanics, and
+API running in a Worker). Multi-instance aware: `App.js` discovers every registered
+dbdump/tamper instance via `GET /api/instances` and lets the user pick which proxy's own
+instance each tab operates on (a selector only appears once more than one instance of a
+given type exists). **Full component/hook reference, wire-level UI mechanics, and
 the Transform panel's operation catalog live in `web/CLAUDE.md`**, loaded automatically
 when working in that directory.
 
@@ -397,7 +516,6 @@ when working in that directory.
 ## TODO
 
 Known gaps and deferred work.
-
 - **`doc/openapi.yaml`'s `{path}` parameters don't survive standard OpenAPI tooling.**
   `/api/core/fs/list/{path}` and `/api/core/fs/file/{path}` document `path` as a single
   `in: path` string, but the real route is a `{path...}` wildcard — standard tooling
@@ -447,60 +565,50 @@ Known gaps and deferred work.
   streams are WS tunnels (mirroring `http1-framer.js`'s `pendingMethods` tracking) and
   routing a tunnel stream's `DATA` payloads into that parser. Lower priority since a
   plain `new WebSocket(url)` still overwhelmingly bootstraps via HTTP/1.1 in practice.
-- **`tapctl dbdump` still has no coverage for `/byte-ranges`/`/chunks/timeline`.**
-  Originally filed 2026-09-01 covering the whole frame/byte-range gap (`/frames`,
-  `/frames/timeline`, `/frames/by-seq`, `/byte-ranges`, `/chunks/timeline` — see
-  `intercept/dbdump/CLAUDE.md` — had no `tapctl` command at all, only the older per-chunk
-  surface: `chunk`, `chunklist`, `stid-stream`, ...), surfaced by a session comparing
-  raw-SQLite vs. `tapctl` vs. direct REST calls as ways for Claude to inspect recorded
-  traffic: for anything involving framer/dissector output — a large and growing share of
-  real investigative questions — the only options were reading `dump.sqlite`'s `frames`
-  table directly (requires knowing the schema up front, no discovery mechanism) or raw
-  `curl` against the REST endpoints (requires reading Go source for the exact request
-  shape, since JSON field naming is an inconsistent mix of `snake_case`/camelCase across
-  structs; a malformed request silently returns `[]` instead of an error, so a wrong
-  guess reads as "no data" rather than "bad request").
-  **Done, same session:** `tapctl dbdump script-*`/`dissect-script-*` (dbdump had no
-  script-store CRUD at all before, only tamper did) plus a `--hash` flag on every
-  `*script-get` command across both interceptors, backed by a new `?hash=1` query param
-  on `scriptstore`'s shared GET handler (`intercept/scriptstore/CLAUDE.md`) — returns
-  `{"sha256":"..."}`, the exact `frames.script_version` value, instead of the content;
-  this was the prerequisite for `frame-progress`/`frames-timeline` (also done, same
-  session — the `beforeStid`-vs-snake_case wire inconsistency noted above was
-  reproduced faithfully rather than smoothed over, per `test/tapctl/CLAUDE.md`'s note)
-  to be usable standalone rather than just wrapped-but-unusable, since both require an
-  exact `script_version` the caller must already know.
-  **Still open:** `byte-ranges`/`chunks-timeline` — lower priority than the above was,
-  since `chunk`/`chunklist`/`stid-stream` already give reasonable raw-byte access; revisit
-  only if a real investigation actually needs them (e.g. `byte-ranges`' arbitrary-span
-  fetch, unlike `chunk`'s whole-chunk-only granularity).
-- **`tapctl core` had no `core/kv` coverage at all — done 2026-09-01.** Only `core/fs`
-  had commands (`fs-*`); `core/kv` (see `core/CLAUDE.md`) had none, despite the two
-  being documented as equally-standing core services. Added `kv-list`/`kv-read`/
-  `kv-write`/`kv-delete` (`test/tapctl/CLAUDE.md`'s "`tapctl core`" section) — CLI-only,
-  no backend change needed, since the REST API already fully existed. Verified live:
-  full write/list-with-prefix/read/delete/read-after-delete/idempotent-delete round trip
-  against a real `core.kv` store, plus the unconfigured-service `404` case.
-- **`tapctl dbdump search`'s mandatory `--session` — done 2026-09-01.** `search-text`
-  itself still requires a session server-side (`searchTextRequest.Session` is
-  non-optional there, unchanged) — before this, the only option without already knowing
-  which session holds a stream was enumerating `sessions` and looping `search` per
-  session by hand (done live, same session, to locate a stream by a header value it
-  contained). Fixed client-side only, no backend change (`test/tapctl/CLAUDE.md`'s
-  `search` bullet): `--session` is now optional and, when omitted, fans out across every
-  session from `sessions`, tagging each hit with a `session` field the raw per-session
-  response doesn't carry on its own. `--stream` now requires `--session` (a stream id is
-  only unique within a session, so a bare `--stream` in fan-out mode would silently hit a
-  different actual stream per session) — verified live: the guard rejects that
-  combination, single-session output is byte-for-byte unchanged, and the fan-out finds
-  the same match across sessions as the earlier by-hand loop did, correctly tagged.
+- **Buffering interceptors in `detecttls` mode.** Rejected at `Start()` today. Reuse `dirFlow`
+  (`proxy/dir_flow.go`); the reader flows stay synchronous, so the work is: (1) route every
+  direct `h.intercept` call site (plain loop, prefix read, `forwardTlsUpDowngradable`,
+  `drainConn`, the down flow) through a `chainForwarder`, with the destination looked up under
+  `dirFlow.mu` (a `func() net.Conn`) and every write-side swap made under that lock (the up flow
+  swaps `ConnDownWrite` during an upgrade, so it takes the down direction's lock too, always in
+  up-then-down order); (2) flush before transitions using `waitDrained` ("wait" policy — a held
+  chunk stalls the transition until released, `tamper`'s `hold-timeout-ms` being the escape
+  hatch): on a downgrade, that direction before `CloseWrite()`/the swap; on an upgrade, pause the
+  down flow, `drainConn`, then both directions, then handshake and swap, so held plaintext never
+  leaks into the new TLS session and later plaintext never overtakes held TLS data; (3) tests for
+  releases during a pause, during `CloseWrite`, EOF with held data, upgrade with held data.
+- **`detecttls` shutdown/upgrade cycles: known limitations and open questions.**
+  - The state checks for a `ClientHello` (both directions must be `fwdPlain`/`fwdTlsCloseNotify`)
+    and the prefix handling in `forwardDetectTlsUp` sit inside `if result.StartIndex > 0`, which
+    `search=false` (the only call) never takes, so they are dead code. A `ClientHello` in a bad
+    state still ends the connection, but late and by side effect: with the server side still in
+    TLS the proxy completes the downstream handshake and then fails writing to the leg whose write
+    side was shut down; with the server side already ended, the up flow's `downEnded` wait fails
+    the upgrade. Moving the two checks above the `if` would fail fast, before the drain and the
+    handshakes. Covered by `TestDetectTls_UpgradeWhileServerStillTlsEndsConnection` and
+    `TestDetectTls_UpgradeAfterUpstreamEndedDoesNotHang`.
+  - The half-close timeout is fixed (5 s, from the first clean end), not idle-based and not
+    configurable; it can cut off a legitimately slow response after a half-close.
+  - `ConnectionTerminated` sees `ConnInfo.TLS == nil` for a connection that has downgraded (it
+    is read from the current downstream conn); snapshot it if an interceptor needs the TLS info
+    at termination. There is no `ConnectionDowngraded` hook, and `info.TLS` can differ per
+    direction (one direction plain while the other is TLS).
+  - `tlsRecordConn` costs two reads per record on the upstream leg (the downstream leg reads
+    from a `BufferedConn`); a `BufferedConn` under it would batch them, but the plain reads
+    after a downgrade would then have to go through it instead of `TcpConnUp`.
+  - `drainConn` waits for `drainTimeoutMs` of silence, reset by every read, so a continuously
+    streaming upstream can hold an upgrade back indefinitely.
+  - Gating the whole feature behind an explicit opt-in (e.g. a `TlsServerConfig` field) was
+    considered; it is currently unconditional.
+  - Half-close is implemented for all modes (see "TLS Shutdown and Half-Close"), but a bare TCP
+    close after a `close_notify` cannot be told apart from an abrupt close at a record boundary.
 
 ## Dependencies
 
 - `github.com/google/gopacket` — pcap writing in `intercept/pcapdump/`
 - `github.com/smallnest/ringbuffer` — used in `proxy/buf_conn.go`
 - `modernc.org/sqlite` — pure-Go SQLite driver (no CGO), used by `intercept/dbdump/`
-- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go`/`intercept/tamper/api.go`; also used client-side by `test/tapctl` (the web frontend uses the browser's native `WebSocket` instead)
+- `github.com/gorilla/websocket` — WebSocket server in `intercept/dbdump/api.go`/`intercept/tamper/api.go`; also used client-side by `tapctl` (the web frontend uses the browser's native `WebSocket` instead)
 - `fflate` 0.8.3 (`web/vendor/fflate.module.js`) — zip/gzip/deflate/zlib support in `web/transforms/zip.js`/`compression.js`. Unmodified copy of the package's own unminified browser ESM build.
 - `crypto-js` 4.2.0 (`web/vendor/crypto-js.module.js`) — MD5/SHA1/SHA2 family + HMAC (`web/transforms/hash.js`/`mac.js`) and DES/TripleDES/RC4 (`web/transforms/encryption.js`). esbuild bundle, unminified; rebuild recipe in the file's header comment.
 - `hash-wasm` 4.12.0 (`web/vendor/hash-wasm-whirlpool.module.js`) — Whirlpool hash in `web/transforms/hash.js` (the one algorithm crypto-js lacks). esbuild bundle, unminified; rebuild recipe in the file's header comment.

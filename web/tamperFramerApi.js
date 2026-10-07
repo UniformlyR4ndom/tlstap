@@ -3,38 +3,45 @@
 // JSON/base64 wrapping). See doc/design/tamper-framer.md and intercept/tamper/CLAUDE.md's
 // "Script storage" section.
 
-const BASE = '/api/i/tamper/framer'
+// createTamperFramerApi(tamperBasePath) binds these to one tamper interceptor instance's
+// own base path, under its "/framer" segment — see tamperApi.js's createTamperApi for the
+// sibling factory covering the rest of that instance's REST/WebSocket API.
+export function createTamperFramerApi(tamperBasePath) {
+    const basePath = `${tamperBasePath}/framer`
 
-async function checkOk(res) {
-    if (!res.ok) {
-        let message = res.statusText
-        try {
-            const body = await res.json()
-            if (body.error) message = body.error
-        } catch {}
-        throw new Error(message)
+    async function checkOk(res) {
+        if (!res.ok) {
+            let message = res.statusText
+            try {
+                const body = await res.json()
+                if (body.error) message = body.error
+            } catch {}
+            throw new Error(message)
+        }
+        return res
     }
-    return res
-}
 
-export async function listFramerScripts() {
-    const res = await checkOk(await fetch(`${BASE}/scripts`))
-    return res.json()
-}
+    return {
+        async listFramerScripts() {
+            const res = await checkOk(await fetch(`${basePath}/scripts`))
+            return res.json()
+        },
 
-export async function getFramerScript(name) {
-    const res = await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`))
-    return res.text()
-}
+        async getFramerScript(name) {
+            const res = await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`))
+            return res.text()
+        },
 
-export async function putFramerScript(name, content) {
-    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/javascript' },
-        body: content,
-    }))
-}
+        async putFramerScript(name, content) {
+            await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/javascript' },
+                body: content,
+            }))
+        },
 
-export async function deleteFramerScript(name) {
-    await checkOk(await fetch(`${BASE}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
+        async deleteFramerScript(name) {
+            await checkOk(await fetch(`${basePath}/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' }))
+        },
+    }
 }

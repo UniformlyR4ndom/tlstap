@@ -31,6 +31,7 @@ type searchMatch struct {
 	Stream    int64 `json:"stream"`
 	Direction int   `json:"direction"`
 	Offset    int64 `json:"offset"`
+	Length    int64 `json:"length"`
 	Stid      int64 `json:"stid"`
 }
 
@@ -238,6 +239,7 @@ func (i *DbDumpInterceptor) searchNonContiguous(session, stream int64, direction
 				Stream:    stream,
 				Direction: direction,
 				Offset:    chunkOff + lo + int64(m[0]),
+				Length:    int64(m[1] - m[0]),
 				Stid:      stid,
 			})
 		}
@@ -344,6 +346,7 @@ func (i *DbDumpInterceptor) searchContiguous(session, stream int64, direction in
 						Stream:    stream,
 						Direction: direction,
 						Offset:    globalOff,
+						Length:    int64(m[1] - m[0]),
 						Stid:      stid,
 					})
 				}

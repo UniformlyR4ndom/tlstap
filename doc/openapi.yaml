@@ -5,7 +5,7 @@ info:
   version: 0.3.0
   description: |
     REST API exposed by the tlstap TLS intercepting proxy when the `dbdump`
-    and/or `tamper` interceptors are active and `"api": {"listen": "..."}` is
+    and/or `tamper` interceptors are active and `"api": {"base-urls": [...]}` is
     set in `config.json`.
 
     **Base path:** All endpoints are reachable at the canonical path
@@ -1381,6 +1381,238 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/i/dbdump/framer-jobs:
+    get:
+      tags: [framer]
+      summary: Browser-tab side of the remote framer-job relay
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). The
+        server never executes a framer script itself — this connection is
+        how a browser tab (opted in via the web UI's "Remote framer runs"
+        toggle) receives job requests pushed from `POST
+        /api/i/dbdump/framer-jobs/run` and reports results back, so that
+        request runs the *same* code path a manual Run click in the UI
+        does. Only one browser is tracked at a time; a new connection
+        replaces (and closes) whichever one was previously registered.
+
+        **Job push** (server → client, JSON text):
+        ```json
+        {"kind": "job", "job_id": "...", "session": N, "stream": N, "script": "..."}
+        ```
+        The browser resolves the script's current content and version
+        itself (the same way a manual Run does — no version is given
+        here) and runs it against the named stream.
+
+        **Result** (client → server, JSON text):
+        ```json
+        {"kind": "result", "job_id": "...", "ok": true}
+        {"kind": "result", "job_id": "...", "ok": false, "error": "..."}
+        ```
+        Sent once the browser's run finishes (or fails); `job_id` must
+        match the job it answers.
+      operationId: framerJobsSocket
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+
+  /api/i/dbdump/framer-jobs/run:
+    post:
+      tags: [framer]
+      summary: Ask a connected browser tab to run a framer script for real
+      description: |
+        A plain blocking REST call — the caller (typically `tapctl dbdump
+        run-framer`) stays a one-shot client rather than holding its own
+        WebSocket open. Dispatches the job to whichever browser tab is
+        currently connected via `GET /api/i/dbdump/framer-jobs` and waits
+        (up to a server-side timeout) for that tab to report a result.
+
+        No `script_version` is given — the connected browser resolves the
+        script's own current content and computes its version itself, the
+        same way a manual Run click does. On success, use
+        `POST /api/i/dbdump/frames/timeline` to inspect what got
+        persisted.
+      operationId: runFramerJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, script]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                script:
+                  type: string
+                  description: Framer script name (without the `.js` extension)
+      responses:
+        '200':
+          description: The connected browser reported success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: |
+            The connected browser reported a failure running the script
+            (e.g. an unknown script name) — the body's `error` is that
+            browser's own message, passed through unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: No browser is currently connected for framer jobs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '504':
+          description: Timed out waiting for the connected browser to report a result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/i/dbdump/dissector-jobs:
+    get:
+      tags: [framer]
+      summary: Browser-tab side of the remote dissector-job relay
+      description: |
+        Upgrades the connection to WebSocket (`Upgrade: websocket`). The
+        dissector-script sibling of `GET /api/i/dbdump/framer-jobs` — same
+        relay mechanics, a separate connection tracked independently of it
+        (a browser opts into "Remote dissector runs" separately from
+        "Remote framer runs").
+
+        **Job push** (server → client, JSON text):
+        ```json
+        {"kind": "job", "job_id": "...", "session": N, "stream": N, "direction": N, "framer_script": "...", "framer_script_version": "...", "frame_id": N, "dissect_script": "..."}
+        ```
+        Identifies one already-persisted frame directly — `direction`/
+        `framer_script`/`framer_script_version`/`frame_id` are the same
+        four-part key (plus session/stream) `frames.go`'s `frameKey` uses,
+        since a frame's id is only unique within it — plus which dissector
+        script to run against it. The browser resolves the dissector
+        script's own current content itself (no version given, same
+        reasoning as the framer-jobs relay).
+
+        **Result** (client → server, JSON text):
+        ```json
+        {"kind": "result", "job_id": "...", "ok": true, "nodes": [...]}
+        {"kind": "result", "job_id": "...", "ok": false, "error": "..."}
+        ```
+        Unlike a framer job's plain ok/error, a successful dissector job's
+        result carries the dissector's own field-tree output directly —
+        dissection is never persisted anywhere, so there is nothing to go
+        inspect afterward otherwise. `nodes` is the same `FieldNode[]`
+        shape `dissect(bytes, frame)` returns (see
+        `doc/design/packet-dissector.md`), passed through unparsed.
+      operationId: dissectorJobsSocket
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+
+  /api/i/dbdump/dissector-jobs/run:
+    post:
+      tags: [framer]
+      summary: Ask a connected browser tab to dissect one already-persisted frame for real
+      description: |
+        A plain blocking REST call, same shape as
+        `POST /api/i/dbdump/framer-jobs/run` — the caller (typically
+        `tapctl dbdump run-dissector`) stays a one-shot client. Dispatches
+        the job to whichever browser tab is currently connected via
+        `GET /api/i/dbdump/dissector-jobs` and waits (up to a server-side
+        timeout) for that tab to report a result.
+
+        The connected browser resolves the target frame itself (a plain
+        frame lookup by id within the given framer key) and its bytes,
+        and the dissector script's own current content — no
+        `dissect_script_version` is given, for the same reason
+        `framer-jobs/run` takes no framer-script version.
+      operationId: runDissectorJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, stream, direction, framer_script, framer_script_version, frame_id, dissect_script]
+              properties:
+                session:
+                  type: integer
+                  format: int64
+                  description: Session ID
+                stream:
+                  type: integer
+                  format: int64
+                  description: Stream ID
+                direction:
+                  type: integer
+                  description: '0 = client→server, 1 = server→client — the framer run''s direction for the target frame'
+                framer_script:
+                  type: string
+                  description: Framer script name that produced the frame (without the `.js` extension)
+                framer_script_version:
+                  type: string
+                  description: Framer script's sha256 content hash the frame was persisted under
+                frame_id:
+                  type: integer
+                  format: int64
+                  description: The frame's own per-direction id within the given framer key
+                dissect_script:
+                  type: string
+                  description: Dissector script name to run (without the `.js` extension)
+      responses:
+        '200':
+          description: The connected browser reported success
+          content:
+            application/json:
+              schema:
+                type: array
+                description: >-
+                  The dissector's own FieldNode[] output, passed through
+                  unparsed — see doc/design/packet-dissector.md for the
+                  field-node schema.
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: |
+            The connected browser reported a failure (e.g. an unknown
+            frame_id, or the dissector script itself throwing) — the
+            body's `error` is that browser's own message, passed through
+            unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: No browser is currently connected for dissector jobs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '504':
+          description: Timed out waiting for the connected browser to report a result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/i/tamper/control:
     get:
       tags: [tamper]
@@ -2091,7 +2323,7 @@ components:
 
     SearchMatch:
       type: object
-      required: [stream, direction, offset, stid]
+      required: [stream, direction, offset, length, stid]
       properties:
         stream:
           type: integer
@@ -2103,6 +2335,10 @@ components:
           type: integer
           format: int64
           description: Byte offset of the first matching byte within the direction stream
+        length:
+          type: integer
+          format: int64
+          description: Length of the match in bytes
         stid:
           type: integer
           format: int64

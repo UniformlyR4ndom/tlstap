@@ -1,6 +1,5 @@
 import { h } from 'preact'
 import htm from 'htm'
-import { listFramerScripts, getFramerScript, putFramerScript, deleteFramerScript } from '../tamperFramerApi.js'
 import { OPERATIONS_BY_CATEGORY } from '../transforms.js'
 import { NUMBER_TYPES } from '../transforms/numbers.js'
 import { camelCaseOpId, capitalizeTypeId } from '../transformWorkerApi.js'
@@ -46,11 +45,12 @@ const COMPLETIONS = { framer: TAMPER_FRAMER_COMPLETION_SHAPE }
 // via ScriptsCrudPanel.js's generic chrome. CRUD only, no Run/Stop — a framer script is
 // selected from the Scripts sub-tab's picker (TamperScriptsPanel.js) and runs composed
 // with whichever interception script is Run there, not from this panel.
-export default function TamperFramerScriptsPanel({ refreshSignal }) {
+export default function TamperFramerScriptsPanel({ tamperFramerApi, refreshSignal }) {
     return html`
         <${ScriptsCrudPanel}
             className="tamper-framer-scripts-view"
-            list=${listFramerScripts} get=${getFramerScript} put=${putFramerScript} del=${deleteFramerScript}
+            list=${tamperFramerApi.listFramerScripts} get=${tamperFramerApi.getFramerScript}
+            put=${tamperFramerApi.putFramerScript} del=${tamperFramerApi.deleteFramerScript}
             completions=${COMPLETIONS}
             refreshSignal=${refreshSignal}
             listWidthKey="tamperFramerScriptsListWidth"

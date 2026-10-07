@@ -82,14 +82,19 @@ about `core.kv` needs its own draining step (it has no in-flight connections, on
 requests already covered by `apiServer`'s own `Shutdown()`), but its `Finalize()` (closing
 the DB) must not race a still-in-flight REST call the way any interceptor's would.
 
-**Config shape**: a new top-level `core` section, one named block per service —
-`core.fs` (a future move of `tamper`'s existing `fs-root`, out of scope here) and
-`core.kv` are both meant to eventually live here:
+**Config shape**: a new section, one named block per service — `core.fs` (a future move
+of `tamper`'s existing `fs-root`, out of scope here) and `core.kv` are both meant to
+eventually live here. Originally specced as a top-level `core` key; later nested under
+`api` instead (`api.core-services`, root `CLAUDE.md`'s "Core Services" section), since
+these services have no purpose except being reached through that same API server:
 
 ```json
 {
-  "core": {
-    "kv": { "file": "kv.sqlite" }
+  "api": {
+    "base-urls": ["http://127.0.0.1:9090"],
+    "core-services": {
+      "kv": { "file": "kv.sqlite" }
+    }
   }
 }
 ```

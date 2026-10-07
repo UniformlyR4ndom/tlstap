@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -17,7 +18,20 @@ import (
 
 const (
 	bufSize        = 1 << 16 // TODO: make configurable
-	drainTimeoutMs = 10
+	drainTimeoutMs = 100
+)
+
+// how long one direction may keep running after the other one ended cleanly
+const defaultHalfCloseTimeout = 5 * time.Second
+
+type fwdState = uint32
+
+const (
+	fwdUnused         = fwdState(0)
+	fwdPlain          = fwdState(1)
+	fwdTls            = fwdState(2)
+	fwdTlsCloseNotify = fwdState(3)
+	fwdTerminated     = fwdState(4)
 )
 
 type ConnHandler struct {
@@ -31,22 +45,51 @@ type ConnHandler struct {
 	bufferingUp   []bufferingEntry
 	bufferingDown []bufferingEntry
 
-	ConnUp   net.Conn
-	ConnDown net.Conn
+	// treat reading and writing end separately to allow handling close_notify per direction
+	// in all modes except detecttls the Read and Write parts of a connection are identical
+	ConnUpRead    net.Conn
+	ConnUpWrite   net.Conn
+	ConnDownRead  net.Conn
+	ConnDownWrite net.Conn
+
+	// the raw TCP connections; only relevant in detecttls mode (except for cleanup in terminate)
+	TcpConnUp   net.Conn
+	TcpConnDown net.Conn
 
 	logger *logging.Logger
 
 	terminator sync.Once
 
+	// closed by terminate(); lets goroutines parked on a channel handshake bail out
+	done chan struct{}
+
+	// reports whether a buffering interceptor currently holds data; nil if there is none in the chains
+	holdPending func() bool
+
+	// overrides defaultHalfCloseTimeout if set
+	halfCloseTimeout time.Duration
+
+	// counts forwarding goroutines other than the one running HandleConnection
 	wg            sync.WaitGroup
 	eofEncounterd atomic.Bool
 
-	upgradeChan    chan bool
-	upgradeAckChan chan bool
+	upgradeChan    chan struct{}
+	upgradeAckChan chan struct{}
+
+	// closed when the down flow returns; lets a pending upgrade stop waiting for its ack
+	downEnded chan struct{}
+
+	// downstream TLS info of the latest upgrade; written before the upgrade-completion signal, read by the down flow after it
+	tlsInfoDown *TLSInfo
+
+	// only relevant for shutdown capability in detecttls mode
+	stateUp   atomic.Uint32
+	stateDown atomic.Uint32
 }
 
 func (h *ConnHandler) HandleConnection(conn net.Conn) error {
 	var err error
+	h.done = make(chan struct{})
 	switch h.Setting.Mode {
 	case ModePlain:
 		err = h.forwardPlain(conn)
@@ -68,7 +111,9 @@ func (h *ConnHandler) HandleConnection(conn net.Conn) error {
 }
 
 func (h *ConnHandler) forwardPlain(conn net.Conn) error {
-	h.ConnDown = conn
+	h.ConnDownRead = conn
+	h.ConnDownWrite = conn
+	h.TcpConnDown = conn
 	defer conn.Close()
 
 	connUp, err := net.Dial("tcp", h.Setting.ConnectEndpoint)
@@ -76,14 +121,18 @@ func (h *ConnHandler) forwardPlain(conn net.Conn) error {
 		return err
 	}
 
-	h.ConnUp = connUp
+	h.ConnUpRead = connUp
+	h.ConnUpWrite = connUp
+	h.TcpConnUp = connUp
 	defer connUp.Close()
 
 	return h.forwardGeneric()
 }
 
 func (h *ConnHandler) forwardTls(conn *tls.Conn) error {
-	h.ConnDown = conn
+	h.ConnDownRead = conn
+	h.ConnDownWrite = conn
+	h.TcpConnDown = conn
 	defer conn.Close()
 
 	connUp, err := tls.Dial("tcp", h.Setting.ConnectEndpoint, h.Setting.TlsClientConfig)
@@ -91,15 +140,17 @@ func (h *ConnHandler) forwardTls(conn *tls.Conn) error {
 		return err
 	}
 
-	h.ConnUp = connUp
+	h.ConnUpRead = connUp
+	h.ConnUpWrite = connUp
+	h.TcpConnUp = connUp
 	defer connUp.Close()
 
-	lDown := h.ConnDown.LocalAddr().String()
-	rDown := h.ConnDown.RemoteAddr().String()
+	lDown := conn.LocalAddr().String()
+	rDown := conn.RemoteAddr().String()
 	h.logger.Info("Downstream connection (%d): %s <-> %s (%s)", h.ConnId, rDown, lDown, SummarizeTlsConn(conn))
 
-	lUp := h.ConnUp.LocalAddr().String()
-	rUp := h.ConnUp.RemoteAddr().String()
+	lUp := connUp.LocalAddr().String()
+	rUp := connUp.RemoteAddr().String()
 	h.logger.Info("Upstream connection (%d): %s <-> %s (%s)", h.ConnId, lUp, rUp, SummarizeTlsConn(connUp))
 
 	serverCerts := connUp.ConnectionState().PeerCertificates
@@ -109,11 +160,20 @@ func (h *ConnHandler) forwardTls(conn *tls.Conn) error {
 }
 
 func (h *ConnHandler) forwardDetectTls(conn net.Conn) error {
-	h.upgradeChan = make(chan bool, 1)
-	h.upgradeAckChan = make(chan bool, 1)
+	if len(h.bufferingUp)+len(h.bufferingDown) > 0 {
+		return errors.New("buffering interceptors are not supported in detecttls mode")
+	}
+
+	h.stateUp.Store(fwdPlain)
+	h.stateDown.Store(fwdPlain)
+
+	h.upgradeChan = make(chan struct{}, 1)
+	h.upgradeAckChan = make(chan struct{}, 1)
+	h.downEnded = make(chan struct{})
 
 	bufConnDown := NewBufConn(conn, bufSize)
-	h.ConnDown = bufConnDown
+	h.ConnDownRead = bufConnDown
+	h.ConnDownWrite = bufConnDown
 	defer conn.Close()
 
 	connUp, err := net.Dial("tcp", h.Setting.ConnectEndpoint)
@@ -121,31 +181,38 @@ func (h *ConnHandler) forwardDetectTls(conn net.Conn) error {
 		return err
 	}
 
-	h.ConnUp = connUp
+	h.ConnUpRead = connUp
+	h.ConnUpWrite = connUp
 	defer connUp.Close()
 
-	h.logger.Info("Forwarding %s <-> %s", h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String())
+	h.TcpConnDown = conn
+	h.TcpConnUp = connUp
+
+	h.logger.Info("Forwarding %s <-> %s", conn.RemoteAddr().String(), connUp.RemoteAddr().String())
 	if err := h.notifyConnEstablished(); err != nil {
 		return err
 	}
 
-	h.wg.Add(1)
-	go h.forwardDetectTlsDown()
-	h.forwardDetectTlsUp(bufConnDown, false)
-
-	h.wg.Wait()
+	h.runFlows(
+		func() error { return h.forwardDetectTlsUp(bufConnDown, false) },
+		h.forwardDetectTlsDown,
+	)
 	h.notifyConnTerminated()
 	return nil
 }
 
 func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) error {
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(connDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
+	connInfo := NewConnInfo(connDown.RemoteAddr(), h.ConnUpRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
 	for {
 		peeked, err := connDown.Peek(buf)
+		if errors.Is(err, io.EOF) {
+			h.logger.Debug("Downstream connection %d closed its write side. Half-closing upstream.", h.ConnId)
+			h.stateUp.Store(fwdTerminated)
+			return closeWrite(h.TcpConnUp)
+		}
 		if err != nil {
 			h.logger.Error("Failed to peek downstream connection: %v", err)
-			h.terminate()
 			return err
 		}
 
@@ -158,13 +225,13 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 			read, err := connDown.Read(buf[:peeked])
 			assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 			assert.Assertf(read == peeked, "Peeked %d bytes but read %d bytes. This is a bug.", peeked, read)
+			h.stateUp.CompareAndSwap(fwdTlsCloseNotify, fwdPlain)
 
 			switch data, err := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); {
 			case err != nil:
-				h.terminate()
 				return err
 			case len(data) > 0:
-				h.ConnUp.Write(data)
+				h.ConnUpWrite.Write(data)
 			}
 
 			continue
@@ -172,64 +239,74 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 
 		// TLS client hello detected
 		if result.StartIndex > 0 {
+			if st := h.stateUp.Load(); st != fwdPlain && st != fwdTlsCloseNotify {
+				h.logger.Error("Got ClientHello for in unexpected state. Terminating connection.")
+				return errors.New("got ClientHello in unexpected upstream-flow state")
+			}
+
+			if st := h.stateDown.Load(); st != fwdPlain && st != fwdTlsCloseNotify {
+				h.logger.Error("Got ClientHello for in unexpected state. Terminating connection.")
+				return errors.New("got ClientHello in unexpected downstream-flow state")
+			}
+
 			read, err := connDown.Read(buf[:result.StartIndex])
 			assert.Assertf(err == nil, "Unexpected error: %v. This is a bug.", err)
 			assert.Assertf(read == result.StartIndex, "Expected to read %d bytes but read %d. This is a bug.", result.StartIndex, read)
+			h.stateUp.CompareAndSwap(fwdTlsCloseNotify, fwdPlain)
 
 			switch data, err := h.intercept(h.InterceptorsUp, buf[:read], &connInfo); {
 			case err != nil:
-				h.terminate()
 				return err
 			case len(data) > 0:
-				h.ConnUp.Write(data)
+				h.ConnUpWrite.Write(data)
 			}
 		}
 
 		h.logger.Debug("%d: TLS Client hello detected: %s", h.ConnId, hex.EncodeToString(result.ClientHello))
 
 		// signal start of TLS upgrade
-		h.upgradeChan <- true
-		h.ConnUp.SetReadDeadline(time.Now())
+		h.upgradeChan <- struct{}{}
+		h.TcpConnUp.SetReadDeadline(time.Now())
 
 		// wait for other forwarder to stop reading from upstream connection
-		<-h.upgradeAckChan
+		select {
+		case <-h.upgradeAckChan:
+		case <-h.done:
+			return nil
+		case <-h.downEnded:
+			return errors.New("upstream closed while a TLS upgrade was pending")
+		}
 
 		// drain upstream connection in case there is outstanding data sent from the sever to the client
-		info := NewConnInfo(h.ConnUp.RemoteAddr(), connDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
-		if err = h.drainConn(buf, h.ConnUp, h.ConnDown, h.InterceptorsDown, &info, drainTimeoutMs); err != nil {
+		info := NewConnInfo(h.ConnUpRead.RemoteAddr(), connDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(connDown))
+		if err = h.drainConn(buf, h.ConnUpRead, h.ConnDownWrite, h.InterceptorsDown, &info, drainTimeoutMs); err != nil {
 			h.logger.Error("Error while draining upstream connection: %v", err)
-			h.upgradeChan <- false
-			h.terminate()
 			return err
 		}
 
 		// perform TLS server handshake towards client
-		tlsConnDown := tls.Server(connDown, h.Setting.TlsServerConfig)
+		tlsConnDown := tls.Server(&tlsRecordConn{Conn: connDown}, h.Setting.TlsServerConfig)
 		if err = tlsConnDown.Handshake(); err != nil {
 			h.logger.Error("Error during TLS server handshake (towards client): %v", err)
-			h.upgradeChan <- false
-			h.terminate()
 			return err
 		}
 
 		// perform TLS client handshake towards server
-		tlsConnUp := tls.Client(h.ConnUp, h.Setting.TlsClientConfig)
+		tlsConnUp := tls.Client(&tlsRecordConn{Conn: h.ConnUpRead}, h.Setting.TlsClientConfig)
 		if err = tlsConnUp.Handshake(); err != nil {
 			h.logger.Error("Error during TLS client handshake (towards server): %v", err)
-			h.upgradeChan <- false
-
-			h.terminate()
 			return err
 		}
 
-		// Assigned before notifyConnUpgraded (not after, as previously): its own
-		// NewConnInfo calls read h.ConnDown/h.ConnUp, and need to see the upgraded
-		// connections to report TLS info on the ConnectionUpgraded call itself.
-		h.ConnDown = tlsConnDown
-		h.ConnUp = tlsConnUp
+		h.stateDown.Store(fwdTls)
+		h.stateUp.Store(fwdTls)
+
+		h.ConnDownRead = tlsConnDown
+		h.ConnDownWrite = tlsConnDown
+		h.ConnUpRead = tlsConnUp
+		h.ConnUpWrite = tlsConnUp
 
 		if err = h.notifyConnUpgraded(); err != nil {
-			h.terminate()
 			return err
 		}
 
@@ -241,52 +318,151 @@ func (h *ConnHandler) forwardDetectTlsUp(connDown *BufferedConn, search bool) er
 		rUp := tlsConnUp.RemoteAddr().String()
 		h.logger.Info("Upgraded upstream connection (%d): %s <-> %s (%s)", h.ConnId, lUp, rUp, SummarizeTlsConn(tlsConnUp))
 
-		// connInfo was built before the upgrade (TLS: nil baked in) and is reused for the
-		// rest of this direction's lifetime below — refresh it now that h.ConnDown
-		// reflects the upgraded connection.
-		connInfo.TLS = tlsInfoFromConn(h.ConnDown)
+		h.tlsInfoDown = tlsInfoFromConn(tlsConnDown)
+		connInfo.TLS = h.tlsInfoDown
 
 		// signal completion of TLS upgrade
-		h.upgradeChan <- true
-		return h.forwardOneWay(tlsConnDown, tlsConnUp, buf, h.InterceptorsUp, &connInfo, h.bufferingUp)
+		h.upgradeChan <- struct{}{}
+		err = h.forwardTlsUpDowngradable(buf, &connInfo)
+		if errors.Is(err, io.EOF) && h.stateUp.Load() == fwdTlsCloseNotify {
+			continue
+		} else {
+			return err
+		}
 	}
 }
 
 func (h *ConnHandler) forwardDetectTlsDown() error {
+	defer close(h.downEnded)
+
 	buf := make([]byte, bufSize)
-	connInfo := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfo := NewConnInfo(h.ConnUpRead.RemoteAddr(), h.ConnDownRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
 
 	for {
-		read, err := h.ConnUp.Read(buf)
-		switch {
-		case err == nil:
+		read, err := h.ConnUpRead.Read(buf)
+
+		// forward what we read, regardless of potential error
+		if read > 0 {
 			switch data, err := h.intercept(h.InterceptorsDown, buf[:read], &connInfo); {
 			case err != nil:
-				h.terminate()
 				return err
 			case len(data) > 0:
-				h.ConnDown.Write(data)
+				h.ConnDownWrite.Write(data)
 			}
+		}
+
+		switch {
+		case err == nil:
+			if read > 0 {
+				// received data after close_notify; the connection continues in plain mode
+				h.stateDown.CompareAndSwap(fwdTlsCloseNotify, fwdPlain)
+			}
+
+			continue
+		case errors.Is(err, io.EOF):
+			if h.stateDown.Load() == fwdTls {
+				h.logger.Debug("Got EOF while reading from upstream connection %d in TLS state. This may indicate close_notify or full TCP connection teardown.", h.ConnId)
+
+				// assuming close_notify from server here
+				// if the EOF turns out to originate from a full TCP connection teardown, we will notice that later
+				connDownWriteTls, ok := h.ConnDownWrite.(*tls.Conn)
+				assert.Assertf(ok, "h.ConnDownWrite not an instance of tls.Conn although in TLS state. This is a bug.")
+				h.stateDown.Store(fwdTlsCloseNotify)
+				if err := connDownWriteTls.CloseWrite(); err != nil {
+					h.logger.Error("Got EOF in connection %d while sending close_notify. Terminating connection.", h.ConnId)
+					return err
+				}
+
+				connInfo.TLS = nil
+
+				// from now on write plaintext (if any) to downstream
+				h.ConnDownWrite = h.TcpConnDown
+				h.ConnDownWrite.SetWriteDeadline(time.Time{})
+
+				// from now on read plaintext (if any) from upstream
+				h.ConnUpRead = h.TcpConnUp
+			} else {
+				h.logger.Debug("Upstream connection %d closed its write side. Half-closing downstream.", h.ConnId)
+				h.stateDown.Store(fwdTerminated)
+				return closeWrite(h.TcpConnDown)
+			}
+
 		case len(h.upgradeChan) > 0 && errors.Is(err, os.ErrDeadlineExceeded):
 			<-h.upgradeChan
 
 			// signal that this routine is no longer reading from the upstream connection
-			h.upgradeAckChan <- true
+			h.upgradeAckChan <- struct{}{}
 
 			// wait for completion of the TLS upgrade
-			<-h.upgradeChan
+			select {
+			case <-h.upgradeChan:
+			case <-h.done:
+				return nil
+			}
 
-			// connInfo was built before the upgrade (TLS: nil baked in) and is reused for
-			// the rest of this direction's lifetime — refresh it now that h.ConnDown
-			// reflects the upgraded connection (forwardDetectTlsUp performs the actual
-			// handshake and reassigns h.ConnDown/h.ConnUp; this goroutine only pauses
-			// through it via the upgradeChan/upgradeAckChan handshake above).
-			connInfo.TLS = tlsInfoFromConn(h.ConnDown)
+			connInfo.TLS = h.tlsInfoDown
+
 		default:
 			h.logger.Error("Failed to read from upstream connection: %v", err)
-			h.terminate()
 			return err
 		}
+	}
+}
+
+func (h *ConnHandler) forwardTlsUpDowngradable(buf []byte, info *ConnInfo) error {
+	for {
+		read, err := h.ConnDownRead.Read(buf)
+
+		// forward what we read, regardless of potential error
+		if read > 0 {
+			switch data, err := h.intercept(h.InterceptorsUp, buf[:read], info); {
+			case err != nil:
+				return err
+			case len(data) > 0:
+				h.ConnUpWrite.Write(data)
+			}
+		}
+
+		switch {
+		case err == nil:
+			// nothing to do since read data was already forwarded trough interceptors
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			if !h.eofEncounterd.Load() {
+				h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
+			}
+			return err
+
+		case errors.Is(err, io.EOF):
+			assert.Assertf(h.stateUp.Load() == fwdTls, "Got EOF in upstream flow outside of TLS state. This is a bug.")
+			h.logger.Debug("Got EOF while reading from downstream connection %d (%s <-> %s) in TLS state. This may indicate close_notify or full TCP connection teardown.", info.ConnID, info.SrcEndpoint, info.DstEndpoint)
+
+			// assume close_notify from client
+			// if the EOF turns out to originate from a full TCP connection teardown, we will notice that later
+			connUpWriteTls, ok := h.ConnUpWrite.(*tls.Conn)
+			assert.Assertf(ok, "h.ConnUpWrite not an instance of tls.Conn although in TLS state. This is a bug.")
+			if err := connUpWriteTls.CloseWrite(); err != nil {
+				h.logger.Error("Got EOF in connection %d (%s <-> %s) while sending close_notify. Terminating connection.", info.ConnID, info.SrcEndpoint, info.DstEndpoint)
+				return err
+			}
+
+			info.TLS = nil
+
+			// from now on write plaintext (if any) to upstream
+			h.ConnUpWrite = h.TcpConnUp
+			h.ConnUpWrite.SetWriteDeadline(time.Time{})
+
+			// from now on read plaintext (if any) from downstream
+			h.ConnDownRead = h.TcpConnDown
+
+			h.stateUp.Store(fwdTlsCloseNotify)
+			return err // back to forwardDetectTlsUp
+
+		default:
+			h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
+			h.eofEncounterd.Store(true)
+			return err
+		}
+
 	}
 }
 
@@ -295,33 +471,37 @@ func (h *ConnHandler) forwardDetectTlsDown() error {
 func (h *ConnHandler) drainConn(b []byte, connIn, connOut net.Conn, interceptors []Interceptor, info *ConnInfo, timeoutMs int) error {
 	defer connIn.SetReadDeadline(time.Time{})
 	for {
-		connIn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Microsecond))
+		connIn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
 		read, err := connIn.Read(b)
-		switch {
-		case errors.Is(err, os.ErrDeadlineExceeded):
-			return nil
-		case err == nil:
+		if read > 0 {
 			switch data, err := h.intercept(interceptors, b[:read], info); {
 			case err != nil:
 				return err
 			case len(data) > 0:
 				connOut.Write(data)
 			}
+		}
+
+		switch {
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			return nil
+		case err == nil:
+			continue
 		default:
 			return err
 		}
+
 	}
 }
 
 // forward up and down through the respective interceptors
-// works for both plain and TLS mode (but not tls TLS detection mode)
 func (h *ConnHandler) forwardGeneric() error {
 	bufDown := make([]byte, bufSize)
 	bufUp := make([]byte, bufSize)
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoUp := NewConnInfo(h.ConnDownRead.RemoteAddr(), h.ConnUpRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
+	connInfoDown := NewConnInfo(h.ConnUpRead.RemoteAddr(), h.ConnDownRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
 
-	h.logger.Info("Forwarding %s <-> %s", h.ConnDown.RemoteAddr().String(), h.ConnUp.RemoteAddr().String())
+	h.logger.Info("Forwarding %s <-> %s", h.ConnDownRead.RemoteAddr().String(), h.ConnUpRead.RemoteAddr().String())
 	if err := h.notifyConnEstablished(); err != nil {
 		return err
 	}
@@ -330,19 +510,24 @@ func (h *ConnHandler) forwardGeneric() error {
 		return err
 	}
 
-	h.wg.Add(1)
-	go h.forwardOneWay(h.ConnDown, h.ConnUp, bufUp, h.InterceptorsUp, &connInfoUp, h.bufferingUp)
-	h.forwardOneWay(h.ConnUp, h.ConnDown, bufDown, h.InterceptorsDown, &connInfoDown, h.bufferingDown)
+	fwdUp := h.newForwarder(h.InterceptorsUp, h.bufferingUp, &connInfoUp, h.ConnUpWrite)
+	fwdDown := h.newForwarder(h.InterceptorsDown, h.bufferingDown, &connInfoDown, h.ConnDownWrite)
+	if len(h.bufferingUp)+len(h.bufferingDown) > 0 {
+		h.holdPending = func() bool { return fwdUp.hasHeld() || fwdDown.hasHeld() }
+	}
 
-	h.wg.Wait()
+	h.runFlows(
+		func() error { return h.forwardOneWay(h.ConnUpRead, h.ConnDownWrite, bufDown, fwdDown, &connInfoDown) },
+		func() error { return h.forwardOneWay(h.ConnDownRead, h.ConnUpWrite, bufUp, fwdUp, &connInfoUp) },
+	)
 	h.notifyConnTerminated()
 	return nil
 }
 
 // TODO: what to do on errors in ConnectionEstablished for any interceptor?
 func (h *ConnHandler) notifyConnEstablished() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoUp := NewConnInfo(h.ConnDownRead.RemoteAddr(), h.ConnUpRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
+	connInfoDown := NewConnInfo(h.ConnUpRead.RemoteAddr(), h.ConnDownRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
 	if err := h.notifyEstablished(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}
@@ -355,8 +540,8 @@ func (h *ConnHandler) notifyConnEstablished() error {
 }
 
 func (h *ConnHandler) notifyConnUpgraded() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoUp := NewConnInfo(h.ConnDownRead.RemoteAddr(), h.ConnUpRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
+	connInfoDown := NewConnInfo(h.ConnUpRead.RemoteAddr(), h.ConnDownRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
 	if err := h.notifyUpgraded(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}
@@ -369,8 +554,8 @@ func (h *ConnHandler) notifyConnUpgraded() error {
 }
 
 func (h *ConnHandler) notifyConnTerminated() error {
-	connInfoUp := NewConnInfo(h.ConnDown.RemoteAddr(), h.ConnUp.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
-	connInfoDown := NewConnInfo(h.ConnUp.RemoteAddr(), h.ConnDown.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDown))
+	connInfoUp := NewConnInfo(h.ConnDownRead.RemoteAddr(), h.ConnUpRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
+	connInfoDown := NewConnInfo(h.ConnUpRead.RemoteAddr(), h.ConnDownRead.RemoteAddr(), h.ConnId, tlsInfoFromConn(h.ConnDownRead))
 	if err := h.notifyTerminated(h.InterceptorsUp, &connInfoUp); err != nil {
 		return err
 	}
@@ -382,16 +567,18 @@ func (h *ConnHandler) notifyConnTerminated() error {
 	return nil
 }
 
-// forwardOneWay is phase 1 (synchronous) of one direction's forwarding loop: a direct blocking
-// read, run the interceptor chain, write. Behavior and cost are unchanged from before buffering
-// interceptors existed as long as buffering is empty (the common case for every interceptor in
-// the codebase today) or none of them ever actually holds anything for this connection. The one
-// exception is the lazy, one-way transition into forwardOneWayAsync (phase 2), taken the first
-// time a buffering interceptor reports it's holding something — from that point on this goroutine
-// never calls srcConn.Read directly again for the remainder of the connection.
-func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, interceptors []Interceptor, info *ConnInfo, buffering []bufferingEntry) error {
+// forwardOneWay forwards srcConn to dstConn. A clean EOF on srcConn shuts down the write side of dstConn
+// (FIN, or close_notify for a TLS conn) and ends this direction with a nil error.
+func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, fwd chainForwarder, info *ConnInfo) error {
+	defer fwd.close()
 	for {
-		r, err := srcConn.Read(buf)
+		read, err := srcConn.Read(buf)
+		if read > 0 {
+			if err := fwd.forward(buf[:read]); err != nil {
+				return err
+			}
+		}
+
 		switch {
 		case err == nil:
 			// ok
@@ -400,205 +587,31 @@ func (h *ConnHandler) forwardOneWay(srcConn, dstConn net.Conn, buf []byte, inter
 				h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
 			}
 			return err
+		case errors.Is(err, io.EOF):
+			h.logger.Debug("Connection %d (%s -> %s): source closed its write side. Half-closing destination.", info.ConnID, info.SrcEndpoint, info.DstEndpoint)
+
+			// held data must not be overtaken by the close
+			if err := fwd.waitDrained(); err != nil {
+				return err
+			}
+
+			return closeWrite(dstConn)
 		default:
 			h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
 			h.eofEncounterd.Store(true)
-			h.terminate()
 			return err
-		}
-
-		if r == 0 {
-			continue
-		}
-
-		data, err := h.intercept(interceptors, buf[:r], info)
-		if err != nil {
-			h.terminate()
-			return err
-		}
-		if len(data) > 0 {
-			dstConn.Write(data)
-		}
-		// Deliberately not exclusive with the write above: a buffering interceptor may forward
-		// part of what it received and still be holding the rest (see the contract note on
-		// BufferingInterceptor), so both a write and a transition can be warranted for the same
-		// chunk. len(buffering) > 0 short-circuits anyPending away entirely whenever this
-		// direction's chain has no buffering interceptor at all.
-		if len(buffering) > 0 && anyPending(buffering, info) {
-			return h.forwardOneWayAsync(srcConn, dstConn, interceptors, info, buffering)
-		}
-	}
-}
-
-type pumpMsg struct {
-	data []byte
-	err  error
-}
-
-// readPump owns all further srcConn.Read calls for this direction once forwardOneWayAsync starts
-// it, so the outer select loop can wait on a channel instead of a blocking Read. Keeps its own
-// scratch buffer, never shared with the consumer, and copies out a right-sized slice per read
-// before sending — the consumer's slice is then safe to hold onto while the pump loops back to
-// Read again, which is what lets the pump read ahead instead of lockstep-waiting on the consumer.
-// Reuses the exact same EOF/deadline/other-error classification forwardOneWay uses, relayed to the
-// consumer via pumpMsg instead of a direct return, so shutdown behavior doesn't diverge between
-// the pre- and post-transition phases.
-//
-// Every send to out races against stop, closed by forwardOneWayAsync right before it returns —
-// without this, a pump whose consumer already exited via the release-channel arm of the select
-// would block forever handing off its next (or final, error) message to nobody, leaking the
-// goroutine. Same discipline tamper's watcher teardown already uses for the same reason: close a
-// dedicated stop channel, don't rely on the data channel itself or on buffering to save you.
-func (h *ConnHandler) readPump(srcConn net.Conn, info *ConnInfo, out chan<- pumpMsg, stop <-chan struct{}) {
-	scratch := make([]byte, bufSize)
-	for {
-		r, err := srcConn.Read(scratch)
-		switch {
-		case err == nil:
-			if r > 0 {
-				data := make([]byte, r)
-				copy(data, scratch[:r])
-				select {
-				case out <- pumpMsg{data: data}:
-				case <-stop:
-					return
-				}
-			}
-		case errors.Is(err, os.ErrDeadlineExceeded):
-			if !h.eofEncounterd.Load() {
-				h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
-			}
-			select {
-			case out <- pumpMsg{err: err}:
-			case <-stop:
-			}
-			return
-		default:
-			h.logger.Info("Terminating connection %d (%s <-> %s). Reason: %v", info.ConnID, info.SrcEndpoint, info.DstEndpoint, err)
-			h.eofEncounterd.Store(true)
-			h.terminate()
-			select {
-			case out <- pumpMsg{err: err}:
-			case <-stop:
-			}
-			return
-		}
-	}
-}
-
-type releaseMsg struct {
-	chainIdx int
-	data     []byte
-	err      error
-}
-
-// fanInReleases merges every buffering interceptor's release channel for this direction into one,
-// tagging each message with its originating chain index so the consumer knows where to resume the
-// interceptor chain (see interceptFrom). Closes the returned channel only once every source
-// channel has closed — i.e. once every buffering interceptor has torn down for this ConnID+info,
-// per the BufferingInterceptor contract that it must close its channel on ConnectionTerminated.
-//
-// Both the receive from each source channel and the send to out race against stop for the same
-// reason readPump does: once forwardOneWayAsync has returned via some other arm, nothing may be
-// left trying to hand data to it.
-func fanInReleases(buffering []bufferingEntry, info *ConnInfo, stop <-chan struct{}) <-chan releaseMsg {
-	out := make(chan releaseMsg)
-	var wg sync.WaitGroup
-	wg.Add(len(buffering))
-	for _, e := range buffering {
-		idx, ch := e.idx, e.bi.ReleaseChannel(info)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case rd, ok := <-ch:
-					if !ok {
-						return
-					}
-					select {
-					case out <- releaseMsg{chainIdx: idx, data: rd.Data, err: rd.Err}:
-					case <-stop:
-						return
-					}
-				case <-stop:
-					return
-				}
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-	return out
-}
-
-// forwardOneWayAsync is phase 2 of one direction's forwarding loop, entered exactly once (see
-// forwardOneWay) and never left: a select between the read pump (new inbound data) and the
-// buffering interceptors' merged release channel (previously-held data ready to continue through
-// the rest of the chain). Terminates and logs identically to forwardOneWay regardless of which
-// arm triggers it, so shutdown behavior is the same whether or not a direction ever buffered
-// anything.
-func (h *ConnHandler) forwardOneWayAsync(srcConn, dstConn net.Conn, interceptors []Interceptor, info *ConnInfo, buffering []bufferingEntry) error {
-	stop := make(chan struct{})
-	defer close(stop) // lets readPump and fanInReleases's relay goroutines exit however they're
-	// currently blocked, the moment this function returns via either select arm below.
-
-	pumpCh := make(chan pumpMsg) // unbuffered: pump blocks handing off, preserving the same
-	// backpressure the direct blocking-read loop provides today.
-	go h.readPump(srcConn, info, pumpCh, stop)
-	releaseCh := fanInReleases(buffering, info, stop)
-
-	for {
-		select {
-		case msg := <-pumpCh:
-			if msg.err != nil {
-				return msg.err
-			}
-			data, err := h.intercept(interceptors, msg.data, info)
-			if err != nil {
-				h.terminate()
-				return err
-			}
-			if len(data) > 0 {
-				dstConn.Write(data)
-			}
-
-		case rel, ok := <-releaseCh:
-			if !ok {
-				// Every buffering interceptor for this (ConnID, direction) has torn down —
-				// treat as connection-terminated, not as an empty release. Must be handled via
-				// the two-value receive specifically: a closed channel is always ready to
-				// receive, so failing to check ok here would busy-loop this select arm forever.
-				h.terminate()
-				return nil
-			}
-			if rel.err != nil {
-				h.terminate()
-				return rel.err
-			}
-			data, err := h.interceptFrom(rel.chainIdx+1, interceptors, rel.data, info)
-			if err != nil {
-				h.terminate()
-				return err
-			}
-			if len(data) > 0 {
-				dstConn.Write(data)
-			}
 		}
 	}
 }
 
 // bufferingEntry records a BufferingInterceptor's position in an interceptor chain, resolved
-// once per connection (see scanBuffering) so ConnHandler never needs to re-assert interceptor
-// types on the hot path.
+// once per connection
 type bufferingEntry struct {
 	idx int
 	bi  BufferingInterceptor
 }
 
-// scanBuffering finds every BufferingInterceptor in interceptors, in chain order. Called once per
-// connection (in newHandler, proxy.go) — interceptors chains are short, so this is negligible.
+// scanBuffering finds every BufferingInterceptor in interceptors, in chain order and extracts it's index.
 func scanBuffering(interceptors []Interceptor) []bufferingEntry {
 	var out []bufferingEntry
 	for idx, i := range interceptors {
@@ -609,23 +622,12 @@ func scanBuffering(interceptors []Interceptor) []bufferingEntry {
 	return out
 }
 
-// anyPending reports whether any of the given buffering interceptors currently holds anything
-// for info's (ConnID, direction).
-func anyPending(buffering []bufferingEntry, info *ConnInfo) bool {
-	for _, e := range buffering {
-		if e.bi.HasPending(info) {
-			return true
-		}
-	}
-	return false
-}
-
 func (h *ConnHandler) intercept(interceptors []Interceptor, data []byte, info *ConnInfo) ([]byte, error) {
 	return h.interceptFrom(0, interceptors, data, info)
 }
 
-// interceptFrom runs interceptors[startIdx:] over data in order, exactly like intercept but
-// windowed — used both for a normal full pass (startIdx 0, via intercept) and to resume the chain
+// interceptFrom runs interceptors[startIdx:] over data in order
+// used both for a normal full pass (startIdx 0, via intercept) and to resume the chain
 // right after a buffering interceptor releases data (startIdx = that interceptor's index + 1).
 func (h *ConnHandler) interceptFrom(startIdx int, interceptors []Interceptor, data []byte, info *ConnInfo) ([]byte, error) {
 	if interceptors == nil {
@@ -653,13 +655,87 @@ func (h *ConnHandler) interceptFrom(startIdx int, interceptors []Interceptor, da
 	return data, nil
 }
 
+// runFlows runs asyncFlow in a goroutine and mainFlow on the caller; whichever ends first terminates the other.
+func (h *ConnHandler) runFlows(mainFlow, asyncFlow func() error) {
+	var graceOnce sync.Once
+	var graceWg sync.WaitGroup
+	stopGrace := make(chan struct{})
+
+	endFlow := func(err error) {
+		if err != nil {
+			h.terminate()
+			return
+		}
+
+		graceOnce.Do(func() {
+			graceWg.Add(1)
+			go func() {
+				defer graceWg.Done()
+				h.terminateAfterGrace(stopGrace)
+			}()
+		})
+	}
+
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		endFlow(asyncFlow())
+	}()
+
+	endFlow(mainFlow())
+	h.wg.Wait()
+
+	// nothing may query the interceptors once the caller reports the connection as terminated
+	close(stopGrace)
+	graceWg.Wait()
+}
+
+// terminateAfterGrace terminates the connection once the half-close timeout has passed, but not while a
+// buffering interceptor still holds data (a human may be deciding about it).
+func (h *ConnHandler) terminateAfterGrace(stop <-chan struct{}) {
+	timeout := h.halfCloseTimeout
+	if timeout == 0 {
+		timeout = defaultHalfCloseTimeout
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+		case <-stop:
+			return
+		}
+
+		if h.holdPending == nil || !h.holdPending() {
+			h.terminate()
+			return
+		}
+
+		timer.Reset(timeout)
+	}
+}
+
+// closeWrite shuts down the write side of a raw connection, signaling EOF to its peer.
+func closeWrite(conn net.Conn) error {
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		return fmt.Errorf("%T does not support CloseWrite", conn)
+	}
+
+	return cw.CloseWrite()
+}
+
 func (h *ConnHandler) terminate() {
 	h.terminator.Do(
 		func() {
 			now := time.Now()
-			h.ConnDown.SetDeadline(now)
-			h.ConnUp.SetDeadline(now)
-			h.wg.Done()
+
+			// TcpConnDown and TcpConnUp are set in any mode but only really used in detecttls mode
+			h.TcpConnDown.SetDeadline(now)
+			h.TcpConnUp.SetDeadline(now)
+			close(h.done)
 		})
 }
 

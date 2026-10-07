@@ -1,7 +1,6 @@
 import { h } from 'preact'
 import { useState, useEffect } from 'preact/hooks'
 import htm from 'htm'
-import { getDissectScript } from '../dbdumpDissectApi.js'
 import { runDissector } from '../dissectRuntime.js'
 import { fmtAsAscii, fmtAsHex, fmtAsHexdump, fmtAsBase64, fmtAsRaw, parseBase64 } from '../format.js'
 
@@ -133,7 +132,7 @@ function FieldNode({ node, depth, frameOffset, frameBytes, onNodeClick, onFieldC
 // frame.offset/bytes are the loaded window's own (see TrafficView.js's onHeaderClick),
 // not necessarily the segment's full declared span for a still-partially-loaded huge
 // frame; dissection simply runs on whatever's currently available, no dedicated fetch.
-export default function DissectPanel({ selectedFrame, dissectScripts, dissectorSelected, onDissectorSelect, onNodeClick, style }) {
+export default function DissectPanel({ dissectApi, selectedFrame, dissectScripts, dissectorSelected, onDissectorSelect, onNodeClick, style }) {
     const [nodes,   setNodes]   = useState(null)
     const [loading, setLoading] = useState(false)
     const [error,   setError]   = useState(null)
@@ -159,7 +158,7 @@ export default function DissectPanel({ selectedFrame, dissectScripts, dissectorS
         setError(null)
         ;(async () => {
             try {
-                const content = await getDissectScript(dissectorSelected)
+                const content = await dissectApi.getDissectScript(dissectorSelected)
                 const result = await runDissector(dissectorSelected, content, selectedFrame.bytes, selectedFrame.frame)
                 if (!cancelled) setNodes(result)
             } catch (e) {

@@ -1,20 +1,18 @@
 import { h } from 'preact'
-import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks'
 import htm from 'htm'
-import { getChunkStid, getByteStid } from '../api.js'
-import { getFramerScript, clearStreamFrames } from '../dbdumpFramerApi.js'
-import { catchUpFramer, sha256Hex } from '../framerRun.js'
+import { sha256Hex, createFramerRun, streamTlsInfo } from '../framerRun.js'
 import { loadStreamFramerScript, saveStreamFramerScript, loadResumeScript, saveResumeScript } from '../framerPrefs.js'
 import { loadStreamDissectScript, saveStreamDissectScript } from '../dissectPrefs.js'
 import HexDump, { ROW_HEIGHT } from './HexDump.js'
 import DissectPanel from './DissectPanel.js'
 import ResizeHandle from './ResizeHandle.js'
 import { useResizableLayout } from '../useResizableLayout.js'
-import { useByteBuffer, FILL_TARGET_SEGMENTS } from '../useByteBuffer.js'
-import { openConnection as openChunkSegments, fillForward as fillChunkForward, fillBackward as fillChunkBackward } from '../chunkSegments.js'
-import { openConnection as openFrameSegments, fillForward as fillFrameForward, fillBackward as fillFrameBackward } from '../frameSegments.js'
+import { useByteBuffer } from '../useByteBuffer.js'
+import { createChunkSegmentsAdapter } from '../chunkSegments.js'
+import { createFrameSegmentsAdapter } from '../frameSegments.js'
 import { fmtByteSize, fmtDuration, fmtLogArgs } from '../format.js'
-import { DIRNUM_C2S, DIRNUM_S2C } from '../direction.js'
+import { DIRNUM_C2S, DIRNUM_S2C, dirLabel } from '../direction.js'
 
 const html = htm.bind(h)
 
@@ -22,20 +20,22 @@ function isClosed(stream) {
     return !!stream.end
 }
 
-// The downstream (client-facing) TLS session's negotiated parameters, or null for a
-// plain-mode proxy or a detecttls connection that hasn't upgraded (yet) — mirrors
-// proxy.ConnInfo.TLS's own nil convention. tls_version is the presence check (matches
-// the backend's own NULL-guard column — see dbdump's ConnectionUpgraded).
-function streamTlsInfo(stream) {
-    return stream.tls_version != null
-        ? { sni: stream.sni, alpn: stream.alpn, version: stream.tls_version, cipherSuite: stream.cipher_suite }
-        : null
-}
-
-export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeader, jumpTo, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts, onFramerLog, onFramerLogReset, dissectScripts }) {
+export default function TrafficView({ dbdumpApi, framerApi, dissectApi, stream, globalOffset, sizeFormat, pinHeader, jumpTo, onJumpError, refreshKey, latestStid, markers, onAddMarker, onRemoveMarker, onSetExtractStart, onSetExtractEnd, onSetExtractRange, onLeaveStream, jumpRef, framerScripts, onFramerLog, onFramerLogReset, dissectScripts }) {
     const [totalBytes, setTotalBytes] = useState({ up: -1, down: -1 })
+    const chunkAdapter = useMemo(() => createChunkSegmentsAdapter(dbdumpApi), [dbdumpApi])
+    const frameAdapter = useMemo(() => createFrameSegmentsAdapter(dbdumpApi, framerApi), [dbdumpApi, framerApi])
+    const { catchUpFramer } = useMemo(() => createFramerRun(dbdumpApi, framerApi), [dbdumpApi, framerApi])
     const viewHeightRef = useRef(0)
     const scrollTopRef = useRef(0)
+    const pinHeaderRef = useRef(pinHeader)
+    pinHeaderRef.current = pinHeader
+    // Tracks the jumpTo.version last (about to be) handled by the jump effect below —
+    // read fresh each render (not itself a hook) so hasPendingJump is already correct by
+    // the time useByteBuffer's own entity-change effect runs in the same commit; updated
+    // inside the jump effect itself once it starts handling a version, so this is true for
+    // exactly the one render where a genuinely new jump is still unprocessed.
+    const lastJumpVersionRef = useRef(0)
+    const hasPendingJump = !!jumpTo && jumpTo.version !== lastJumpVersionRef.current
 
     // Framer state. frameState: 'raw' | 'framing' | 'framed' — not itself persisted, but
     // the stream-reselection effect below auto-resumes 'framed' (re-running the framer)
@@ -65,19 +65,24 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     const [dissectorSelected, setDissectorSelected] = useState('')
     const [selectedFrame, setSelectedFrame] = useState(null)
     const [dissectHighlight, setDissectHighlight] = useState(null)
+    // Raw-mode counterpart to dissectHighlight, driven by a Search-panel result jump
+    // (jumpTo.highlight) instead of a dissector field click — set/cleared inside the jump
+    // effect below, since jumpTo.highlight is only ever present on a search-originated jump.
+    const [searchHighlight, setSearchHighlight] = useState(null)
     const [dissectPanelWidth, handleDissectPanelResize] = useResizableLayout('dissectPanelWidth', { sign: -1, min: 200, max: 800 })
 
     const {
-        display, loading, error, setError, handleScrollEnd, reloadFrom, displayRef,
+        display, loading, error, setError, handleScrollEnd, reloadFrom, reloadCenteredOn, displayRef,
         jumpToTop, jumpToBottom, jumpToNextSegment, jumpToPrevSegment,
     } = useByteBuffer({
         entity: stream,
         refreshKey,
-        openConnection: openChunkSegments,
-        fillForward: fillChunkForward,
-        fillBackward: fillChunkBackward,
+        openConnection: chunkAdapter.openConnection,
+        fillForward: chunkAdapter.fillForward,
+        fillBackward: chunkAdapter.fillBackward,
         isClosed,
         latestId: latestStid,
+        hasPendingJump,
     })
 
     const inFrameView = frameState === 'framed'
@@ -104,9 +109,9 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     } = useByteBuffer({
         entity: frameEntity,
         refreshKey: frameRefreshKey,
-        openConnection: openFrameSegments,
-        fillForward: fillFrameForward,
-        fillBackward: fillFrameBackward,
+        openConnection: frameAdapter.openConnection,
+        fillForward: frameAdapter.fillForward,
+        fillBackward: frameAdapter.fillBackward,
         isClosed,
         // A frame's own stid is always that of the raw chunk containing its last byte, so
         // the chunk-level latestStid is a valid upper bound for "the end" of the frame
@@ -141,7 +146,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         setSelectedFrame(null)
         setDissectHighlight(null)
         try {
-            const content = await getFramerScript(scriptName)
+            const content = await framerApi.getFramerScript(scriptName)
             const version = await sha256Hex(content)
             // Enforces "at most one framing view per stream": purges any other
             // script/version's frame data for this stream first. A no-op if this exact
@@ -149,7 +154,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
             // resumes rather than reprocessing — this is what makes an auto-resume of an
             // up-to-date stream cheap, and a resume after the script was edited a correct
             // full reprocess, with no separate version comparison needed on our side.
-            await clearStreamFrames({ session: targetStream.session, stream: targetStream.id, script: scriptName, scriptVersion: version })
+            await framerApi.clearStreamFrames({ session: targetStream.session, stream: targetStream.id, script: scriptName, scriptVersion: version })
             await catchUpFramer(targetStream.session, targetStream.id, scriptName, content, targetStream.end, streamTlsInfo(targetStream), handleFramerScriptLog)
             if (streamGenRef.current !== gen) return // superseded by a newer stream selection
             saveStreamFramerScript(targetStream.session, targetStream.id, scriptName)
@@ -187,6 +192,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
         setFrameScriptRunning(null)
         setSelectedFrame(null)
         setDissectHighlight(null)
+        setSearchHighlight(null)
         onFramerLogReset?.()
         const savedScript = stream ? (loadStreamFramerScript(stream.session, stream.id) ?? '') : ''
         setFramerSelected(savedScript)
@@ -286,24 +292,79 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
     })
 
     // Jump effect — resolves jumpTo to a target stid, then calls the hook's reloadFrom.
-    // `cancelled` guards against a stale resolution superseding a newer jump.
+    // `cancelled` guards against a stale resolution superseding a newer jump. Each unit
+    // that resolves against a value the caller could have gotten wrong (Goto's manually-
+    // typed value, not a marker/search-result jump — those always target real, already-
+    // found data) is validated against what's actually captured *before* reloading
+    // anything, so a bad target shows an error instead of silently landing somewhere else
+    // — assumes the target stream is already the one selected, true for every current
+    // caller (Goto never switches streams); a hypothetical future jump that both switches
+    // streams and fails this check would leave the newly-selected entity unloaded, since
+    // hasPendingJump already told its own initial-load effect to stand down.
     useEffect(() => {
         if (!jumpTo || !stream) return
         let cancelled = false
+        lastJumpVersionRef.current = jumpTo.version
+        setSearchHighlight(jumpTo.highlight ?? null)
+
+        // A jump tagged with its own source (currently just Goto — App.js's handleGoTo)
+        // reports failures to that source's own UI via onJumpError instead of the generic
+        // top-of-view banner, since "why didn't my typed value work" reads better right
+        // next to the input that produced it. Search-result/marker jumps are untagged and
+        // keep the banner — their own target is never wrong (always real, already-found
+        // data), so a failure there is a genuine buffer/network problem, not user input.
+        function reportError(message) {
+            if (jumpTo.source && onJumpError) onJumpError(jumpTo, message)
+            else setError(message)
+        }
 
         ;(async () => {
             try {
                 let targetStid = jumpTo.value
                 let targetByteOffset = null
                 let targetDirection = null
-                if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
+                if (jumpTo.unit === 'chunks') {
+                    // No resolution call for this unit (targetStid is already the raw
+                    // value), so it's the one case latestStid can pre-validate without an
+                    // extra round trip — a bogus/too-large value would otherwise silently
+                    // land wherever the backward-filled tail of the stream happens to be
+                    // (fillToTarget's mustReachStid chase never finds a stid that doesn't
+                    // exist, same failure shape /byte-stid's own case below has).
+                    if (latestStid != null && latestStid >= 0 && jumpTo.value > latestStid) {
+                        reportError(`Chunk #${jumpTo.value} doesn't exist yet; the latest is #${latestStid}.`)
+                        return
+                    }
+                } else if (jumpTo.unit === 'chunks-c2s' || jumpTo.unit === 'chunks-s2c') {
                     const direction = jumpTo.unit === 'chunks-c2s' ? DIRNUM_C2S : DIRNUM_S2C
-                    const result = await getChunkStid(stream.session, stream.id, direction, jumpTo.value)
+                    // Same pre-check as the 'chunks' (total) unit above, unified in
+                    // phrasing — /chunk-stid does 404 correctly on a bad id (unlike
+                    // /byte-stid below), but its own "chunk not found" text reads
+                    // inconsistently next to the other two units' own messages here.
+                    const list = await dbdumpApi.getChunkList(stream.session, stream.id)
+                    if (cancelled) return
+                    const latestForDir = direction === DIRNUM_C2S ? list.latest0 : list.latest1
+                    if (latestForDir == null || latestForDir < 0 || jumpTo.value > latestForDir) {
+                        const latestStr = latestForDir != null && latestForDir >= 0 ? `#${latestForDir}` : 'none yet'
+                        reportError(`Chunk #${jumpTo.value} (${dirLabel(direction)}) doesn't exist yet; the latest is ${latestStr}.`)
+                        return
+                    }
+                    const result = await dbdumpApi.getChunkStid(stream.session, stream.id, direction, jumpTo.value)
                     if (cancelled) return
                     targetStid = result.stid
                 } else if (jumpTo.unit === 'offset-c2s' || jumpTo.unit === 'offset-s2c') {
                     const direction = jumpTo.unit === 'offset-c2s' ? DIRNUM_C2S : DIRNUM_S2C
-                    const result = await getByteStid(stream.session, stream.id, direction, jumpTo.value)
+                    // /byte-stid resolves to the *last* chunk (never 404s) for an offset
+                    // past what's captured so far — checked against the stream's own
+                    // known length here, before even asking, rather than after the fact:
+                    // otherwise the jump "succeeds" by silently landing at the top of that
+                    // last chunk instead of at the (nonexistent) requested byte.
+                    const totalLen = direction === DIRNUM_C2S ? stream.length0 : stream.length1
+                    if (totalLen == null || totalLen < 0 || jumpTo.value >= totalLen) {
+                        const have = totalLen != null && totalLen >= 0 ? `only ${totalLen} (0x${totalLen.toString(16)}) bytes captured so far` : 'nothing captured yet'
+                        reportError(`Offset 0x${jumpTo.value.toString(16)} is beyond the captured ${dirLabel(direction)} data (${have}).`)
+                        return
+                    }
+                    const result = await dbdumpApi.getByteStid(stream.session, stream.id, direction, jumpTo.value)
                     if (cancelled) return
                     targetStid = result.stid
                     targetByteOffset = jumpTo.value
@@ -311,8 +372,11 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                 }
                 if (cancelled) return
 
-                const startStid = Math.max(0, targetStid - Math.floor(FILL_TARGET_SEGMENTS / 2))
-                reloadFrom(startStid, {
+                // reloadCenteredOn (not reloadFrom) — it loads directly at targetStid
+                // (backward for leading context, forward starting *at* it) rather than
+                // walking forward from a segment-count-computed boundary that can be far
+                // from the target in byte terms for realistic chunk sizes.
+                reloadCenteredOn(targetStid, {
                     computeExtra: rows => {
                         let targetRowPx = 0
                         for (let i = 0; i < rows.length; i++) {
@@ -329,14 +393,16 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                                 }
                             }
                         }
+                        // A pinned header covers the top row, so a byte target lands one row lower.
+                        const pinnedOffset = pinHeader && targetByteOffset !== null ? ROW_HEIGHT : 0
                         const scrollTo = jumpTo.align === 'top'
-                            ? targetRowPx
+                            ? Math.max(0, targetRowPx - pinnedOffset)
                             : Math.max(0, targetRowPx - Math.floor(viewHeightRef.current / 2))
                         return { scrollTo, scrollToVersion: jumpTo.version }
                     },
                 })
             } catch (e) {
-                if (!cancelled) setError(e.message)
+                if (!cancelled) reportError(e.message)
             }
         })()
 
@@ -357,6 +423,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
             if (!leavingStream) return
             const rows = displayRef.current.rows
             let i = Math.floor(scrollTopRef.current / ROW_HEIGHT)
+            if (pinHeaderRef.current && rows[i] && rows[i].type !== 'header') i++
             while (i < rows.length && rows[i].type === 'header') i++
             const row = rows[i]
             if (row?.type === 'hex') onLeaveStream?.(leavingStream, { direction: row.direction, offset: row.offset })
@@ -430,6 +497,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                     />
                     <${ResizeHandle} orientation="v" onResize=${handleDissectPanelResize} />
                     <${DissectPanel}
+                        dissectApi=${dissectApi}
                         selectedFrame=${selectedFrame}
                         dissectScripts=${dissectScripts}
                         dissectorSelected=${dissectorSelected}
@@ -456,6 +524,7 @@ export default function TrafficView({ stream, globalOffset, sizeFormat, pinHeade
                         onSetExtractRange=${onSetExtractRange}
                         onViewportChange=${handleViewportChange}
                         markers=${streamMarkers}
+                        highlightRange=${searchHighlight}
                     />
                 `}
             </div>

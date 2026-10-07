@@ -1,18 +1,17 @@
 import { h } from 'preact'
 import { useState, useEffect, useRef } from 'preact/hooks'
 import htm from 'htm'
-import { getStreams } from '../api.js'
 import { fmtDuration } from '../format.js'
 import ListPanel from './ListPanel.js'
 
 const html = htm.bind(h)
 
-export default function StreamList({ session, selected, onSelect, onLoad, refreshKey, streamsVersion }) {
+export default function StreamList({ dbdumpApi, session, selected, onSelect, onLoad, refreshKey, streamsVersion }) {
     const [streams, setStreams] = useState([])
     const lastSeenVersionRef = useRef(-1)
 
     function load(sessionId) {
-        return getStreams(sessionId).then(ss => { setStreams(ss); onLoad?.(ss) }).catch(() => { setStreams([]); onLoad?.([]) })
+        return dbdumpApi.getStreams(sessionId).then(ss => { setStreams(ss); onLoad?.(ss) }).catch(() => { setStreams([]); onLoad?.([]) })
     }
 
     // Seeding from `streamsVersion`'s current value (rather than a network round trip)

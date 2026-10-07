@@ -58,30 +58,43 @@ function isPrintable(bytes) {
     return true
 }
 
-// The Transform bottom-panel tab: an options column on the left, and a stacked
-// input/output pair on the right, connected by a step pipeline.
-export default function TransformPanel() {
+export const INITIAL_TRANSFORM_STATE = {
     // Canonical content, regardless of which view is active. Text mode derives its
     // display from this (decode-on-render) rather than storing its own copy, so
     // toggling views never loses data unless the user actively edits lossy text.
-    const [bytes, setBytes] = useState(() => new Uint8Array(0))
-    // 'raw' | 'hex' | 'hexdump'
-    const [inputView, setInputView] = useState('raw')
-    const [outputView, setOutputView] = useState('raw')
+    bytes: new Uint8Array(0),
+    inputView: 'raw',   // 'raw' | 'hex' | 'hexdump'
+    outputView: 'raw',
     // Buffer for the input Hex view only: holds exactly what was typed, since hex decoding can
     // fail on incomplete input (e.g. an odd number of digits mid-keystroke) — unlike Raw view,
     // whose UTF-8 encode/decode always succeeds and can therefore be derived from `bytes` on
     // every render. `bytes` is only updated from this buffer when it currently parses as valid
     // hex; resynced from `bytes` whenever the view switches into 'hex'.
-    const [hexText, setHexText] = useState('')
+    hexText: '',
+    steps: [],
+    collapsedSections: new Set(ALGORITHM_SECTIONS.map(s => s.name)),
+    outputBytes: null,
+    outputError: null,
+}
+
+// The Transform bottom-panel tab: an options column on the left, and a stacked
+// input/output pair on the right, connected by a step pipeline. Its content lives in the
+// parent (`transformState`); `onTransformStateChange` takes an updater `prev => next`.
+export default function TransformPanel({ transformState, onTransformStateChange }) {
+    const { bytes, inputView, outputView, hexText, steps, collapsedSections, outputBytes, outputError } = transformState
+    const field = key => v => onTransformStateChange(s => ({ ...s, [key]: typeof v === 'function' ? v(s[key]) : v }))
+    const setBytes             = field('bytes')
+    const setInputView         = field('inputView')
+    const setOutputView        = field('outputView')
+    const setHexText           = field('hexText')
+    const setSteps             = field('steps')
+    const setCollapsedSections = field('collapsedSections')
+    const setOutputBytes       = field('outputBytes')
+    const setOutputError       = field('outputError')
     const [optionsWidth, handleOptionsResize] = useResizableLayout('encdecOptionsWidth', { min: 100, max: 400 })
     const [inputHeight, handleInputResize]    = useResizableLayout('encdecInputHeight', { min: 30, max: 2000 })
-    const [steps, setSteps] = useState([])
     const [menuOpen, setMenuOpen] = useState(false)
-    const [collapsedSections, setCollapsedSections] = useState(() => new Set(ALGORITHM_SECTIONS.map(s => s.name)))
     const [dragOverId, setDragOverId] = useState(null)
-    const [outputBytes, setOutputBytes] = useState(null)
-    const [outputError, setOutputError] = useState(null)
     const toolbarRef = useRef(null)
     const dragIdRef = useRef(null)
 

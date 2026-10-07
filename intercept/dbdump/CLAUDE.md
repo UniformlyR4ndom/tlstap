@@ -4,7 +4,7 @@ Implementation notes for the `dbdump` interceptor, loaded automatically when wor
 under this directory. See the root `CLAUDE.md` for where `dbdump` fits into the wider
 architecture — `ApiProvider`/REST API mechanics ("REST API" section), the config-args
 table ("Built-in Interceptors"), and its relationship to `tamper` (documented in
-`intercept/tamper/CLAUDE.md`) — and `test/tapctl/CLAUDE.md` for CLI usage against the
+`intercept/tamper/CLAUDE.md`) — and `tapctl/CLAUDE.md` for CLI usage against the
 endpoints documented below.
 
 Logs all captured traffic to an SQLite database (via `modernc.org/sqlite`, pure Go).
@@ -365,6 +365,56 @@ section.
   `dbdump_test.go` (adds the column, is idempotent when called again, and
   works identically whether the table already existed or was just freshly created).
 
+**Framer jobs (`framerjobs.go`, `jobrelay.go`)** let `tapctl dbdump run-framer` ask a
+connected browser tab to actually execute a framer script, rather than adding a second,
+separately maintained script-execution environment on the Go side — a framer script is
+(and stays) entirely browser-driven; this file only relays a request to whichever tab
+already has one (or more) loaded. Browser-verified 2026-09-08: toggle on → connects,
+`run-framer` persists real frames (confirmed via `frames-timeline`), an unknown-script
+failure propagates the real error message end to end, toggle off → clean disconnect →
+next `run-framer` call `503`s again.
+
+- **`jobRelay` (`jobrelay.go`)** is the shared connection-tracking/dispatch/timeout
+  mechanism behind both this and dissector jobs below — extracted once a second relay
+  needed the identical mechanics, rather than kept as two copies that would have to
+  change identically. Payload-agnostic: it only needs each job to carry a caller-chosen
+  `job_id` and each result frame to echo it back; every other field is each relay's own
+  concern to build/decode. `DbDumpInterceptor` holds one instance per relay
+  (`i.framerJobs`, `i.dissectorJobs` — see "Dissector jobs" below), each independent of
+  the interceptor's main `mu` (no chunk-capture state is involved).
+- **Not gated by a config field** — unlike `scripts-dir`/`dissect-scripts-dir`'s
+  empty-disables-with-`501` convention, `/framer-jobs`/`/framer-jobs/run` are always
+  registered; "nothing to do" is instead "no browser is currently connected," reported as
+  `503` per request rather than a fixed startup-time capability check, since whether a
+  browser is listening changes from one moment to the next.
+- **Only one browser tracked at a time** per relay — a new `/framer-jobs` connection
+  replaces (and closes) whichever one was previously registered (`jobRelay.register`) —
+  last-connect-wins, since there's normally exactly one operator's tab doing this;
+  nothing here tries to pick among several.
+- **`POST /framer-jobs/run`** (`{"session":N,"stream":N,"script":"..."}`) is a plain
+  blocking REST call — tapctl stays a one-shot "connect, act, exit" client like every
+  other command, so the *server* holds the request open rather than tapctl polling a job
+  ID. `503` immediately (nothing dispatched) if no browser is connected. Otherwise:
+  assigns a job id, pushes `{"kind":"job","job_id":"...","session":N,"stream":N,
+  "script":"..."}` over the browser's socket, and waits (up to `remoteJobTimeout`, 2
+  minutes, shared with dissector jobs below) for that same connection to report a
+  `{"kind":"result","job_id":"...","ok":bool,"error":"..."}` reply — `200
+  {"status":"ok"}` on success, `422 {"error":"..."}` on a reported failure (e.g. an
+  unknown script name — the browser's own script-fetch 404 message, passed straight
+  through), `504` on timeout. If the browser disconnects while a job is still
+  outstanding, every job still waiting on that connection is failed immediately
+  (`"browser disconnected"`) rather than left to time out.
+- **No script-version parameter** — unlike `frame-progress`/`frames-timeline`'s
+  `frameTimelineKeyRequest`, callers here only name a script. The connected browser
+  resolves its current content and computes the version itself (`sha256Hex`), the same
+  way a manual Run click does — there's no separate version to go stale, since nothing
+  here executes anything server-side.
+- The server never runs a script or knows what one looks like — it only ever forwards
+  opaque job/result JSON between one HTTP caller and one WebSocket connection. See
+  `web/CLAUDE.md`'s "Remote framer job listener" section for the browser-side half (what
+  actually executes on receipt of a job, and the opt-in UI toggle) and `tapctl/CLAUDE.md`
+  for `run-framer`'s own CLI shape.
+
 **Dissector scripts** are the client-side counterpart to framer scripts: given one
 frame's bytes, produce a labeled field-tree breakdown for the UI, à la Wireshark's
 packet-details pane — browser-verified against `examples/dbdump/dissect/
@@ -395,6 +445,43 @@ execution and UI (`DissectPanel.js`, `dissectRuntime.js`) are documented in
 - Tested (`dissect_test.go`): full CRUD round-trip through the REST endpoints, that the
   dissector and framer stores are genuinely independent (same script name in both, one
   store's delete doesn't touch the other's), and the unconfigured-directory 501 path.
+
+**Dissector jobs (`dissectorjobs.go`)** are "Framer jobs"' dissector-script sibling —
+same `jobRelay` mechanics, same `tapctl` command shape (`run-dissector`), a separate
+connection/toggle from framer jobs (`i.dissectorJobs`, its own `/dissector-jobs`/
+`/dissector-jobs/run` pair) rather than one relay carrying both job kinds — matching this
+codebase's consistent framer/dissector-are-separate-systems precedent (own stores, own
+panels, own default-script prefs) rather than introducing the first place the two are
+combined. Browser-verified 2026-09-08 alongside framer jobs.
+
+- **The one real difference from a framer job: dissection output is never persisted
+  anywhere server-side** (see "Dissector scripts" above) — there is nothing to go inspect
+  afterward the way `frames-timeline` works for a framer job, so a successful result must
+  carry the dissector's own `FieldNode[]` tree directly, not just `{"status":"ok"}`.
+  `handleDissectorJobsRun` passes it through as opaque `json.RawMessage` — this package
+  never parses or validates a dissector's output, same treatment `frames.meta` already
+  gets.
+- **`POST /dissector-jobs/run`** request:
+  `{"session":N,"stream":N,"direction":N,"framer_script":"...","framer_script_version":"...","frame_id":N,"dissect_script":"..."}`
+  — identifies one already-persisted frame directly, by the same five-part key
+  `frames.go`'s `frameKey` uses (`session`, `stream`, `direction`, `framer_script`,
+  `framer_script_version` — a frame's `id` is only unique within that key) plus
+  `frame_id` and which dissector script to run. No dissect-script-version parameter, same
+  reasoning as `run-framer`'s missing framer-script-version — the browser resolves the
+  dissector script's own current content itself.
+- Response: `200` with the bare `FieldNode[]` JSON array on success (matching the
+  bare-array convention `/frames`/`/chunks/timeline` already use elsewhere in this API,
+  rather than wrapping it in `{"nodes":[...]}`), `422 {"error":"..."}` on a reported
+  failure (e.g. an unknown `frame_id`, or the dissector script itself throwing), `503`/
+  `504` same as `run-framer`.
+- The connected browser resolves the target frame itself (a plain `/frames` lookup keyed
+  as above, `id >= frame_id, n:1`, checked against the exact id — a frame is never
+  re-fetched from raw chunks the way a framer job's `catchUpFramer` fetches chunks, since
+  it's already fully computed and stored) and its bytes (`/byte-ranges` over the frame's
+  own `ranges`, merged in range order — the same primitive `frameSegments.js` uses for
+  the UI's own frame view) before calling the real `runDissector(...)`. See
+  `web/CLAUDE.md`'s "Remote dissector job listener" section for that side, and
+  `tapctl/CLAUDE.md` for `run-dissector`'s own CLI shape.
 
 **Cross-direction interleaving (`listFramesTimeline` in `frames.go`):** `TrafficView`'s
 frame view merges both directions into one scroll, the same way the raw-chunk view
@@ -457,6 +544,10 @@ begin with — see the schema note above).
 | POST | `/frames/by-seq` | see "Framer scripts" above | same as `/frames/timeline`, merged by emission-order `seq` instead of `stid` |
 | POST | `/frames/append` | see "Framer scripts" above | `204`, or `409` on a stale expected offset |
 | POST | `/frames/clear` | see "Framer scripts" above (`clearStreamFrames`) | `204` — purges every other `(script, script_version)`'s frame data for the given stream |
+| WS | `/framer-jobs` | — | see "Framer jobs" above; the connected-browser side of the relay |
+| POST | `/framer-jobs/run` | see "Framer jobs" above | `200 {"status":"ok"}`, `422 {"error":"..."}` on a reported failure, `503` if no browser is connected, `504` on timeout |
+| WS | `/dissector-jobs` | — | see "Dissector jobs" above; the connected-browser side of the relay |
+| POST | `/dissector-jobs/run` | see "Dissector jobs" above | `200` with the dissector's own `FieldNode[]` array, `422 {"error":"..."}` on a reported failure, `503` if no browser is connected, `504` on timeout |
 
 **WebSocket `/stid-stream` protocol:**
 

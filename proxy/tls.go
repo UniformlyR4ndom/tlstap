@@ -226,9 +226,6 @@ func SummarizeTlsConn(tlsConn *tls.Conn) string {
 	return sb.String()
 }
 
-// tlsInfoFromConn extracts a TLSInfo from conn's negotiated TLS state, or nil if conn
-// isn't (yet) a *tls.Conn — a plain net.Conn (ModePlain, or a not-yet-upgraded
-// detecttls connection) has no TLS state to report.
 func tlsInfoFromConn(conn net.Conn) *TLSInfo {
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {

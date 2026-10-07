@@ -1,4 +1,3 @@
-import { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges } from './api.js'
 import { selectByBudget, computeReachedEnd } from './frameSegmentsCore.js'
 
 // Chunk-mode adapter for useByteBuffer.js — maps its generic openConnection/fillForward/
@@ -14,12 +13,26 @@ import { selectByBudget, computeReachedEnd } from './frameSegmentsCore.js'
 // chunk mode, since chunks never tie on stid the way frames can and are always fully
 // loaded already; byteBufferCore.js's fillToTarget still passes them (for contract
 // uniformity with the frame adapter), they're just ignored here.
+//
+// fillForward/fillBackward below take their network calls via `handle` (built by
+// openConnection) rather than a module-level api.js import, so they stay plain,
+// dbdump-instance-agnostic exports — directly unit-testable with a fake handle
+// (chunkSegments.test.js) with no dbdump instance/api.js involved at all.
+// createChunkSegmentsAdapter(dbdumpApi) is what a caller (TrafficView.js) actually uses,
+// binding openConnection to one dbdump instance's own createDbDumpApi(...) object.
 
 // entity is unused — the returned handle is entity-agnostic; session/stream are sent per
 // call instead. Kept as a parameter anyway to match the adapter contract's documented
 // openConnection(entity) signature.
-export function openConnection(entity) {
-    return { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges }
+export function createChunkSegmentsAdapter(dbdumpApi) {
+    return {
+        openConnection(entity) {
+            const { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges } = dbdumpApi
+            return { listChunksTimeline, listChunksTimelineBackward, fetchByteRanges }
+        },
+        fillForward,
+        fillBackward,
+    }
 }
 
 async function fetchWindows(handle, entity, candidates) {

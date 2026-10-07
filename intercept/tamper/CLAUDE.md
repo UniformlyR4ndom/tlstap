@@ -5,7 +5,7 @@ under this directory. See the root `CLAUDE.md` for where `tamper` fits into the 
 architecture (`ApiProvider`/REST API mechanics, `BufferingInterceptor` — "Buffering
 Interceptors" section) and `web/CLAUDE.md`'s "Tamper tab"/"Scripted interception"
 sections, which document the browser/script-facing side of everything below, and
-`test/tapctl/CLAUDE.md` for CLI usage against these endpoints.
+`tapctl/CLAUDE.md` for CLI usage against these endpoints.
 
 Lets a connected control client actively pause, inspect, edit, drop, or forward
 individual chunks of live traffic, or just live-watch it without holding anything up.
@@ -85,7 +85,7 @@ immediately — it never blocks. Release — forwarding, dropping, or aborting t
 `drop-connection` command (`api.go`'s `handleRelease`/`handleDropConnection`, calling
 `heldBuffer.performAction`/`abort`), a per-buffer hold-timeout, or a control disconnect
 sweep, all of which deliver a `proxy.ReleasedData` on the buffer's release channel for
-`ConnHandler`'s async forwarding loop to pick up (see the root `CLAUDE.md`'s "Buffering
+`ConnHandler`'s per-direction release worker to pick up (see the root `CLAUDE.md`'s "Buffering
 Interceptors" section). Switching a stream from intercept back to watch mode (`set-mode`)
 immediately force-releases (forwards, unmodified) everything currently held for it via
 `releaseAll()`, rather than leaving it to time out.
@@ -93,16 +93,17 @@ immediately force-releases (forwards, unmodified) everything currently held for 
 **Possible future option (not implemented):** held chunks could survive a control
 disconnect instead of always force-releasing, gated by a new config flag — would let a
 one-shot client like `tapctl` do "edit now, decide whether to release later" across
-separate invocations (today it can't; see `test/tapctl/CLAUDE.md`'s note on this
+separate invocations (today it can't; see `tapctl/CLAUDE.md`'s note on this
 limitation).
 
 **No goroutine is parked per held chunk** — see the root `CLAUDE.md`'s "Buffering
-Interceptors" section for why that matters. One residual, harmless race:
-`ConnectionTerminated` can `close()` both directions' `heldBuffer`s concurrently with the
-*other* direction's `Intercept()` still mid-`appendChunk` (the `wg.Done()` quirk under
-the root `CLAUDE.md`'s "Key Implementation Details" section). `appendChunk` doesn't
-check `closed`, so this never panics — the appended bytes just sit unread until
-`streamState` is GC'd, harmless since the connection is already tearing down.
+Interceptors" section for why that matters and how `ConnHandler` consumes `relCh`.
+`heldBuffer` sends on `relCh` (capacity 1) while holding its own lock; `ConnHandler` never calls
+`Intercept()` while holding a lock the release worker needs, so a blocked send always drains.
+`ConnectionTerminated` runs only after both directions' forwarding goroutines have returned, so no
+`Intercept()` can still be appending to a buffer that `close()` is about to close. Tamper is only
+supported in `plain`, `tls` and `tls-mux` mode (not `detecttls`), with at most one buffering
+interceptor per direction chain.
 
 **A held buffer's bytes are never pushed inline** — `held` and `stream-list` are pure
 metadata, specifically so that (re)connecting to control at any time is enough to
@@ -247,7 +248,7 @@ tamper-specific:
   at all (deliberately dropped from the design: nothing depends on it, since staleness
   detection on the client side is driven by the `script-updated` push event below, not a
   timestamp comparison). This is also what makes CLI-driven editing (`tapctl tamper
-  script-*`, see `test/tapctl/CLAUDE.md`) a first-class citizen alongside the browser
+  script-*`, see `tapctl/CLAUDE.md`) a first-class citizen alongside the browser
   rather than a bolted-on afterthought — both just `PUT`/`GET`/`DELETE` the same REST
   resource.
 - **REST endpoints** (base: `/<proxy-name>/api/i/tamper` or canonical `/api/i/tamper`,
@@ -297,7 +298,7 @@ instances (`ScriptsDir`/`DissectScriptsDir`) side by side:
   struct with a "kind" discriminator, since no such discriminator pattern exists
   anywhere else in this codebase and the two stores are otherwise fully independent.
 - Covered by the same `tapctl tamper framer-script-list/-get/-put/-delete` commands as
-  `ScriptsDir`'s own `script-*` commands — see `test/tapctl/CLAUDE.md`.
+  `ScriptsDir`'s own `script-*` commands — see `tapctl/CLAUDE.md`.
 - Unit-tested in `framer_scripts_test.go`, mirroring `scripts_test.go`'s own coverage
   plus one additional test confirming the two stores don't collide on a shared name.
 
